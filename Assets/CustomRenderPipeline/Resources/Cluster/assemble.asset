@@ -29,7 +29,7 @@ MonoBehaviour:
   rvtTrilinearBlend: 0
   brgGBufferExcludeLayer: 31
   UseRVT: 1
-  clusterShadowMode: 0
+  clusterShadowMode: 1
   clusterTargetTexels: 0
   clusterShadowForceAll: 0
   useBRG: 0

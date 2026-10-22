@@ -420,30 +420,25 @@ namespace Cluster
                 cpuVisible[k] = cnt;
             }
 
-            var sb = new System.Text.StringBuilder();
-            sb.Append("[Cluster阴影][Debug] 簇数 = ").Append(clusterCount)
-              .Append(" | 级联数 = ").Append(cascadeCount)
-              .Append(" | 每簇顶点 = ").Append(VertsPerCluster)
-              .Append(" | LOD 判据 = ")
-              .Append(targetTexels > 0 ? $"开({targetTexels} texel)" : "关(只画 LOD0)")
-              .Append(" | forceAll = ").Append(debugForceAll)
-              .Append("\n  各级联 [k] = CPU可见 / GPU可见: ");
+            // 默认静默：验证已通过后，正常情况不出任何日志，避免持续刷屏。
+            // 仅在「发现裁剪错误」或「全部级联可见数为 0」时才报警（ClusterDebug 安全网）。
             bool mismatch = false;
             long gpuSum = 0;
             for (int k = 0; k < n; k++)
             {
                 long gpu = (long)counters[k];
-                if (k > 0) sb.Append(", ");
-                sb.Append('[').Append(k).Append("]=").Append(cpuVisible[k]).Append('/').Append(gpu);
                 if (cpuVisible[k] != gpu) mismatch = true;
                 gpuSum += gpu;
             }
-            Debug.Log(sb.ToString());
 
             if (mismatch)
             {
-                Debug.LogWarning("[Cluster阴影][Debug] CPU 与 GPU 剔除结果不一致 ⇒ 裁剪逻辑有错，" +
-                    "优先检查 _Planes 平面空间 / _ClusterBounds 世界空间 / 矩阵来源是否与 compute 一致。");
+                var sb = new System.Text.StringBuilder();
+                sb.Append("[Cluster阴影][Debug] CPU 与 GPU 剔除结果不一致 ⇒ 裁剪逻辑有错。各级联 [k]=CPU可见/GPU可见: ");
+                for (int k = 0; k < n; k++)
+                    sb.Append('[').Append(k).Append("]=").Append(cpuVisible[k]).Append('/').Append((long)counters[k]).Append(k < n - 1 ? ", " : "");
+                Debug.LogWarning(sb.ToString() +
+                    "\n  优先检查 _Planes 平面空间 / _ClusterBounds 世界空间 / 矩阵来源是否与 compute 一致。");
             }
             else if (gpuSum == 0 && debugForceAll == 0)
             {

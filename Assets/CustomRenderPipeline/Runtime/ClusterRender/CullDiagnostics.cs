@@ -22,8 +22,8 @@ namespace Cluster
     /// </summary>
     public static class CullDiagnostics
     {
-        /// <summary>总开关（默认开）。</summary>
-        public static bool Enabled = true;
+        /// <summary>总开关（默认关：排查 BRG 剔除基线时临时开启，避免日常刷屏）。</summary>
+        public static bool Enabled = false;
 
         private const int kLogIntervalFrames = 300;
         private static int s_frame;
