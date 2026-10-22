@@ -1,0 +1,160 @@
+
+#pragma kernel TraverseQuadTree
+#pragma kernel BuildPatches
+#pragma kernel BuildLodMap
+#pragma kernel BuildBounds
+
+#include "ProPlaneData.hlsl"
+
+
+float GetNodeSize(uint lod){
+    float2 size = _NodeSize[lod].xy;
+    return max(size.x, size.y);
+}
+
+float3 GetNodePositionOS(uint2 nodeLoc, uint lodLevel){
+    float2 size = _NodeSize[lodLevel].xy;
+    float2 xy = float2(nodeLoc.x * size.x, nodeLoc.y * size.y);
+    // float2 uv = xy / _TerrainSize.xz;       //确定uv坐标
+    // float2 hight = MinMaxHeightTexture.mips[lodLevel + _MipsOffset][nodeLoc].xy;
+    float3 positionOS = float3(xy.x, _WorldSize.y, xy.y);
+    return positionOS;
+}
+
+bool EvaluateNode(uint2 nodeLoc,uint lod){
+    float3 positionWS = mul(_ObjectToWorld, float4(GetNodePositionOS(nodeLoc,lod), 1)).xyz;
+    // float3 positionWS = GetNodePositionOS(nodeLoc,lod);
+    float dis = distance(_CameraPositionWS, positionWS);
+    float nodeSize = GetNodeSize(lod);
+    float f = dis / (nodeSize * _NodeEvaluation);
+    if( f < 1){
+        return true;
+    }
+    return false;
+}
+
+
+
+//遍历四叉树，进行节点评价，生成AppendFinalNodeList
+[numthreads(1,1,1)]
+void TraverseQuadTree (uint3 id : SV_DispatchThreadID)
+{
+    //从待处理栈中取一个数据
+    uint2 nodeLoc = ConsumeNodeList.Consume();
+
+    if(_CurrentLod > 0 && EvaluateNode(nodeLoc, _CurrentLod)){
+        //divide
+        AppendNodeList.Append(nodeLoc * 2);
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,0));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(0,1));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,1));
+    }else{
+        AppendFinalNodeList.Append(uint3(nodeLoc, _CurrentLod));
+    }
+}
+
+void CreatePatchAndBounds(uint3 nodeLoc, uint2 patchOffset, out RenderPatch patch, out Bounds bounds){
+    uint lod = nodeLoc.z;
+    float2 size = _NodeSize[lod].xy; //该块node的大小
+    float2 beginPos = float2(nodeLoc.x * size.x, nodeLoc.y * size.y);    //起始位置
+    float2 patchSize = size / PATCH_COUNT_PER_NODE;     //每块patch的大小
+
+    float2 finalPos = float2(beginPos.x + patchSize.x * patchOffset.x, beginPos.y + patchSize.y * patchOffset.y);
+
+    patch.lod = uint4(nodeLoc, patchOffset.x * 8 + patchOffset.y);
+    patch.position = finalPos;    //后面两个数据用来debug
+
+    bounds = (Bounds)0;
+
+    float2 maxPos = finalPos + patchSize;
+    bounds.minPosition = mul(_ObjectToWorld, float4(finalPos.x, 0, finalPos.y, 1)).xyz;
+    bounds.maxPosition = mul(_ObjectToWorld, float4(maxPos.x, _WorldSize.y, maxPos.y, 1)).xyz;
+
+    bounds.maxPosition += _BoundExtent;
+    bounds.minPosition -= _BoundExtent;
+}
+
+
+
+//测试是否在平面的外侧
+bool IsOutSidePlane(float4 plane,float3 position){
+    return dot(plane.xyz,position) + plane.w < 0; 
+}
+
+bool IsAABBOutSidePlane(float4 plane,float3 boundsMin,float3 boundsMax){
+    return IsOutSidePlane(plane,boundsMin) &&
+        IsOutSidePlane(plane,boundsMax) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMin.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMin.z)) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMax.y,boundsMin.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMin.z));
+}
+
+bool IsBoundsOutSidePlane(float4 plane,Bounds bounds){
+    return IsAABBOutSidePlane(plane,bounds.minPosition,bounds.maxPosition);
+}
+
+//视锥裁剪
+bool FrustumCull(float4 planes[6],Bounds bounds){
+    return IsBoundsOutSidePlane(planes[0],bounds) || 
+    IsBoundsOutSidePlane(planes[1],bounds) || 
+    IsBoundsOutSidePlane(planes[2],bounds) || 
+    IsBoundsOutSidePlane(planes[3],bounds) || 
+    IsBoundsOutSidePlane(planes[4],bounds) || 
+    IsBoundsOutSidePlane(planes[5],bounds);
+}
+
+bool Cull(Bounds bounds){
+    if(FrustumCull(_CameraFrustumPlanes,bounds)){
+        return true;
+    }
+    return false;
+}
+
+
+//对每一个node进行切割以及剔除，生成最后的patches
+[numthreads(8,8,1)]
+void BuildPatches(uint3 id : SV_DispatchThreadID, uint3 groupId:SV_GroupID, uint3 groupThreadId:SV_GroupThreadID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint2 patchOffset = groupThreadId.xy;
+    //生成Patch
+    RenderPatch patch; Bounds bounds;
+    CreatePatchAndBounds(nodeLoc, patchOffset, patch, bounds);
+
+    if(Cull(bounds)){
+        return;
+    }
+    CulledPatchList.Append(patch);
+}
+
+//对每一个node进行切割以及剔除，生成最后的patches
+[numthreads(8,8,1)]
+void BuildBounds(uint3 id : SV_DispatchThreadID, uint3 groupId:SV_GroupID, uint3 groupThreadId:SV_GroupThreadID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint2 patchOffset = groupThreadId.xy;
+    //生成Patch
+    RenderPatch patch; Bounds bounds;
+    CreatePatchAndBounds(nodeLoc, patchOffset, patch, bounds);
+    if(Cull(bounds)){
+        return;
+    }
+    BoundsList.Append(bounds);
+}
+
+
+[numthreads(1, 1, 1)]
+void BuildLodMap(uint3 groupId:SV_GroupID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint lod = nodeLoc.z; uint mapSize = _LodMapLevelSize[lod];
+    
+    uint2 begIndex = nodeLoc.xy * mapSize;
+    uint2 finalIndex = begIndex + mapSize;
+    
+    for(uint x = begIndex.x; x < finalIndex.x; x++){
+        for(uint y = begIndex.y; y < finalIndex.y; y++){
+            _LodMap[uint2(x, y)] = lod / (float)_CurrentLod;
+        }
+    }
+}

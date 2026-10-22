@@ -1,0 +1,217 @@
+#pragma kernel TraverseQuadTree
+#pragma kernel BuildPatches
+#pragma kernel BuildLodMap
+#pragma kernel BuildBounds
+#pragma kernel BuildPatchesShadow
+
+#include "PlaneData.hlsl"
+
+#pragma multi_compile _ EDGE_CHECK
+#pragma multi_compile _ MIN_MAX_HIGHT_MAP
+
+float GetNodeSize(uint lod){
+    float2 size = _NodeSize[lod].xy;
+    return max(size.x, size.y);
+}
+
+float3 GetNodePositionOS(uint2 nodeLoc, uint lodLevel, out float highDis){
+    float4 size = _NodeSize[lodLevel];
+    float2 xy = float2(nodeLoc.x * size.x, nodeLoc.y * size.y) + size.xy / 2.0f;
+
+    float3 positionOS;
+#ifdef MIN_MAX_HIGHT_MAP
+    float2 heigh = _MinMaxHeightMap.mips[lodLevel + _MinMaxHMapMipsOffset][nodeLoc.xy].xy;
+    highDis = (heigh.y - heigh.x) * 3.0;
+    positionOS = float3(xy.x, (heigh.x + heigh.y) / 2.0f * size.w, xy.y);
+#else
+    positionOS = float3(xy.x, 0, xy.y);     //平面模式只考虑水平
+    highDis = 0;
+#endif
+
+    return positionOS;
+}
+
+
+
+
+bool EvaluateNode(uint2 nodeLoc,uint lod){
+    float highDis;
+    float3 positionOS = GetNodePositionOS(nodeLoc, lod, highDis);
+    //在这个阶段，摄像机为模型空间位置
+    float dis = distance(_CameraPositionOS, positionOS);
+    float nodeSize = GetNodeSize(lod);
+    float f = dis / (nodeSize * _NodeEvaluation) - highDis;
+    if(f < 1){
+        return true;
+    }
+    return false;
+}
+
+//nodeLoc:Node结点编号以及级别
+void CreatePatchAndBounds(uint3 nodeLoc, out Bounds bounds){
+    uint lod = nodeLoc.z;
+    float4 size = _NodeSize[lod]; //该块node的大小
+    float2 beginPos = float2(nodeLoc.x * size.x, nodeLoc.y * size.y);    //起始位置
+
+    bounds = (Bounds)0;
+#ifdef MIN_MAX_HIGHT_MAP
+    float2 heigh = _MinMaxHeightMap.mips[nodeLoc.z + _MinMaxHMapMipsOffset][nodeLoc.xy].xy;
+    bounds.minPosition = _BeginPosition.xyz + float3(beginPos.x, size.w * heigh.x, beginPos.y) - _Extent;
+    bounds.maxPosition = _BeginPosition.xyz + float3(beginPos.x + size.x, size.w * heigh.y, beginPos.y + size.y) + _Extent;
+#else
+    bounds.minPosition = _BeginPosition.xyz + float3(beginPos.x, -1000, beginPos.y) - _Extent;
+    bounds.maxPosition = _BeginPosition.xyz + float3(beginPos.x + size.x, size.z + size.w, beginPos.y + size.y) + _Extent;
+#endif
+}
+
+//测试是否在平面的外侧
+inline bool IsOutSidePlane(float4 plane,float3 position){
+    return dot(plane.xyz,position) + plane.w < 0; 
+}
+
+inline bool IsAABBOutSidePlane(float4 plane,float3 boundsMin,float3 boundsMax){
+    return IsOutSidePlane(plane,boundsMin) &&
+        IsOutSidePlane(plane,boundsMax) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMin.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMin.z)) &&
+        IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMax.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMax.y,boundsMin.z)) &&
+        IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMin.z));
+}
+
+inline bool IsBoundsOutSidePlane(float4 plane,Bounds bounds){
+    return IsAABBOutSidePlane(plane,bounds.minPosition,bounds.maxPosition);
+}
+
+
+//视锥裁剪
+inline bool FrustumCull(float4 planes[6],Bounds bounds){
+    return IsBoundsOutSidePlane(planes[0],bounds) || 
+    IsBoundsOutSidePlane(planes[1],bounds) || 
+    IsBoundsOutSidePlane(planes[2],bounds) || 
+    IsBoundsOutSidePlane(planes[3],bounds) || 
+    IsBoundsOutSidePlane(planes[4],bounds) || 
+    IsBoundsOutSidePlane(planes[5],bounds);
+}
+
+//视锥裁剪
+inline bool FrustumCullShadow(float4 planes[6],Bounds bounds){
+    return IsBoundsOutSidePlane(planes[0],bounds) || 
+    IsBoundsOutSidePlane(planes[1],bounds) || 
+    IsBoundsOutSidePlane(planes[2],bounds) || 
+    IsBoundsOutSidePlane(planes[3],bounds) || 
+    IsBoundsOutSidePlane(planes[4],bounds);
+}
+
+inline bool Cull(Bounds bounds){
+
+    if(FrustumCull(_CameraFrustumPlanes,bounds)){
+        return true;
+    }
+    return false;
+}
+
+inline bool CullShadow(Bounds bounds){
+    if(FrustumCullShadow(_CameraFrustumPlanes, bounds)){
+        return true;
+    }
+    return false;
+}
+
+//遍历四叉树，进行节点评价，生成AppendFinalNodeList
+[numthreads(1,1,1)]
+void TraverseQuadTree (uint3 id : SV_DispatchThreadID)
+{
+    //从待处理栈中取一个数据
+    uint2 nodeLoc = ConsumeNodeList.Consume();
+#ifdef EDGE_CHECK
+    if(_CurrentLod > 0 && EvaluateNode(nodeLoc, _CurrentLod) && _CurrentLod != 4){
+#else
+    if(_CurrentLod > 0 && EvaluateNode(nodeLoc, _CurrentLod)){
+#endif
+        //divide
+        AppendNodeList.Append(nodeLoc * 2);
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,0));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(0,1));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,1));
+    }else{
+        uint edgeVal = 0;
+        //边界检测仅在需要边界特殊操作的面中处理
+#ifdef EDGE_CHECK
+//////////////////////////////////////////Edge Check///////////////////////////////////////
+        if(nodeLoc.x == 0){
+            edgeVal = edgeVal ^ (1 << 1);        //左边的edgeVal为1，检查第2位是否为1
+        }
+        else if(nodeLoc.x == _CurrentEdgeSize){
+            edgeVal = edgeVal ^ (1 << 3);        //右边界的顶点值，检查第4位是否为1
+        }
+
+        if(nodeLoc.y == 0)
+            edgeVal = edgeVal ^ (1 << 4);        //下边的edgeVal为1，检查第5位是否为1
+        else if(nodeLoc.y == _CurrentEdgeSize)
+            edgeVal = edgeVal ^ (1 << 2);        //上边界的顶点值，检查第3位是否为1
+//////////////////////////////////////////END Edge Check///////////////////////////////////////
+#endif
+
+
+        AppendFinalNodeList.Append(uint4(nodeLoc, _CurrentLod, edgeVal));
+    }
+}
+
+
+[numthreads(1, 1, 1)]
+void BuildLodMap(uint3 groupId:SV_GroupID){
+    uint4 nodeLoc = FinalNodeList[groupId.x];
+    uint lod = nodeLoc.z; uint mapSize = _LodMapLevelSize[lod];
+    
+    uint2 begIndex = nodeLoc.xy * mapSize;
+    uint2 finalIndex = begIndex + mapSize;
+    
+    for(uint x = begIndex.x; x < finalIndex.x; x++){
+        for(uint y = begIndex.y; y < finalIndex.y; y++){
+            _LodMap[uint2(x, y)] = lod / 4.0f;
+        }
+    }
+}
+
+
+//进行最终的检查
+[numthreads(1, 1, 1)]
+void BuildPatches(uint3 groupId:SV_GroupID){
+    uint4 nodeLoc = FinalNodeList[groupId.x];
+    Bounds bounds;
+    CreatePatchAndBounds(nodeLoc.xyz, bounds);
+
+    if(Cull(bounds)){
+        return;
+    }
+    CulledPatchList.Append(nodeLoc);
+}
+
+//对每一个node进行切割以及剔除，生成最后的patches
+[numthreads(1, 1, 1)]
+void BuildBounds(uint3 groupId:SV_GroupID){
+    uint4 nodeLoc = FinalNodeList[groupId.x];
+    Bounds bounds;
+    CreatePatchAndBounds(nodeLoc.xyz, bounds);
+    // bounds.maxPosition = 100;
+    // bounds.minPosition = 0;
+    if(Cull(bounds)){
+        return;
+    }
+    BoundsList.Append(bounds);
+}
+
+//对每一个node进行切割以及剔除，生成最后的patches
+[numthreads(1, 1, 1)]
+void BuildPatchesShadow(uint3 id : SV_DispatchThreadID, uint3 groupId:SV_GroupID, uint3 groupThreadId:SV_GroupThreadID){
+    uint4 nodeLoc = FinalNodeList[groupId.x];
+    Bounds bounds;
+    CreatePatchAndBounds(nodeLoc.xyz, bounds);
+
+    if(CullShadow(bounds)){
+        return;
+    }
+    CulledPatchList.Append(nodeLoc);
+}

@@ -1,0 +1,11 @@
+#ifndef CUSTOMRP_CLUSTER_DEFFER_CAMERA_INPUT
+#define CUSTOMRP_CLUSTER_DEFFER_CAMERA_INPUT
+
+TEXTURE2D(_SSRTargetTex);
+
+float4x4 _FrustumCornersRay;
+
+
+
+
+#endif

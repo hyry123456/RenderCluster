@@ -1,0 +1,39 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9d7df589def74a24bbe6757aa40a42f5, type: 3}
+  m_Name: assemble
+  m_EditorClassIdentifier: 
+  TexturesCount: 100
+  CellCount: 2
+  CellSize: 256
+  paddingSize: 2
+  mipsLevel: 3
+  mipsOffset: 1.78
+  mipsChangeSpeed: 0.616
+  FeedbackScale: 1
+  FeedbackZoomScale: 1
+  debugFeedback: {fileID: 0}
+  debugFeedbackZoom: {fileID: 0}
+  rvtDebugTex: {fileID: 0}
+  debugMode: 0
+  normalDebugMode: 0
+  rvtTrilinearBlend: 0
+  brgGBufferExcludeLayer: 31
+  UseRVT: 1
+  clusterShadowMode: 1
+  clusterTargetTexels: 0
+  clusterShadowForceAll: 0
+  useBRG: 0
+  useTileVT: 0
+  TilesPerAxis: 1
+  savePath: C:/Study/UnityProjects/RenderCluster/Assets/StreamingAssets/ClusterData/
+  MipsDebug: 0

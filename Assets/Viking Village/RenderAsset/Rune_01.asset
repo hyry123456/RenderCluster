@@ -1,0 +1,32 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 99af0ebb0dc0aa24bbf0bccbd5eefc54, type: 3}
+  m_Name: Rune_01
+  m_EditorClassIdentifier: 
+  albedo: {fileID: 2800000, guid: 7289e50d10db6f24ca97b9707bfc2b79, type: 3}
+  normal: {fileID: 2800000, guid: 0a11933c811f3884ea71c92e766be627, type: 3}
+  pbrData: {fileID: 2800000, guid: 360f96a5be5dc4a62a3ff30360c565fc, type: 3}
+  emission: {fileID: 0}
+  detail: {fileID: 0}
+  normalScale: 1
+  uv_Offset: {x: 0, y: 0}
+  uv_Scale: {x: 1, y: 1}
+  uv_DetailOffset: {x: 0, y: 0}
+  uv_DetailScale: {x: 1, y: 1}
+  metallic: 0.08
+  roughness: 1
+  cullOff: 0.5
+  detailAlbedo: 0
+  detailNormal: 0
+  detailRoughness: 0
+  emissionColor: {r: 0, g: 0, b: 0, a: 0.99999994}
+  mainColor: {r: 0.8018868, g: 0.7905393, b: 0.7905393, a: 1}

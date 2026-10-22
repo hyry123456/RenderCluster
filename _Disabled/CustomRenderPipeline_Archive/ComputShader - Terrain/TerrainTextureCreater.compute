@@ -1,0 +1,82 @@
+//Terrain 贴图创建器，用来创建
+
+#pragma kernel DrawFirstMinMaxHeightMap
+#pragma kernel DrawMipsMinMaxHeightMap
+#pragma kernel GenerateNormal
+
+
+RWTexture2D<float2> Result;
+RWTexture2D<float> _OriginHeighTex;     //源高度图
+RWTexture2D<float2> _MipsHightTex;     //后续的mips高度图
+
+[numthreads(32, 32, 1)]
+void DrawFirstMinMaxHeightMap (uint3 id : SV_DispatchThreadID)
+{
+    uint width, hight;
+    _OriginHeighTex.GetDimensions(width, hight);
+
+    if(id.x >= width - 1 || id.y >= hight - 1) return;
+
+    float hight00 = _OriginHeighTex[id.xy];
+    float hight01 = _OriginHeighTex[id.xy + uint2(0, 1)];
+    float hight10 = _OriginHeighTex[id.xy + uint2(1, 0)];
+    float hight11 = _OriginHeighTex[id.xy + uint2(1, 1)];
+
+    float2 minMaxHight = float2(
+            min(min(hight00, hight01), min(hight10, hight11)),
+            max(max(hight00, hight01), max(hight10, hight11))
+        );
+    Result[id.xy] = minMaxHight;
+}
+
+
+[numthreads(8, 8, 1)]
+void DrawMipsMinMaxHeightMap (uint3 id : SV_DispatchThreadID)
+{
+    uint width, hight;
+    Result.GetDimensions(width, hight);     //根据源高度图进行读写
+
+    uint2 index = id.xy * 2;        //每次缩放2倍
+
+    float2 hight00 = _MipsHightTex[index.xy];
+    float2 hight01 = _MipsHightTex[index.xy + uint2(0, 1)];
+    float2 hight10 = _MipsHightTex[index.xy + uint2(1, 0)];
+    float2 hight11 = _MipsHightTex[index.xy + uint2(1, 1)];
+
+    float2 minMaxHight = float2(
+            min(min(hight00.x, hight01.x), min(hight10.x, hight11.x)),
+            max(max(hight00.y, hight01.y), max(hight10.y, hight11.y))
+        );
+    Result[id.xy] = minMaxHight;
+}
+
+
+Texture2D<float4> HeightTex;
+RWTexture2D<float4> NormalTex;
+uint width, hight;
+
+float3 GetPosition(uint2 coord){
+    float height = HeightTex[coord].r;
+    return float3(coord.x * 1.0 / width,height,coord.y * 1.0 / hight); 
+}
+
+float3 GetNormal(float3 v1,float3 v2){
+    return normalize(-cross(v1,v2)).xyz;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateNormal (uint3 id : SV_DispatchThreadID)
+{
+    uint2 coord = id.xy;
+    HeightTex.GetDimensions(width, hight);
+    float3 p0 = GetPosition(coord);
+    float3 v1 = GetPosition(coord + uint2(1,0)) - p0;
+    float3 v2 = GetPosition(coord + uint2(0,1)) - p0;
+    float3 v3 = GetPosition(coord + uint2(-1,0)) - p0;
+    float3 v4 = GetPosition(coord + uint2(0,-1)) - p0;
+
+    float3 normal = GetNormal(v1,v2) + GetNormal(v2,v3) + GetNormal(v3,v4) + GetNormal(v4,v1);
+    normal = normalize(normal);
+    normal = (normal + 1) * 0.5;
+    NormalTex[coord] = float4(normal.xzy,1);
+}

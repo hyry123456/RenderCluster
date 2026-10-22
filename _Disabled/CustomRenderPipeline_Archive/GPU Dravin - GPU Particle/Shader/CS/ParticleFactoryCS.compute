@@ -1,0 +1,86 @@
+//单个节点控制的粒子数量
+#define PerNodeCount 32
+
+#include "../HLSL/ParticleFactoryInc.hlsl"
+
+
+//新的粒子工厂
+#pragma kernel Particles_PerFrame
+
+//逐帧刷新的方法，用来控制与渲染直接相关的数据
+[numthreads(1024, 1, 1)]
+void Particles_PerFrame(uint3 id : SV_DispatchThreadID)
+{
+    uint objIndex = id.x;
+    uint size, stride;
+    particlesBuffer.GetDimensions(size, stride);
+    if(objIndex >= size) return;
+    uint groIndex = objIndex / PerNodeCount;
+
+    FactoryNode node = nodesBuffer[groIndex];
+    NoiseParticleData particle = particlesBuffer[objIndex];
+
+    //检查是否处于存活阶段
+    if(node.lifeTime.x < _Time.x){
+        particle.index.y = 0;
+        particle.random.w = 0;      //时间初始化
+        particlesBuffer[objIndex] = particle;
+        return;
+    }
+
+
+
+    float randomTime = abs(random(particle.random.z));
+    float beginTime = node.lifeTime.x - node.lifeTime.y - node.lifeTime.z * randomTime;     //释放时间
+    //检查是否处于释放阶段
+    if(beginTime > _Time.x){
+        particle.index.y = 0;   //未到释放阶段
+        particle.random.w = 0;
+        particlesBuffer[objIndex] = particle;
+        return;
+    }
+
+    //检查是否大于存活时间，大于标记为关闭
+    if(particle.random.w > node.lifeTime.y){
+        particle.index.y = 2;       //标记为超时
+        particlesBuffer[objIndex] = particle;
+        return;
+    }
+
+    //运行阶段
+    if(particle.index.y == 0){  //初始化
+        InitializeParticle(particle, node);
+    }
+    else{   //正常运行
+        CommonUpdate(particle);
+    }
+
+    CaculateSurface(particle, node);
+    particlesBuffer[objIndex] = particle;
+}
+
+#pragma kernel Particles_PerFixFrame
+
+//粒子重力没必要这么大
+#define GRAVITY 2.2
+
+//逐帧刷新的方法，用来控制大小以及施加力
+[numthreads(1024, 1, 1)]
+void Particles_PerFixFrame(uint3 id : SV_DispatchThreadID)
+{
+    uint objIndex = id.x;
+    uint size, stride;
+    particlesBuffer.GetDimensions(size, stride);
+    if(objIndex >= size) return;
+    uint groIndex = objIndex / PerNodeCount;
+
+    NoiseParticleData particle = particlesBuffer[objIndex];
+
+    if(particle.index.y == 1){
+        FactoryNode node = nodesBuffer[groIndex];
+        if(node.initlizeMode.z == 1)
+            particle.nowSpeed += float3(0, -GRAVITY, 0) * _Time.z;
+        FixFrameUpdate(particle, node);
+        particlesBuffer[objIndex] = particle;
+    }
+}

@@ -1,0 +1,57 @@
+# ===== Unity 生成的目录（巨大且可重建，绝不提交）=====
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+.vs/
+
+# ===== Unity 自动生成的工程文件（可重建）=====
+*.csproj
+*.unityproj
+*.sln
+*.sln.dotSettings
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# ===== OS / 编辑器临时文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== WorkBuddy 本地备份（已由 git 接管回退）=====
+.workbuddy/backup/
+
+# ===== 数据 / 资源：本地存储，不进 Git（Git 只管代码 + 配置 + 小图）=====
+# 模型
+*.fbx
+*.obj
+*.blend
+*.max
+*.dae
+*.3ds
+# 大贴图 / 图像（.png / .jpg 等小图保留进 Git）
+*.tif
+*.tiff
+*.hdr
+*.exr
+*.tga
+*.psd
+*.dds
+# 音频
+*.wav
+*.mp3
+*.ogg
+*.aiff
+*.m4a
+# 其他大包
+*.unitypackage

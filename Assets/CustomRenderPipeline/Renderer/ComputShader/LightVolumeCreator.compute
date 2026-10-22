@@ -1,0 +1,192 @@
+#pragma kernel RenderDirection
+#pragma kernel RenderSpot
+#pragma kernel RenderPoint
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/CommonMaterial.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Shadow/ShadowSamplingTent.hlsl"
+
+// #define FILTER_SAMPLES 16
+// #define FILTER_SETUP SampleShadow_ComputeSamples_Tent_7x7
+// #define SHADOW_SAMPLER sampler_linear_clamp_compare
+// SAMPLER_CMP(SHADOW_SAMPLER);
+SAMPLER(sampler_linear_clamp);
+// SAMPLER(sampler_point_clamp);
+
+TEXTURE2D_SHADOW(_ShadowMap);
+
+RWTexture3D<float4> Result;
+
+// RWTexture2D<float4> _Check;
+
+// Texture2D<float> _ShadowMap;
+// SamplerState sampler_ShadowMap;
+
+float3 _BoxMax;
+float3 _BoxMin;
+float2 _ShadowMapSize;
+float4 _LightColor;
+
+float4x4 _WorldToNDC;
+
+float4 _LightPosition;
+float4 _LightSpotAngle;
+float4 _LightDirect;
+uint _FilterCount;
+
+
+float GetShadowIntensity(float3 positionSTS){
+    float shadowDepth = SAMPLE_TEXTURE2D_LOD(
+        _ShadowMap, sampler_linear_clamp, positionSTS.xy, 0
+    ).r;
+    return (positionSTS.z >= shadowDepth)? 1 : 0;
+}
+
+float GetDepth(float3 worldPos){
+    float4 positionSTS = mul(_WorldToNDC, float4(worldPos, 1));
+    positionSTS.xyz /= positionSTS.w;
+    positionSTS.xyz = positionSTS.xyz * 0.5 + 0.5;
+
+    positionSTS.z = 1.0 - positionSTS.z;
+    return GetShadowIntensity(positionSTS.xyz);
+}
+
+
+[numthreads(8, 8, 8)]
+void RenderDirection(uint3 id : SV_DispatchThreadID)
+{
+    float3 range = _BoxMax.xyz - _BoxMin.xyz;
+
+    uint width, high, depth;
+    Result.GetDimensions(width, high, depth);
+    range /= width;
+
+
+    float shadow = 0;
+    float3 threRange = range / _FilterCount;
+    float3 avaragePos = 0;
+    float3 worldPos = _BoxMin + id * range;
+
+    for(uint i = 0; i < _FilterCount; i++){
+        for(uint j = 0; j < _FilterCount; j++){
+            for(uint k = 0; k < _FilterCount; k++){
+                float3 worldPos = _BoxMin + id * range + threRange * float3(i, j, k);
+                shadow += GetDepth(worldPos);
+            }
+        }
+    }
+
+    shadow /= _FilterCount * _FilterCount * _FilterCount; 
+
+    Result[id] += max(shadow * _LightColor, 0);
+}
+
+float Square (float x) {
+	return x * x;
+}
+
+float DistanceSquared(float3 pA, float3 pB) {
+	return dot(pA - pB, pA - pB);
+}
+
+[numthreads(8, 8, 8)]
+void RenderSpot(uint3 id : SV_DispatchThreadID)
+{
+    float3 range = _BoxMax.xyz - _BoxMin.xyz;
+
+    uint width, high, depth;
+    Result.GetDimensions(width, high, depth);
+    range /= width;
+
+    float3 color = 0;
+    float3 threRange = range / _FilterCount;
+
+    for(uint i = 0; i < _FilterCount; i++){
+        for(uint j = 0; j < _FilterCount; j++){
+            for(uint k = 0; k < _FilterCount; k++){
+                float3 worldPos = _BoxMin + id * range + threRange * float3(i, j, k);
+                float shadow = GetDepth(worldPos);
+
+                float3 ray = _LightPosition.xyz - worldPos;
+                float3 direction = normalize(ray);
+                float distanceSqr = max(dot(ray, ray), 0.00001);
+                float rangeAttenuation = Square(
+                    saturate(1.0 - Square(distanceSqr * _LightPosition.w))
+                );
+
+                float spotAttenuation = Square(
+                    saturate(dot(_LightDirect.xyz, direction) *
+                    _LightSpotAngle.x + _LightSpotAngle.y)
+                );
+
+                color += shadow * _LightColor.xyz * spotAttenuation * rangeAttenuation / distanceSqr;
+
+            }
+        }
+    }
+
+    color /= _FilterCount * _FilterCount * _FilterCount; 
+
+    Result[id] += float4(max(color * 5, 0.0), 1);
+
+
+}
+
+#define TRISECTION 0.33333333
+
+float4x4 _PointWorldToNDC[6];
+
+float GetPointDepth(float3 worldPos, uint index){
+    float4 positionSTS = mul(_PointWorldToNDC[index], float4(worldPos, 1));
+    positionSTS.xyz /= positionSTS.w;
+    positionSTS.xyz = positionSTS.xyz * 0.5 + 0.5;
+
+    uint2 offset = uint2(index % 3, index / 3);
+    positionSTS.x = TRISECTION * offset.x + positionSTS.x * TRISECTION;
+    positionSTS.y = 0.5f * offset.y + positionSTS.y * 0.5f;
+
+    positionSTS.z = 1.0 - positionSTS.z;
+    return GetShadowIntensity(positionSTS.xyz);
+}
+
+
+[numthreads(8, 8, 8)]
+void RenderPoint(uint3 id : SV_DispatchThreadID)
+{
+    float3 range = _BoxMax.xyz - _BoxMin.xyz;
+
+    uint width, high, depth;
+    Result.GetDimensions(width, high, depth);
+    range /= width;
+
+    // float shadow = 0;
+    float3 color = 0;
+    float3 threRange = range / _FilterCount;
+
+    for(uint i = 0; i < _FilterCount; i++){
+        for(uint j = 0; j < _FilterCount; j++){
+            for(uint k = 0; k < _FilterCount; k++){
+                float3 worldPos = _BoxMin + id * range + threRange * float3(i, j, k);
+
+                float3 position = _LightPosition.xyz;
+                float3 tempRay = position - worldPos;
+                float3 worldPosToLightDir = normalize(tempRay);
+                uint index = CubeMapFaceID(-worldPosToLightDir);
+                // shadow += GetPointDepth(worldPos, index);
+                float shadow = GetPointDepth(worldPos, index);
+
+                float3 ray = _LightPosition.xyz - worldPos;
+                float3 direction = normalize(ray);
+                float distanceSqr = max(dot(ray, ray), 0.00001);
+                float rangeAttenuation = Square(
+                    saturate(1.0 - Square(distanceSqr * _LightPosition.w))
+                );
+                color += shadow * rangeAttenuation * _LightColor.xyz / distanceSqr;
+            }
+        }
+    }
+    color /= _FilterCount * _FilterCount * _FilterCount; 
+
+
+
+    Result[id] += float4(max(color, 0.0), 1);
+}

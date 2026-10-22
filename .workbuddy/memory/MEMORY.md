@@ -1,0 +1,55 @@
+# RenderCluster 项目长期记忆
+
+## 1. Cluster 阴影管线（当前定案）
+- 三条路径由资产 `clusterShadowMode` 切换：SRP(0) / Cluster(1) / ClusterDebug(2)。
+  ClusterDebug = 同 GPU 路径 + CPU 复算 + 限频读回 `_Counter`/`_Args` 对账（`LogStats()` 1/120 帧，仅 Debug）。
+- GPU 逐簇剔除（`ClusterShadowCull.compute`：Reset/CullAll/BuildArgs 三 kernel，整帧 3 dispatch + 每级联 1 次 `DrawProceduralIndirect`）。**只画 LOD0**（`lodCount=1`，`_MaxLod=1` 守卫，`targetTexels<=0` 关闭 LOD 判据）。`clusterShadowForceAll` = 强制全画，区分「剔除错」vs「绘制链坏」。
+- **是真正的 indirect draw**：`BuildArgs` 写 `_Args[k*4+1]=_Counter[k]`（GPU 可见簇数），`Draw()` 用 `DrawProceduralIndirect(argsBuf, 16*k)`；shader 用 `instanceID` 取 `_Visible[_ClusterBase+instanceID]` 得真实簇号。**`argsBuf` 必须用 `ComputeBufferType.IndirectArguments` 创建**（漏了报 "missing IndirectArguments flag"）。
+
+## 2. 铁律（改代码前必看）
+- **阴影矩阵**：`buffer.SetViewProjectionMatrices(view,proj)` 内部已自动 `GL.GetGPUProjectionMatrix`；shader 直接用 `unity_MatrixVP`（= SRP `TransformWorldToHClip`）。**绝不要手推 z 行改写**（曾致阴影全错）。
+- **`_Indices` 是全局顶点号**：shader 直接 `_Positions[_Indices[c*384+vid]]`，别再加簇基址（历史双重偏移坑）。
+- **compute buffer 按 kernel 绑定**：`SetBuffer(kernelIndex,name,buf)`，无 `SetComputeBufferParam`。被多 kernel 共用的 buffer（如 `_Counter`）必须逐 kernel 绑全，漏绑的 dispatch 直接失效（症状：indirect instanceCount=0、无报错）。
+- **剔除平面**：用 `GeometryUtility.CalculateFrustumPlanes(viewProj)`（世界空间，官方保证）；**别用 `ShadowSplitData.GetCullingPlane`**（空间不明，实测剔光世界）。`_ClusterBounds` 必须是世界空间包围球。
+
+## 3. 架构 / 渲染
+- 渲染 = BRG 批处理；逐簇 DrawMesh 已弃用（4FPS，归档 `_Deprecated/ClusterPath/`）。
+- 纹理 = Tile-VT（`useTileVT`），与几何正交；T=1 公式退化为「整图一格」。
+- 延迟管线 `DefferPipeline`：GBuffer MRT（RT0 albedo+metal…），renderScale=1，MSAA 1x。
+- Edit 模式 `ClusterObject.OnEnable` 啥也不做 → 物体保持场景原材质（Edit 清晰/Play 糊分岔点）。Play+UseRVT=0 → `ApplyStandardMaterials()`（已是 DefferStandard 则原样沿用）；UseRVT=1 → BRG 注册。
+
+## 4. BRG 阴影（layer 排除法，2026-10-21）
+- 让 BRG 不投影的正解 = 删 `Unlit/ClusterPBR_BRG` 的 ShadowCaster pass（Unity 按 `LightMode="ShadowCaster"` 找 pass）。别走 `BatchFilterSettings.shadowCastingMode=Off`（2022.3 SRP 拦不干净）。
+- 替代：`brgGBufferExcludeLayer`（默认 31；-1 关闭）。物体挪到该 layer + 材质换 `AssetMat(Unlit/ClusterPBR)`（其 ShadowCaster 比 DefferStandard 便宜 ~40%）；BRG `shadowCastingMode` 由 `BRGCastsShadows => layer<0` 实时派生。
+- GBuffer/Unsupported pass 排除该层防双重绘制；相机/灯光 cullingMask 缺层自动补位+警告一次。退 Play 还原 layer（`OnDisable`）。
+- 结论：BRG 对 134 个组合无收益，RVT+BRG 也打不过全 SRP 档（A 档 ~380fps）。瓶颈是阴影 pass 不是 RVT。
+
+## 5. Tile-VT 不变式
+- 单图虚拟分辨率 `V=CellSize×TilesPerAxis`（非 CellSize）；level0 容量=`CellCount²×mips/T²`。先算容量再调 mipsOffset。
+- mip 用 `V`：`uv=baseUV*(_VTFeedbackParam.y*T)`，四处一致。mip 公式 `clamp(speed·log2(max(dot(dx,dx),dot(dy,dy)))+offset,0,mips-1)`，`speed=0.25,offset=0`（别加 `+1.0-speed`）。
+- 图集边长 `=(padding·2^(mips-1)·2+CellSize)·CellCount·mips`；超 `maxTextureSize` 时 `Create()` 不抛异常只 `IsCreated()==false` ⇒ 黑屏。当前资产被调小到 CellSize256/T1 很糊，测完调回参考值(512/4/6/4)。
+
+## 6. 雷区集合
+- `ClusterPBR*.shader` 内嵌 SampleRVT/GetColor 逐字副本 → 改 pageId 多处同步。
+- `ClusterPBR_BRG.shader` 必须自带 `LightMode="Feedback"` Pass。
+- RVT 反馈只在 `cameraType==Game`；Scene 视图不更新页表。
+- `TileTable` 写入属性名带 `_RVT*Src` 前缀（否则 `SetTexture` 静默跳过）。
+- 图集 RT `mipCount=0` ⇒ anisoLevel 无效，shader 手动各向异性。
+- Unity 2022 全局 keyword 跟随 CommandBuffer：无材质 `buffer.Blit` → `Incompatible keyword states`，改走管线材质 `Draw()`。
+- 活动代码=`Core/Shadows.cs`+`Core/Lighting.cs`；`MyRenderPipeline/Lighting/MyShadow.cs` 死代码。
+- `ClusterCore.cs` 同时 `using Common;using System;using UnityEngine;` ⇒ 用 `UnityEngine.Object.`。
+- `FilteringSettings.layerMask` 是 `int`（按位当 uint 需 `unchecked((int)...)`）；类名 `ClusterProverty`（非 Proverty）；`RenderPipelineBase.cs` 无 `using Cluster` 写全限定名。
+- Profiler 用 C# `Profiler.BeginSample`（`using UnityEngine.Profiling`）；`ExecuteBuffer()` 会 `buffer.Clear()`，跨提交 Begin/End 必失衡。
+- 2022.3 `AsyncGPUReadback.Request` 区域版无 depth 参数；读 GPU 用 `RenderTexture.active+ReadPixels+GetPixelData<T>(0)`。`SetVertexBufferParams`/带索引 `DrawProcedural` 不可用。
+- 法线链路：图集存法线原样，读取侧 `DecodeNormal(map,scale)+normal.y*=-1.0`（DX vs Unity 切线空间）。5 处一致。别动八面体。
+- detail 直采不走虚拟化（越页串色）；BRG 材质源=场景原材质。
+- mask 白回退：无 mask 图时 mask 恒白（AO=1），移植必须带白回退；判 mask 看 `_MASK_MAP` keyword 真值。
+- UnityPerMaterial cbuffer「三处逐字副本」：漏一处 ⇒ cbuffer 不一致 ⇒ pass 不画（阴影缺失但画面正常，易误判）。
+- `_CLIPPING`：`_CullOff` 有值≠该裁，看 keyword 真值。
+- 诊断：`NormalDebugMode` 决策树；两套 Debug 别混（assemble 只管预览槽，画面由 DefferPipeline.asset 决定）；截图对比固定相机+1920×1080+只切 UseRVT。
+
+## 7. 用户偏好 / 工具
+- 重视先想清楚再动手，反感返工；改"疑似数据源"文件前先确认是否被引用；中文/Windows；不复用旧 cluster 剔除代码。
+- **工程已用 Git + LFS**（根目录 `.git`/`.gitignore`/`.gitattributes`）：大贴图(.tif/.hdr/.png…)走 LFS，YAML(.asset/.prefab/.unity)保留文本 diff；忽略 Library/Temp/obj/Logs/UserSettings。
+- 编译验证：Unity 编辑器常被占用时，用 `.workbuddy/compile_check.py`（Unity 自带 Roslyn 直编 Assembly-CSharp）；矩阵数值验证 `.workbuddy/verify_matrix.py`（纯 Python）。
+- 未来：Hi-Z 层级深度遮挡剔除；逐贴图 `T=ceil(texSize/CellSize)`；occlusion 接入；清理 `_VirtualDetail` 与旧 System B 九图集。

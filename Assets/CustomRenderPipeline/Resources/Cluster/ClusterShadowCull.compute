@@ -1,0 +1,118 @@
+// 【真正的 cluster 管线】阴影用的逐簇 GPU 剔除。
+//
+// ── 为什么需要它 ──
+// 不做剔除时 instanceCount = 全部簇数，Frame Debugger 里是 N 条 Draw Procedural，
+// 顶点着色器要把整个场景的顶点全部跑一遍（哪怕 95% 在视锥外被硬件裁掉）。
+// 剔除之后每级联只提交【真正落在该级联视锥里的簇】，顶点数大幅下降。
+//
+// ── 一次 dispatch 剔完【所有级联】 ──
+//     Reset    （1 个线程组，纯清零）
+//     CullAll  （每线程一个簇，内部循环所有级联，各判一次）
+//     BuildArgs（每线程一个级联，写 indirect args）
+//   ⇒ 整个阴影总共 3 个 dispatch + 每级联 1 次 indirect draw。
+// 为什么必须「每级联判一次」：4 个级联是 4 个不同的正交视锥 + 4 张不同的图，
+// 一个簇在级联 0 可见、在级联 3 可能完全在外面。合并的是 dispatch 次数，不是判定次数。
+//
+// ── 平面空间的确定（历史上踩过坑）──
+// 用 GeometryUtility.CalculateFrustumPlanes(viewProj) —— 官方文档保证返回【世界空间】平面。
+// 不要再用 ShadowSplitData.GetCullingPlane：它返回的空间官方没写明，
+// 之前实测把整个世界都剔掉了（可见簇恒为 0）。
+//
+// ⚠️ buffer 绑定是【按 kernel】的：SetComputeBufferParam(cs, kernelIndex, ...)
+//    只对该 kernel 生效。一个 buffer 被多个 kernel 用（下面 _Counter 同时被
+//    Reset / CullAll / BuildArgs 读写，_Visible 被 CullAll 读写），
+//    必须逐个 kernel 绑全 —— 漏绑的那个 dispatch 直接失效，
+//    症状是「间接绘制 instanceCount=0、什么都不画、且不一定有明确报错」。
+
+#pragma kernel Reset
+#pragma kernel CullAll
+#pragma kernel BuildArgs
+
+StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=半径
+
+// 每级联 _PlanesPerCascade 个平面，按 [cascade * _PlanesPerCascade + i] 排布（世界空间）。
+StructuredBuffer<float4> _Planes;
+// 每级联一个参数：(projScale, targetTexels, planeCount, _MaxLod)
+//   projScale     = 该级联 proj[1][1]（世界→阴影空间 z 的归一化尺度）
+//   targetTexels  <= 0 表示【不做 LOD 判据】（当前只有 LOD0，判了也没得选）
+StructuredBuffer<float4> _CascadeParams;
+
+RWStructuredBuffer<uint> _Visible;                // [cascade * _ClusterCount + slot] = 簇下标
+RWStructuredBuffer<uint> _Counter;                // [cascade] = 该级联可见簇数
+RWStructuredBuffer<uint> _Args;                   // [cascade * 4 + 0..3] = indirect args
+
+int _CascadeCount;
+int _ClusterCount;
+int _PlanesPerCascade;
+int _MaxLod;                                     // 当前可用 LOD 级数（只有 LOD0 ⇒ 1）
+int _TrisPerCluster;
+int _DebugForceAll;                              // 非 0 = 跳过所有剔除，全可见（排查用）
+
+// 纯清零：dispatch 1 组即可
+[numthreads(64, 1, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _CascadeCount) _Counter[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void CullAll(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if ((int)c >= _ClusterCount) return;
+
+    // 同一份包围球只读一次，循环所有级联 ⇒ 这就是「剔一次拿到全部级联的可见列表」
+    float4 bb = _ClusterBounds[c];
+    float3 center = bb.xyz;
+    float radius = bb.w;
+    int lod = 0;                                  // 只烘了 LOD0
+
+    for (int k = 0; k < _CascadeCount; k++)
+    {
+        float4 cp = _CascadeParams[k];
+        bool ok = true;
+
+        if (_DebugForceAll == 0)
+        {
+            // ---- 1. 视锥剔除：包围球 vs 该级联的 6 个世界空间平面 ----
+            // dot(n, p) + d >= 0 在内侧 ⇒ 球完全在外侧时 dot + d < -radius
+            int pc = (int)cp.z;
+            int baseIdx = k * _PlanesPerCascade;
+            for (int i = 0; i < pc; i++)
+            {
+                float4 pl = _Planes[baseIdx + i];
+                if (dot(pl.xyz, center) + pl.w < -radius) { ok = false; break; }
+            }
+
+            // ---- 2. LOD 选择（仅当 targetTexels > 0 且有多级 LOD 时才有意义）----
+            if (ok && cp.y > 0.0 && _MaxLod > 1)
+            {
+                float texelRadius = radius * cp.x;  // 该簇投影到阴影图上的半径（texel）
+                float target = cp.y;
+                if (texelRadius > target)             ok = (lod == 0);
+                else if (texelRadius * 2.0 <= target) ok = (lod == _MaxLod - 1);
+            }
+        }
+
+        if (!ok) continue;
+
+        // ---- 3. 原子追加进该级联的紧凑列表 ----
+        uint slot;
+        InterlockedAdd(_Counter[k], 1u, slot);
+        if ((int)slot < _ClusterCount)
+            _Visible[k * _ClusterCount + (int)slot] = c;
+    }
+}
+
+// 每线程一个级联：把计数翻译成 indirect args（每实例固定 _TrisPerCluster*3 个顶点）
+[numthreads(8, 1, 1)]
+void BuildArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint k = id.x;
+    if ((int)k >= _CascadeCount) return;
+
+    _Args[k * 4 + 0] = (uint)(_TrisPerCluster * 3);
+    _Args[k * 4 + 1] = _Counter[k];
+    _Args[k * 4 + 2] = 0;
+    _Args[k * 4 + 3] = 0;
+}

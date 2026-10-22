@@ -1,0 +1,30 @@
+Log：logger Start, time: 2024/1/29 14:59:12, version: 2020.3.22f1c1.
+Windows 10  (10.0.22621) 64bit AMD Ryzen 7 5800H with Radeon Graphics  16 memorySize:15720 Graphics: NVIDIA GeForce RTX 3060 Laptop GPU vendor: NVIDIA memorySize: 6009 Direct3D 11.0 [level 11.1]
+
+Warning：CommandBuffer: temporary render texture  not found while executing Main Camera (Blit source)
+UnityEngine.Rendering.ScriptableRenderContext:Submit ()
+CustomRenderPipline.DefferPipeline.DefferPipeline:Submit () (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipeline.cs:576)
+CustomRenderPipline.DefferPipeline.DefferPipeline:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera,CustomRenderPipline.RenderSetting,CustomRenderPipline.ShadowSetting,CustomRenderPipline.DefferPipeline.DefferSetting,CustomRenderPipline.PostFXSetting) (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipeline.cs:207)
+CustomRenderPipline.DefferPipeline.DefferPipelineAsset:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera,int) (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipelineAsset.cs:151)
+CustomRenderPipline.RenderPiplineBase:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera[]) (at Assets/CustomRenderPipeline/Runtime/RenderPiplineBase/PipelineAsset.cs:54)
+UnityEngine.GUIUtility:ProcessEvent (int,intptr,bool&)
+
+Warning：CommandBuffer: temporary render texture  not found while executing SceneCamera (Blit source)
+UnityEngine.Rendering.ScriptableRenderContext:Submit ()
+CustomRenderPipline.DefferPipeline.DefferPipeline:Submit () (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipeline.cs:576)
+CustomRenderPipline.DefferPipeline.DefferPipeline:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera,CustomRenderPipline.RenderSetting,CustomRenderPipline.ShadowSetting,CustomRenderPipline.DefferPipeline.DefferSetting,CustomRenderPipline.PostFXSetting) (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipeline.cs:207)
+CustomRenderPipline.DefferPipeline.DefferPipelineAsset:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera,int) (at Assets/CustomRenderPipeline/Runtime/Defferrd Render/Core/DefferPipelineAsset.cs:151)
+CustomRenderPipline.RenderPiplineBase:Render (UnityEngine.Rendering.ScriptableRenderContext,UnityEngine.Camera[]) (at Assets/CustomRenderPipeline/Runtime/RenderPiplineBase/PipelineAsset.cs:58)
+UnityEngine.GUIUtility:ProcessEvent (int,intptr,bool&)
+
+Warning：Visual Studio Editor Package version 2.0.22 is available, we strongly encourage you to update from the Unity Package Manager for a better Visual Studio integration
+UnityEngine.Debug:LogWarning (object)
+Microsoft.Unity.VisualStudio.Editor.VisualStudioIntegration:HandleListRequestCompletion () (at Library/PackageCache/com.unity.ide.visualstudio@2.0.11/Editor/VisualStudioIntegration.cs:149)
+Microsoft.Unity.VisualStudio.Editor.VisualStudioIntegration:OnUpdate () (at Library/PackageCache/com.unity.ide.visualstudio@2.0.11/Editor/VisualStudioIntegration.cs:160)
+UnityEditor.EditorApplication:Internal_CallUpdateFunctions ()
+
+Error：Releasing render texture that is set as Camera.targetTexture!
+  at System.Environment.get_StackTrace () [0x00000] in <695d1cc93cca45069c528c15c9fdd749>:0 
+  at LoggerWriter.OnLogCallBack (System.String condition, System.String stackTrace, UnityEngine.LogType type) [0x00062] in C:\Unity\Project\RenderCluster\Assets\LoggerWriter.cs:122 
+  at UnityEngine.Application.CallLogCallback (System.String logString, System.String stackTrace, UnityEngine.LogType type, System.Boolean invokedOnMainThread) [0x00000] in <6e4d12b24947479396255a251bf563ca>:0 
+

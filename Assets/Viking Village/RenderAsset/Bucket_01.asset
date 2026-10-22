@@ -1,0 +1,32 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 99af0ebb0dc0aa24bbf0bccbd5eefc54, type: 3}
+  m_Name: Bucket_01
+  m_EditorClassIdentifier: 
+  albedo: {fileID: 2800000, guid: 037dea175588e8649b80d238764e9814, type: 3}
+  normal: {fileID: 2800000, guid: 81e46d8ffd02cd647a14da3d9ca7cf5f, type: 3}
+  pbrData: {fileID: 2800000, guid: f6a2ff3b668044043929238ef83c3289, type: 3}
+  emission: {fileID: 0}
+  detail: {fileID: 2800000, guid: 6eb813f654b1acf4d828514fe4a80e45, type: 3}
+  normalScale: 1
+  uv_Offset: {x: 0, y: 0}
+  uv_Scale: {x: 1, y: 1}
+  uv_DetailOffset: {x: 0, y: 0}
+  uv_DetailScale: {x: 6, y: 6}
+  metallic: 0.69
+  roughness: 1
+  cullOff: 0.5
+  detailAlbedo: 0
+  detailNormal: 1
+  detailRoughness: 0
+  emissionColor: {r: 0, g: 0, b: 0, a: 0.99999994}
+  mainColor: {r: 1, g: 1, b: 1, a: 1}

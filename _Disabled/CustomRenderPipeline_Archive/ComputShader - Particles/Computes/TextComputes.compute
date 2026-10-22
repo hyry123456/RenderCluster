@@ -1,0 +1,209 @@
+#include "../Input/ParticleSystemInput.hlsl"
+#include "../Input/NoiseInput.hlsl"
+
+//固定定义两个主函数，主函数已经定义好了，不用多管
+#pragma kernel ParticleUpdate
+#pragma kernel ParticleFixUpdate
+#pragma kernel ParticleFixUpdate_Collsion
+#pragma kernel ParticleSorting
+
+float4x4 _LocalToWorld;
+float3 _CubeRange;
+float _Arc, _Radius;
+float3 _BeginSpeed;
+float _LifeTime;            //存活时间
+
+uint4 _Mode;                //x:起始形状，y:初始速度模式, z:重力模式, w:粒子大小的决定模式
+float4 _Gravity;            //重力方向
+
+float _Frequency;           //采样频率
+int _Octave;                //采样次数
+float _Intensity;           //采样强度
+float _SpeedDamping;        //速度衰减
+
+float4 _SizeRange;          //xy:particle Size Range, zw:speed to size range
+
+StructuredBuffer<float4> _SizesBuffer;
+StructuredBuffer<float4> _ColorsBuffer;
+StructuredBuffer<float2> _AlphasBuffer;
+
+//使用参数方程作为坐标生成的根据
+float3 GetSphereBeginPos(float2 random) {
+    float3 pos;
+    float u, _sin;
+    u = lerp(-_Arc/2, _Arc / 2, random.y);
+    pos.x = (random.x - 0.5) * 2;
+    _sin = sqrt(1.0 - pos.x * pos.x);
+    pos.z = cos(u) * _sin;
+    pos.y = sin(u) * _sin;
+    pos = normalize(pos) * _Radius;
+
+    return mul(_LocalToWorld, float4(pos, 1)).xyz;
+}
+
+float3 GetCubeBeginPos(float3 random){
+    float3 begin = -_CubeRange/2.0;
+    float3 end = _CubeRange/2.0;
+    float3 pos = lerp(begin, end, random);
+    return mul(_LocalToWorld, float4(pos, 1)).xyz;
+}
+
+//初始化位置的调用方法
+float3 GetBeginPos(float3 ramdom){
+    // return GetSphereBeginPos(ramdom.yx);
+    // return mul(_LocalToWorld, float4(0, 0, 0, 1)).xyz;
+    switch (_Mode.x){
+        case 1:
+            return GetSphereBeginPos(ramdom.yx);
+        case 2:
+            return GetCubeBeginPos(ramdom.yzx);
+        default:
+           return mul(_LocalToWorld, float4(0, 0, 0, 1)).xyz;
+    }
+
+}
+
+//获得初始速度
+float3 GetBeginSpeed(float3 beginPos){
+    float3 temp = abs(_BeginSpeed.xyz);
+    float speed = temp.x + temp.y + temp.z;    //根据速度大小确定一个随机速度
+    float3 normal = normalize(_BeginSpeed.xyz);
+    float3 direct = normalize(beginPos - mul(_LocalToWorld, float4(0, 0, 0, 1)).xyz);
+    switch(_Mode.y){
+        case 1:     //速度是法线以及大小，在粒子位置生成一个垂直于法线且是向外的力度
+            return normalize( (direct - normal * dot(direct, normal)) ) * speed;
+        case 2:     //在粒子位置生成一个垂直于法线且是向内的力度
+            return -normalize( (direct - normal * dot(direct, normal)) ) * speed;
+        case 3:     //朝向起始位置的速度，也就是往中间汇集
+            return -direct * speed;
+        case 4:     //离开起始位置的速度，也就是从中间往外面跑
+            return direct * speed;
+        default: //默认模式,传入速度就是初始化速度
+            return _BeginSpeed.xyz;
+    }
+}
+
+//获得重力方向以及强度
+float3 GetGravity(float3 worldPos){
+    switch (_Mode.z){
+        case 1:
+            return _Gravity.xyz;
+        case 2:
+            float3 center = mul(_LocalToWorld, float4(_Gravity.xyz, 1)).xyz;
+            float3 direct = center - worldPos;
+            float distance = length(direct);
+            float3 force = direct * saturate(pow(distance / _Gravity.w, 3));
+            return force.xyz;
+        default:
+            return 0;
+    }
+}
+
+//时间控制函数，用来读取Curve中的值
+float LoadSize(float time_01) {
+    uint count, stride;
+    _SizesBuffer.GetDimensions(count, stride);
+    //有数据才循环
+    for (uint i = 1; i < count; i++) {
+        //找到在范围中的
+        if (time_01 <= _SizesBuffer[i].x) {
+            //Unity的Curve的曲线本质上是一个三次多项式插值，公式为：y = ax^3 + bx^2 + cx +d
+            float a = (_SizesBuffer[i - 1].w + _SizesBuffer[i].z) * (_SizesBuffer[i].x - _SizesBuffer[i - 1].x)
+                - 2 * (_SizesBuffer[i].y - _SizesBuffer[i - 1].y);
+            float b = (-2 * _SizesBuffer[i - 1].w - _SizesBuffer[i].z) *
+                (_SizesBuffer[i].x - _SizesBuffer[i - 1].x) + 3 * (_SizesBuffer[i].y - _SizesBuffer[i - 1].y);
+            float c = _SizesBuffer[i - 1].w * (_SizesBuffer[i].x - _SizesBuffer[i - 1].x);
+            float d = _SizesBuffer[i - 1].y;
+
+            float trueTime = (time_01 - _SizesBuffer[i - 1].x) / (_SizesBuffer[i].x - _SizesBuffer[i - 1].x);
+            return a * pow(trueTime, 3) + b * pow(trueTime, 2) + c * trueTime + d;
+        }
+    }
+    return 0;
+}
+
+float3 LoadColor(float time_01) {
+    uint count, stride;
+    _ColorsBuffer.GetDimensions(count, stride);
+
+    for (uint i = 1; i < count; i++) {
+        if (time_01 <= _ColorsBuffer[i].w) {
+            float radio = smoothstep(_ColorsBuffer[i - 1].w, _ColorsBuffer[i].w, time_01);
+            return lerp(_ColorsBuffer[i - 1].xyz, _ColorsBuffer[i].xyz, radio);
+        }
+    }
+    return 0;
+}
+
+float LoadAlpha(float time_01) {
+    uint count, stride;
+    _AlphasBuffer.GetDimensions(count, stride);
+    for (uint i = 1; i < count; i++) {
+        if (time_01 <= _AlphasBuffer[i].y) {
+            float radio = smoothstep(_AlphasBuffer[i - 1].y, _AlphasBuffer[i].y, time_01);
+            return lerp(_AlphasBuffer[i - 1].x, _AlphasBuffer[i].x, radio);
+        }
+    }
+    return 0;
+}
+
+void InitializeParticle(inout ParticleData particle){
+    particle.worldPos = GetBeginPos(particle.random.xyz);         //初始化坐标
+    particle.nowSpeed = GetBeginSpeed(particle.worldPos);     //初始化速度
+    particle.random.w = 0;
+    return;
+}
+
+
+bool CheckParticleIsDie(ParticleData particle)
+{
+    return particle.random.w >= _LifeTime;
+    // return particle.random.w >= 3;
+}
+
+
+
+
+void UpdateParticle(inout ParticleData particle){
+    particle.worldPos += particle.nowSpeed * _Time.y;      //更新位置
+    particle.random.w += _Time.y;
+
+    //开始计算颜色等数据
+    float time_01 = saturate( particle.random.w / _LifeTime );
+    AnimateUVData uvData = AnimateUV(time_01);
+    particle.uvTransData = uvData.uvData;
+    particle.interpolation = uvData.interpolation;
+    particle.color = float4(LoadColor(time_01), LoadAlpha(time_01));
+    // particle.color = time_01;
+
+    //大小
+    float size01;
+    switch (_Mode.w) {      //枚举大小模式
+    case 1 :
+        size01 = LoadSize(smoothstep(_SizeRange.z, _SizeRange.w, abs(particle.nowSpeed.x)));
+        break;
+    case 2 :
+        size01 = LoadSize(smoothstep(_SizeRange.z, _SizeRange.w, abs(particle.nowSpeed.y)));
+        break;
+    case 3:
+        size01 = LoadSize(smoothstep(_SizeRange.z, _SizeRange.w, abs(particle.nowSpeed.z)));
+        break;
+    default :
+        size01 = LoadSize(time_01);
+        break;
+    }
+    particle.size = lerp(_SizeRange.x, _SizeRange.y, size01);
+}
+
+void FixUpdateParticle(inout ParticleData particle){
+    particle.nowSpeed += CurlNoise3D(particle.worldPos * _Frequency, _Octave) * _Intensity * _Time.z;
+    particle.nowSpeed = particle.nowSpeed * (1.0 - _SpeedDamping * _Time.z);
+    particle.nowSpeed += GetGravity(particle.worldPos) * _Time.z;
+
+
+    return;
+}
+
+void OnCheckCollsion(inout ParticleData particle){
+    CheckCollsion(particle);
+}

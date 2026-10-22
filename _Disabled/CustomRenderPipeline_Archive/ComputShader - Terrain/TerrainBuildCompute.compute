@@ -1,0 +1,192 @@
+
+#pragma kernel TraverseQuadTree
+#pragma kernel BuildPatches
+#pragma kernel BuildLodMap
+#pragma kernel BuildBounds
+
+#include "CommonInput.hlsl"
+
+//表示TraverseQuadTree kernel执行的LOD级别
+uniform uint PassLOD;
+
+ConsumeStructuredBuffer<uint2> ConsumeNodeList;
+AppendStructuredBuffer<uint2> AppendNodeList;
+AppendStructuredBuffer<uint3> AppendFinalNodeList;
+
+//四叉树遍历完成后，合适的节点存放在这里
+StructuredBuffer<uint3> FinalNodeList;
+
+//保存了Node的一些信息，通过NodeId来访问
+// RWStructuredBuffer<NodeDescriptor> NodeDescriptors;
+
+AppendStructuredBuffer<RenderPatch> CulledPatchList;    //patch写入的目标位置
+
+AppendStructuredBuffer<Bounds> BoundsList;    //Bounds写入的目标位置
+
+Texture2D<float4> MinMaxHeightTexture;          //x:min, y:max
+SamplerState samplerMinMaxHeightTexture;
+
+Texture2DArray<float4> _SpltaTexArray;
+SamplerState sampler_SpltaTexArray;
+
+uint _SpltaLayerCount;        //Layer Count
+
+RWTexture2D<float> _LodMap;
+uint _MipsOffset;
+
+//5级Lod的偏移值
+uint nodeIdOffsetLOD[6];
+uint nodeCountLOD[6];        //每一级每一行的大小
+float4 _NodeSize[6];     //每一级的node大小，xy对应大小的xz
+float3 _CameraPositionWS;
+float _NodeEvaluation;
+
+float4 _TerrainSize;
+
+uniform float4 _CameraFrustumPlanes[6];
+
+float GetNodeSize(uint lod){
+    float2 size = _NodeSize[lod].xy;
+    return max(size.x, size.y);
+}
+
+float3 GetNodePositionOS(uint2 nodeLoc, uint lodLevel){
+    float2 size = _NodeSize[lodLevel].xy;
+    float2 xy = float2(nodeLoc.x * size.x, nodeLoc.y * size.y);
+    float2 hight = MinMaxHeightTexture.mips[lodLevel + _MipsOffset][nodeLoc].xy;
+    float3 positionOS = float3(xy.x, (hight.x + hight.y) / 2 * _TerrainSize.y, xy.y);
+    return positionOS;
+}
+
+
+bool EvaluateNode(uint2 nodeLoc,uint lod){
+    float3 positionWS = GetNodePositionOS(nodeLoc,lod);
+    float dis = distance(_CameraPositionWS,positionWS);
+    float nodeSize = GetNodeSize(lod);
+    float f = dis / (nodeSize * _NodeEvaluation);
+    if( f < 1){
+        return true;
+    }
+    return false;
+}
+
+uint GetNodeId(uint2 nodeLoc, uint lodLevel){
+    uint nodeCount = nodeCountLOD[lodLevel];
+    return nodeIdOffsetLOD[lodLevel] + nodeLoc.y * nodeCount + nodeLoc.x;
+}
+
+//遍历四叉树，进行节点评价，生成AppendFinalNodeList
+[numthreads(1,1,1)]
+void TraverseQuadTree (uint3 id : SV_DispatchThreadID)
+{
+    //获得Append Buffer中的最后一个数据
+    uint2 nodeLoc = ConsumeNodeList.Consume();
+    //根据节点编号，以及当前Lod等级确定编号
+    uint nodeId = GetNodeId(nodeLoc, PassLOD);
+    if(PassLOD > 0 && EvaluateNode(nodeLoc,PassLOD)){
+        //divide
+        AppendNodeList.Append(nodeLoc * 2);
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,0));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(0,1));
+        AppendNodeList.Append(nodeLoc * 2 + uint2(1,1));
+    }else{
+        AppendFinalNodeList.Append(uint3(nodeLoc,PassLOD));
+    }
+}
+
+//测试是否在平面的外侧
+bool IsOutSidePlane(float4 plane,float3 position){
+    return dot(plane.xyz,position) + plane.w < 0; 
+}
+
+bool IsAABBOutSidePlane(float4 plane,float3 boundsMin,float3 boundsMax){
+    return IsOutSidePlane(plane,boundsMin) &&
+    IsOutSidePlane(plane,boundsMax) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMin.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMin.z)) &&
+    IsOutSidePlane(plane,float3(boundsMin.x,boundsMax.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMax.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMax.y,boundsMin.z)) &&
+    IsOutSidePlane(plane,float3(boundsMax.x,boundsMin.y,boundsMin.z));
+}
+
+bool IsBoundsOutSidePlane(float4 plane,Bounds bounds){
+    return IsAABBOutSidePlane(plane,bounds.minPosition,bounds.maxPosition);
+}
+
+//视锥裁剪
+bool FrustumCull(float4 planes[6],Bounds bounds){
+    return IsBoundsOutSidePlane(planes[0],bounds) || 
+    IsBoundsOutSidePlane(planes[1],bounds) || 
+    IsBoundsOutSidePlane(planes[2],bounds) || 
+    IsBoundsOutSidePlane(planes[3],bounds) || 
+    IsBoundsOutSidePlane(planes[4],bounds) || 
+    IsBoundsOutSidePlane(planes[5],bounds);
+}
+
+bool Cull(Bounds bounds){
+    if(FrustumCull(_CameraFrustumPlanes,bounds)){
+        return true;
+    }
+    return false;
+}
+
+void CreatePatchAndBounds(uint3 nodeLoc, uint2 patchOffset, out RenderPatch patch, out Bounds bounds){
+    uint lod = nodeLoc.z;
+    float2 size = _NodeSize[lod].xy; //该块node的大小
+    float2 beginPos = float2(nodeLoc.x * size.x, nodeLoc.y * size.y);    //起始位置
+    float2 patchSize = size / PATCH_COUNT_PER_NODE;     //每块patch的大小
+
+    float2 finalPos = float2(beginPos.x + patchSize.x * patchOffset.x, beginPos.y + patchSize.y * patchOffset.y);
+
+    patch.lod = uint4(nodeLoc, patchOffset.x * 8 + patchOffset.y);
+    patch.position = finalPos;    //后面两个数据用来debug
+
+    float2 xy = float2(nodeLoc.x * size.x + patchOffset.x * patchSize.x, nodeLoc.y * size.y + patchOffset.y * patchSize.y);
+    float2 hight = MinMaxHeightTexture.mips[lod + _MipsOffset][uint2(nodeLoc.xy)].xy;
+
+    float2 maxPos = finalPos + patchSize;
+    bounds.minPosition = float3(finalPos.x, hight.x * _TerrainSize.y, finalPos.y);
+    bounds.maxPosition = float3(maxPos.x, hight.y * _TerrainSize.y, maxPos.y);
+}
+
+[numthreads(8,8,1)]
+void BuildPatches(uint3 id : SV_DispatchThreadID, uint3 groupId:SV_GroupID, uint3 groupThreadId:SV_GroupThreadID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint2 patchOffset = groupThreadId.xy;
+    //生成Patch
+    RenderPatch patch; Bounds bounds;
+    CreatePatchAndBounds(nodeLoc, patchOffset, patch, bounds);
+
+    if(Cull(bounds)){
+        return;
+    }
+    CulledPatchList.Append(patch);
+}
+
+[numthreads(8,8,1)]
+void BuildBounds(uint3 id : SV_DispatchThreadID, uint3 groupId:SV_GroupID, uint3 groupThreadId:SV_GroupThreadID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint2 patchOffset = groupThreadId.xy;
+    //生成Patch
+    RenderPatch patch; Bounds bounds;
+    CreatePatchAndBounds(nodeLoc, patchOffset, patch, bounds);
+
+    BoundsList.Append(bounds);
+}
+
+
+[numthreads(1, 1, 1)]
+void BuildLodMap(uint3 groupId:SV_GroupID){
+    uint3 nodeLoc = FinalNodeList[groupId.x];
+    uint lod = nodeLoc.z; uint mapSize = _LodMapLevelSize[lod];
+    // uint2 begIndex = nodeLoc.xy * mapSize;
+    uint2 begIndex = nodeLoc.xy * mapSize;
+    uint2 finalIndex = begIndex + mapSize;
+    
+    for(uint x = begIndex.x; x < finalIndex.x; x++){
+        for(uint y = begIndex.y; y < finalIndex.y; y++){
+            _LodMap[uint2(x, y)] = lod / 5.0;
+        }
+    }
+}

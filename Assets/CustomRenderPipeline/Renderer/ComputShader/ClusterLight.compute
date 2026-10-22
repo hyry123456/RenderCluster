@@ -1,0 +1,175 @@
+
+#include "../ShaderLibrary/Common.hlsl"
+
+#pragma multi_compile _ UNITY_REVERSED_Z
+
+#pragma multi_compile _ VISABLE_LIGHT_COUNT
+
+struct OtherLight
+{
+	float4 lightColor;
+	float4 lightPosition;
+	float4 lightDirectionsAndMasks;
+	float4 lightSpotAngles;
+	float4 lightShadowData;
+};
+
+#pragma kernel LightCluster
+
+
+#define MAX_LIGHT_COUNT 256
+#define MAX_LIGHT_COUNT_PER_TILE 32
+#define THREAD_NUM_X 16
+#define THREAD_NUM_Y 16
+#define THREAD_COUNT 256
+
+groupshared uint tileMinDepthInt = 0xFFFFFFFF;		//整型化的最小深度
+groupshared uint tileMaxDepthInt = 0;				//最大深度
+
+groupshared	float4 debug;
+
+groupshared uint tileVisibleLightCount = 0;			//该tile的灯光数量，使用线程操作保证一个tile一个tile的执行
+groupshared uint tileVisibleLightIndices[MAX_LIGHT_COUNT];
+
+float4x4 _CameraMatrixV;
+float4 _DeferredTileParams;
+
+//近平面左下角
+uniform float3 _CameraNearPlaneLB;
+//近平面水平基向量
+uniform float3 _CameraNearBasisH;
+//近平面垂直基向量
+uniform float3 _CameraNearBasisV;
+
+Texture2D<float> _GBufferDepthTex;       //深度图
+uint _OtherLightCount;
+StructuredBuffer<OtherLight> _OtherLightBuffer;
+
+RWStructuredBuffer<uint> _RWTileLightsArgsBuffer;
+RWStructuredBuffer<uint> _RWTileLightsIndicesBuffer;
+
+RWTexture2D<float4> _OutTexture;
+
+inline float LinearEyeDepth( float z )
+{
+    return (1.0 / (_ZBufferParams.z * z + _ZBufferParams.w));
+}
+
+//aabb.xy为中心,aabb.zw为extents
+bool IntersectAABB(float4 aabb,float4 lightSphere){
+    float2 p = aabb.xy + aabb.zw * sign(lightSphere.xy - aabb.xy);
+    float2 d = p - lightSphere.xy;
+    return dot(d,d) < lightSphere.w * lightSphere.w;
+}
+
+bool Intersect(float3 tileFrustumCorners[4], OtherLight otL){
+    float tileDepthMin = asfloat(tileMinDepthInt);
+    float tileDepthMax = asfloat(tileMaxDepthInt);
+
+
+	float3 lightCamPos = mul(_CameraMatrixV, float4(otL.lightPosition.xyz,1)).xyz;//转到CameraView坐标系
+    float lightRadius = otL.lightColor.w;
+    float lightDepthMin = -lightCamPos.z - lightRadius;
+    float lightDepthMax = -lightCamPos.z + lightRadius;
+
+	// debug = float4(tileDepthMax, tileDepthMin, lightDepthMax, lightDepthMin) / 100.0
+
+
+
+    if(lightDepthMin > tileDepthMax || lightDepthMax < tileDepthMin){
+        return false;
+    }
+
+	float minZ = max(tileDepthMin,lightDepthMin);
+	float maxZ = min(tileDepthMax,lightDepthMax);
+	float farPlaneScale = maxZ / tileDepthMin;
+	float nearPlaneScale = minZ / tileDepthMin;
+	float2 minXY = tileFrustumCorners[0].xy;
+	float2 maxXY = tileFrustumCorners[2].xy;
+	minXY = min(minXY * nearPlaneScale ,minXY * farPlaneScale);
+	maxXY = max(maxXY * nearPlaneScale ,maxXY * farPlaneScale);
+	float4 aabb = float4((minXY + maxXY) * 0.5,(maxXY - minXY) * 0.5);
+
+	return IntersectAABB(aabb, float4(lightCamPos, otL.lightColor.w));
+
+}
+
+
+
+[numthreads(THREAD_NUM_X, THREAD_NUM_Y, 1)]
+void LightCluster(uint3 id : SV_DispatchThreadID,uint3 groupId:SV_GROUPID, uint groupIndex:SV_GROUPINDEX){
+
+    //stage 1. 初始化groupshared变量
+    if(groupIndex == 0){
+        tileMinDepthInt = 0xFFFFFFFF;
+        tileMaxDepthInt = 0;
+        tileVisibleLightCount = 0;
+        // gemoDepthMask = 0;
+
+    }
+
+	//阻止线程的运行，直到该tile的每一个都执行到这里为止
+    GroupMemoryBarrierWithGroupSync();
+
+    bool inScreen = (float)id.x < _CameraBufferSize.x && (float)id.y < _CameraBufferSize.y;
+	float depth = 0;
+    float linearDepth = 0;
+    if(inScreen){
+        depth = _GBufferDepthTex[id.xy].r;
+        #if UNITY_REVERSED_Z
+        linearDepth = LinearEyeDepth(1 - depth);
+        #else
+        linearDepth = LinearEyeDepth(depth);
+        #endif
+        //找最小值
+        InterlockedMin(tileMinDepthInt, asuint(linearDepth));
+        //找最大值
+        InterlockedMax(tileMaxDepthInt, asuint(linearDepth));
+
+    }
+    //上面一轮后可以得到1个tile中的像素最小/大值
+    GroupMemoryBarrierWithGroupSync();
+
+    float tileDepthMin = asfloat(tileMinDepthInt);
+    float tileDepthMax = asfloat(tileMaxDepthInt);
+
+    //一个pass处理16x16=256盏灯，也就是一个像素处理一盏灯光
+    uint passCnt = ceil((float)_OtherLightCount / THREAD_COUNT);
+    uint2 tileId = groupId.xy;
+    
+    float tileDepthMinScale = tileDepthMin / _ProjectionParams.y; //_ProjectionParams.y is nearPlaneZ
+    float3 tileFrustumCorners[4];
+    tileFrustumCorners[0] = tileDepthMinScale * (_CameraNearPlaneLB + tileId.x * _CameraNearBasisH + tileId.y * _CameraNearBasisV);
+    tileFrustumCorners[1] = tileFrustumCorners[0] + _CameraNearBasisH * tileDepthMinScale;
+    tileFrustumCorners[2] = tileFrustumCorners[0] + (_CameraNearBasisH + _CameraNearBasisV) * tileDepthMinScale;
+    tileFrustumCorners[3] = tileFrustumCorners[0] + _CameraNearBasisV * tileDepthMinScale;
+
+	uint lightIndex = groupIndex;      //真正有值的是groupIndex，最多256个灯光，而groupIndex也做大为256
+	if(lightIndex < _OtherLightCount){
+		OtherLight otL = _OtherLightBuffer[lightIndex];
+		// lightSphere.xyz = mul(_CameraMatrixV_Unity, float4(otL.lightPosition.xyz,1));//转到CameraView坐标系
+		if(Intersect(tileFrustumCorners, otL)){
+			uint offset = 0;
+			//原子方式添加值，记录组内有多少灯光
+			InterlockedAdd(tileVisibleLightCount,1,offset);
+			tileVisibleLightIndices[offset] = lightIndex;
+		}
+	}
+    GroupMemoryBarrierWithGroupSync();
+
+#if VISABLE_LIGHT_COUNT
+
+_OutTexture[id.xy] = tileVisibleLightCount / (float)_OtherLightCount;
+
+#endif
+
+    uint tileIndex = tileId.y * _DeferredTileParams.z + tileId.x;
+    if(groupIndex == 0){
+        _RWTileLightsArgsBuffer[tileIndex] = tileVisibleLightCount;		//存储数量
+    }
+
+    if(groupIndex < tileVisibleLightCount && groupIndex < MAX_LIGHT_COUNT_PER_TILE){
+        uint visibleLightIndex = tileVisibleLightIndices[groupIndex];		//取出其中任意一盏灯
+        _RWTileLightsIndicesBuffer[tileIndex * MAX_LIGHT_COUNT_PER_TILE + groupIndex] = visibleLightIndex;
+    }
+}

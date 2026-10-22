@@ -1,0 +1,30 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 383f1491cf791714c80bac1356e3eb79, type: 3}
+  m_Name: FileLoadAsset
+  m_EditorClassIdentifier: 
+  names:
+  - AllPackages
+  - ObtainPackages
+  - AllTask
+  - CompleteTask
+  - RuntimeTask
+  - SceneData
+  - PlayerData
+  paths:
+  - Package/AllPackage.pac
+  - Package/ObtainPackage.pac
+  - Task/AllTask.task
+  - Task/CompleteTask.task
+  - Task/RuntimeTask.task
+  - Scene/SceneData.sce
+  - Info/PlayerData.info

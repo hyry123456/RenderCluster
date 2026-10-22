@@ -1,0 +1,33 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 99af0ebb0dc0aa24bbf0bccbd5eefc54, type: 3}
+  m_Name: Fence_01
+  m_EditorClassIdentifier: 
+  albedo: {fileID: 2800000, guid: 5061c548b4bcc48feb042fe5c7cc9359, type: 3}
+  normal: {fileID: 2800000, guid: 8e352cb081b7246d7ad890ba3dc594a1, type: 3}
+  pbrData: {fileID: 2800000, guid: 70d214517d7864e5c9a4bf2573ba0bca, type: 3}
+  emission: {fileID: 0}
+  detail: {fileID: 2800000, guid: 3af436b9135970c42a3d949b794f09ca, type: 3}
+  normalScale: 1
+  uv_Offset: {x: 0, y: 0}
+  uv_Scale: {x: 1, y: 1}
+  uv_DetailOffset: {x: 0, y: 0}
+  uv_DetailScale: {x: 4, y: 4}
+  metallic: 0
+  roughness: 1
+  cullOff: 0.5
+  detailAlbedo: 1
+  detailNormal: 1
+  detailRoughness: 0
+  emissionColor: {r: 0, g: 0, b: 0, a: 1}
+  mainColor: {r: 1, g: 1, b: 1, a: 1}
+  assetMat: {fileID: 0}

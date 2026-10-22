@@ -1,0 +1,32 @@
+#pragma kernel CSMain
+
+RWStructuredBuffer<float2> _TimeSliceBuffer;
+RWStructuredBuffer<float4x4> _MatrixBuffer;       //矩阵数据，用来存储不同水滴的位置以及随机数
+
+float _DeltaFlashSpeed;
+
+float2 LocalRand(float2 seed){
+    return frac(cos(sin(seed) * 547.5421231231) * 354.1234124532887) * 2 - 1;
+}
+
+float LocalRand(float seed){
+    return frac(cos(sin(seed * 431.2543) * 1548.213123) * 3254.213);
+}
+
+
+[numthreads(64,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if(_TimeSliceBuffer[id.x].x > 1){
+        _TimeSliceBuffer[id.x].x = -1;
+        _TimeSliceBuffer[id.x].y = 0.8 + LocalRand(_TimeSliceBuffer[id.x].y) * 0.4;     //随机速度
+        float4x4 mtx = _MatrixBuffer[id.x];
+        float2 seed = float2(mtx._m03, mtx._m13);
+        seed = LocalRand(seed);
+        mtx._m03 = seed.x;
+        mtx._m13 = seed.y;
+        _MatrixBuffer[id.x] = mtx;
+    }
+    _TimeSliceBuffer[id.x].x += _DeltaFlashSpeed * _TimeSliceBuffer[id.x].y;
+    // _TimeSliceBuffer[id.x].x += _DeltaFlashSpeed;
+}

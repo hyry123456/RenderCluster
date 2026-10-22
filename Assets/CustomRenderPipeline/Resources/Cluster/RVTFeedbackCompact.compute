@@ -1,0 +1,58 @@
+// RVT 反馈请求的 GPU 压缩：
+// 把全分辨率 Feedback RT（每像素编码 32-bit pageId）压缩成定长请求标志数组。
+// 键空间 = 贴图数 × mips级数 × (T*T)（T=1 时退回 贴图数×mips级数）。
+// 同一 pageId 的所有像素写入同样的值 1，因此不需要原子去重，一次普通 store 即可。
+// CPU 侧只回读定长标志数组并迭代，替代原来的 8MB 全屏回读 + 逐像素扫描。
+//
+// 正确性约束：压缩只换请求的收集方式，不换语义——同一画面下本方案产出的
+// pageId 集合必须与逐像素扫描逐个一致（texId / mip 的过滤规则也原样保留）。
+
+#pragma kernel ClearFlags
+#pragma kernel CompactFeedback
+
+RWStructuredBuffer<uint> _RequestFlags;	// 长度 = 页表总数（= 贴图数 × mips级数 × T*T），0=未请求，1=本帧已请求
+Texture2D<float4> _FeedbackTex;			// 全分辨率 Feedback RT（ARGB32, Linear）
+
+uint _SumTextureCount;					// 每个 mip 级别的页数（= 贴图数 × T*T），pageId = mip*_SumTextureCount + texId*T*T + tileIndex
+uint _MaxMipIndex;						// 只处理 mip 小于此值的请求（最低级由 needCallMinsMap 管理）
+uint _FlagsCount;						// _RequestFlags 的长度（ClearFlags / 越界过滤边界）
+uint _TexWidth, _TexHeight;				// Feedback RT 尺寸（CompactFeedback 的边界）
+
+// 第一步：清空标志数组。整帧内先执行，避免 CPU 侧每帧 SetData
+[numthreads(64, 1, 1)]
+void ClearFlags(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < _FlagsCount)
+		_RequestFlags[id.x] = 0u;
+}
+
+// 第二步：逐像素解码 (texId, mip) 并置位。
+// [] 运算符在 compute 中等价于 Load：精确取 texel，不过滤不插值
+[numthreads(8, 8, 1)]
+void CompactFeedback(uint3 id : SV_DispatchThreadID)
+{
+	//dispatch 按 8 对齐向上取整，边界外的线程必须挡掉：
+	//越界 Load 返回 0，会被解码成 texId=0 / mip=0 的假请求
+	if (id.x >= _TexWidth || id.y >= _TexHeight)
+		return;
+
+	float4 col = _FeedbackTex[id.xy];
+	//Feedback 编码（FeedbackPass.hlsl）：RGBA8 每通道 8bit 拼出 32-bit pageId
+	uint pageId = ((uint)(col.a * 255.0 + 0.5) << 24)
+				| ((uint)(col.b * 255.0 + 0.5) << 16)
+				| ((uint)(col.g * 255.0 + 0.5) << 8)
+				|  (uint)(col.r * 255.0 + 0.5);
+
+	//背景像素（Feedback 每帧 Clear 为白色 = 0xFFFFFFFF）与越界 pageId：
+	//pageId >= _FlagsCount 同时覆盖了“背景(0xFFFFFFFF)”和“非法 tileIndex”两种情况
+	if (pageId >= _FlagsCount)
+		return;
+
+	//解出 mip 用于过滤：最低级页只由 needCallMinsMap 队列分配，
+	//与原来 CPU 循环的 mip < mipsLevel - 1 一致
+	uint mip = pageId / _SumTextureCount;
+	if (mip >= _MaxMipIndex)
+		return;
+
+	_RequestFlags[pageId] = 1u;
+}

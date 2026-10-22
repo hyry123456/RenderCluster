@@ -1,0 +1,83 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fe2b30f8db2287b4191016e6c80f0e11, type: 3}
+  m_Name: Hight DefferPipeline
+  m_EditorClassIdentifier: 
+  renderSetting:
+    allowHDR: 1
+    useDynamicBatching: 1
+    useGPUInstancing: 1
+    useSRPBatching: 1
+    renderScale: 1
+    antiAiasing: 1
+    CopyDepth: 1
+    CopyColor: 1
+  shadowSetting:
+    maxDistance: 300
+    distanceFade: 0.1
+    directional:
+      atlasSize: 4096
+      filter: 2
+      cascadeCount: 4
+      cascadeRatio1: 0.1
+      cascadeRatio2: 0.35
+      cascadeRatio3: 0.6
+      cascadeFade: 0.1
+      cascadeBlend: 1
+    other:
+      atlasSize: 4096
+      filter: 2
+  postFXSetting: {fileID: 11400000, guid: e7e3fe2be2fd2bc43ae057cdcfc58070, type: 2}
+  cameraShader: {fileID: 4800000, guid: 2ce7030c09cc7504f8df48cde3ef0d3c, type: 3}
+  defferSetting:
+    ssrSetting:
+      useSSR: 0
+      RayCastingResolution: 2
+      TraceMethod: 1
+      PreintegratedGF_LUT: {fileID: 2800000, guid: 0d712fa13cf8ae24ab72a70329769229,
+        type: 3}
+      BlueNoise_LUT: {fileID: 2800000, guid: 9d93a5327ae23dd4c88d0bae1b0f1603, type: 3}
+      SpatioSampler: 4
+      TemporalWeight: 0.99
+      TemporalScale: 1
+      BRDFBias: 0.95
+      RayNums: 4
+      Thickness: 0.05
+      ScreenFade: 0.1
+      HiZ_RaySteps: 256
+      HiZ_MaxLevel: 8
+      HiZ_StartLevel: 1
+      HiZ_StopLevel: 0
+      Linear_TraceBehind: 0
+      Linear_TowardRay: 1
+      Linear_RayDistance: 512
+      Linear_RaySteps: 128
+      Linear_StepSize: 10
+      Denoise: 1
+      RunTimeDebugMod: 0
+      UseSeparateRender: 0
+      DeBugPass: 9
+    ambientOcclusionSetting:
+      useAO: 1
+      intensity: 0.4
+      radius: 0.3
+      downSample: 0
+      simpleCount: 3
+    lightingSettings:
+      clusterLightSetting:
+        clusterLightCS: {fileID: 7200000, guid: 48cc9e40bb05f8748a1ec58412750f93,
+          type: 3}
+        isUse: 1
+        renderVisableLight: 0
+    accuracyNormal: 1
+    debugMode: 0
+    renderWire: 0

@@ -1,0 +1,13 @@
+fileFormatVersion: 2
+guid: fa39347d9b6320b409abd91905282f4a
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - rampCreateCS: {fileID: 7200000, guid: f0ebf923ff7745c4b87f4db4c937ccf7, type: 3}
+  - target: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

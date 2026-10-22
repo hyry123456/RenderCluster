@@ -1,0 +1,121 @@
+		// 级联数据缓存（避免每帧分配；方向光级联数上限 4，这里留到 8）
+		readonly Matrix4x4[] m_cascadeView = new Matrix4x4[8];
+		readonly Matrix4x4[] m_cascadeProj = new Matrix4x4[8];
+		readonly ShadowSplitData[] m_cascadeSplit = new ShadowSplitData[8];
+
+		void RenderDirectionalShadows(int index, int split, int tileSize)
+		{
+			ShadowedDirectionalLight light = shadowedDirectionalLights[index];
+			var shadowSettings =
+				new ShadowDrawingSettings(cullingResults, light.visibleLightIndex, BatchCullingProjectionType.Orthographic)
+				{
+					useRenderingLayerMaskTest = true
+				};
+			int cascadeCount = settings.directional.cascadeCount;
+			int tileOffset = index * cascadeCount;
+			Vector3 ratios = settings.directional.CascadeRatios;
+			//不要缩小该级联的“阴影投射物裁剪球”。
+			//shadowCascadeBlendCullingFactor 是作用在 splitData.cullingSphere 半径上的乘数；
+			//取 <1 会把落在 [factor*R, R] 这一圈环带里的投射物整批裁掉，
+			//结果就是：物体在主画面里看得见，却没有被画进该级联的阴影图 ——
+			//表现为“被房子遮住的区域只有一部分有阴影”，且不同级联之间投射物集合不一致、阴影剧变。
+			//取 1 = 不收缩，保证每个级联都渲染其真实阴影视锥内的全部投射物（只增不减）。
+			float cullingFactor = 1f;
+			float tileScale = 1f / split;
+
+			// ===== 两条阴影路径的分岔（资产上切换，几何/灯光/级联设置都不用动）=====
+			//   SRP         ：逐物体剔除 + SRP Batcher + context.DrawShadows
+			//   Cluster     ：逐簇剔除 + 逐簇 LOD + 每级联一次 DrawProceduralIndirect
+			//   ClusterDebug：同 Cluster，额外做 CPU/GPU 对账（限频，不影响性能测量）
+			bool useCluster = m_shadowMode == ClusterShadowMode.Cluster ||
+							  m_shadowMode == ClusterShadowMode.ClusterDebug;
+			ClusterShadowRenderer cluster = ClusterShadowRenderer.Instance;
+			if (useCluster)
+			{
+				cluster.targetTexels = ClusterControl.Instance.ClusterAssembleAsset.clusterTargetTexels;
+				cluster.BeginLight();
+			}
+
+			// ===== pass 1：只做 CPU 计算（级联矩阵 / 世界平面 / 图集矩阵），不提交任何命令 =====
+			// 为什么拆两遍：cluster 的剔除必须【在所有级联登记完之后、任何 draw 之前】一次性提交，
+			// 否则又回到「每级联 Reset+Cull+BuildArgs」= 4×3 个 dispatch（Frame Debugger 里一片）。
+			for (int i = 0; i < cascadeCount; i++)
+			{
+				cullingResults.ComputeDirectionalShadowMatricesAndCullingPrimitives(
+					light.visibleLightIndex, i, cascadeCount, ratios, tileSize,
+					light.nearPlaneOffset, out Matrix4x4 viewMatrix,
+					out Matrix4x4 projectionMatrix, out ShadowSplitData splitData
+				);
+
+				splitData.shadowCascadeBlendCullingFactor = cullingFactor;
+				m_cascadeView[i] = viewMatrix;
+				m_cascadeProj[i] = projectionMatrix;
+				m_cascadeSplit[i] = splitData;
+
+				if (index == 0)
+				{
+					SetCascadeData(i, splitData.cullingSphere, tileSize);
+
+					// 【一次性诊断】打印阴影归属与灯光的 Culling Mask。
+					// 判断标准：画面有阴影 + 阴影 pass 时间落到 ~2.7ms
+					// → 阴影已交回 MeshRenderer；完全没阴影
+					// → 那批物体没进阴影投射物集合（layer / Culling Mask / renderingLayerMask）。
+					if (!s_loggedCasters)
+					{
+						s_loggedCasters = true;
+						var visibleLight = cullingResults.visibleLights[light.visibleLightIndex];
+						Debug.Log($"[RVT/BRG] 阴影诊断：BRG 排除 layer = {ClusterProverty.BRGShadowExcludeLayer}" +
+							$" | 该光 cullingMask = {visibleLight.light.cullingMask}");
+					}
+				}
+
+				int tileIndex = tileOffset + i;
+				// 只算图集偏移，【不要】在这里调 SetTileViewport —— 那是往 CommandBuffer 里塞命令，
+				// 4 个级联会在任何 draw 之前就全部设完，最后只剩最后一个 viewport 生效。
+				Vector2 offset = new Vector2(tileIndex % split, tileIndex / split);
+				dirShadowMatrices[tileIndex] = ConvertToAtlasMatrix(
+					projectionMatrix * viewMatrix, offset, tileScale
+				);
+
+				// cluster：登记该级联的世界空间平面 + texel 比例（纯 CPU，不提交）
+				if (useCluster)
+					cluster.AddCascade(projectionMatrix * viewMatrix, splitData, tileSize);
+			}
+
+			// ===== 一次性 GPU 剔除：整帧只有 Reset / CullAll / BuildArgs 三个 dispatch =====
+			// CullAll 里每个线程负责一个簇，内部循环所有级联 —— 判定次数仍是「级联数」
+			// （4 个级联视锥不同，省不掉），省掉的是 dispatch 次数与重复读取包围球。
+			if (useCluster)
+				cluster.Cull(buffer);
+
+			// ===== pass 2：逐级联设 viewport + 画 =====
+			for (int i = 0; i < cascadeCount; i++)
+			{
+				int tileIndex = tileOffset + i;
+				SetTileViewport(tileIndex, split, tileSize);
+
+				buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+				buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
+
+				GPUDravinSystem.Instance.SetDirectionCullingPlane(m_cascadeSplit[i].cullingSphere,
+					light.forward, light.up, light.right);
+				GPUDravinSystem.Instance.DrawShadows(context, buffer);
+
+				// cluster：一次 indirect draw 画完该级联的全部可见簇
+				if (useCluster)
+					cluster.Draw(buffer, i, light.slopeScaleBias);
+
+				ExecuteBuffer();
+				if (!useCluster)
+				{
+					shadowSettings.splitData = m_cascadeSplit[i];
+					context.DrawShadows(ref shadowSettings);
+				}
+
+				buffer.SetGlobalDepthBias(0f, 0f);
+			}
+
+			// Debug：全部画完之后统一对账（读回 args/counter + 必要时跑探头），限频 1/120 帧
+			if (m_shadowMode == ClusterShadowMode.ClusterDebug)
+				cluster.DebugVerify(ExecuteBuffer);
+		}

@@ -1,0 +1,80 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c153b06b8cc44a943af332de11e8b063, type: 3}
+  m_Name: PostFX Setting
+  m_EditorClassIdentifier: 
+  bloom:
+    maxIterations: 6
+    downscaleLimit: 15
+    bicubicUpsampling: 0
+    threshold: 1.3
+    thresholdKnee: 0.454
+    intensity: 2
+    fadeFireflies: 0
+    mode: 0
+    scatter: 0.364
+  colorLUTResolution: 32
+  toneMapping:
+    mode: 3
+  colorAdjustments:
+    postExposure: -0.6
+    contrast: 15
+    colorFilter: {r: 1, g: 1, b: 1, a: 1}
+    hueShift: 0
+    saturation: 45
+  autoExposure:
+    useAutoExposure: 1
+    exposureHistogram: {fileID: 7200000, guid: dfa7c9944c3951044885d58812664f59, type: 3}
+    autoExposure: {fileID: 7200000, guid: f6143bf229574d648ba736dc9e59680b, type: 3}
+    filtering: {x: 50, y: 95}
+    minLuminance: -9
+    maxLuminance: 1
+    speedUp: 4
+    speedDown: 2
+    exposureCompensation: 0.15
+  whiteBalance:
+    temperature: 6
+    tint: 0
+  splitToning:
+    shadows: {r: 0.6509434, g: 0.6509434, b: 0.6509434, a: 1}
+    highlights: {r: 0.4056604, g: 0.4056604, b: 0.4056604, a: 1}
+    balance: 0
+  shadowsMidtonesHighlights:
+    shadows: {r: 0.75, g: 0.75, b: 0.75, a: 1}
+    midtones: {r: 0.88, g: 0.88, b: 0.88, a: 1}
+    highlights: {r: 1.2, g: 1.2, b: 1.2, a: 1}
+    shadowsStart: 0
+    shadowsEnd: 0.8
+    highlightsStart: 1.5
+    highLightsEnd: 2
+  dynamicBlur:
+    useDynamicBlur: 0
+    blurRadio: 0.1
+  fXAA:
+    luminanceMode: 2
+    contrastThreshold: 0.0563
+    relativeThreshold: 0.147
+    subpixelBlending: 0.27
+    lowQuality: 0
+  bulkLight:
+    pass: 0
+    useBulkLight: 1
+    shrinkRadio: 100
+    circleCount: 32
+    noise: {fileID: 2800000, guid: 9d93a5327ae23dd4c88d0bae1b0f1603, type: 3}
+    drawDirectionLight: 1
+    drawOtherLight: 0
+  depthOfField:
+    focusDistance: 0.1
+    focusRange: 100
+    bokehRadius: 2.76
+    useDepthOfField: 0
