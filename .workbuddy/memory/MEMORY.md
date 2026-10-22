@@ -50,6 +50,11 @@
 
 ## 7. 用户偏好 / 工具
 - 重视先想清楚再动手，反感返工；改"疑似数据源"文件前先确认是否被引用；中文/Windows；不复用旧 cluster 剔除代码。
-- **工程已用 Git + LFS**（根目录 `.git`/`.gitignore`/`.gitattributes`）：大贴图(.tif/.hdr/.png…)走 LFS，YAML(.asset/.prefab/.unity)保留文本 diff；忽略 Library/Temp/obj/Logs/UserSettings。
+- **工程已用 Git，政策：仅代码+配置进 Git，数据/资源留本地（不进 Git、不花 LFS）**（2026-10-22 定案）。
+  - 根目录 `.git`/`.gitignore`/`.gitattributes`；分支 `main`；远程 `origin` = GitHub 私有仓（网页看提交图/diff/一键 Revert）。
+  - `.gitignore` 排除：模型(.fbx/.obj/.blend…)、大贴图(.tif/.hdr/.exr/.tga/.psd/.dds)、音频(.wav/.mp3/.ogg…)、`.unitypackage`；**保留** `.png/.jpg` 小图与全部 YAML 文本(.asset/.prefab/.unity/.meta)。
+  - 已**移除 LFS**（数据不进 Git，LFS 无用）；仓库仅 ~94MB、零大文件，直接推 GitHub 免费额度。
+  - ⚠️ Unity 坑：每个被排除二进制的 `.meta`（tiny 文本含 GUID）**必须留在 Git**，只剔二进制本体，否则引用全断。
+  - 历史已重写为单一干净初始提交（旧基线含 1.71GB LFS，已 prune）；大资源如需完整备份用 `robocopy Assets D:\备份` 另做，与 Git 无关。
 - 编译验证：Unity 编辑器常被占用时，用 `.workbuddy/compile_check.py`（Unity 自带 Roslyn 直编 Assembly-CSharp）；矩阵数值验证 `.workbuddy/verify_matrix.py`（纯 Python）。
 - 未来：Hi-Z 层级深度遮挡剔除；逐贴图 `T=ceil(texSize/CellSize)`；occlusion 接入；清理 `_VirtualDetail` 与旧 System B 九图集。
