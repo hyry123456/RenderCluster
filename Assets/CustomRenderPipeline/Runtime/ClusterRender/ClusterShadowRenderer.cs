@@ -74,8 +74,10 @@ namespace Cluster
         // ---------------- 每帧级联数据 ----------------
         int cascadeCount;
         readonly Vector4[] cpuPlanes = new Vector4[MaxCascades * PlanesPerCascade];
-        readonly Vector4[] cpuCascadeParams = new Vector4[MaxCascades];
-        readonly int[] cpuPlaneCount = new int[MaxCascades];
+		readonly Vector4[] cpuCascadeParams = new Vector4[MaxCascades];
+		readonly int[] cpuPlaneCount = new int[MaxCascades];
+		/// <summary>世界空间包围球（xyz=中心 w=半径），按簇下标排布，供 Debug 模式 CPU 剔除比对用。</summary>
+		Vector4[] cpuBounds;
 
         /// <summary>LOD 判据的目标 texel 数。<= 0 = 不做 LOD 判据（当前只有 LOD0）。</summary>
         public float targetTexels = 0f;
@@ -216,6 +218,7 @@ namespace Cluster
             posBuf.SetData(allPos.ToArray());
             idxBuf.SetData(allIdx.ToArray());
             boundsBuf.SetData(allBounds.ToArray());
+            cpuBounds = allBounds.ToArray();   // 缓存世界空间包围球，供 Debug CPU 剔除比对
 
             // 剔除用的 buffer 大小都按"级联数 × 簇数"来，宁可多 alloc 也不要重分配
             int maxC = Mathf.Max(1, MaxCascades);
@@ -370,28 +373,52 @@ namespace Cluster
         static int s_lastStatFrame = -999;
 
         /// <summary>
-        /// ClusterDebug 模式：限频同步读回 _Counter，打印每个级联真正可见的簇数。
+        /// ClusterDebug 模式：在 GPU 剔除 + 绘制之外，CPU 用【完全相同】的视锥测试口径再剔除一次，
+        /// 把 CPU 可见数 与 GPU 计数(_Counter) 比对，不一致就说明裁剪逻辑有错。
         ///
-        /// 为什么必须有这个探针（上一轮的教训）：
-        /// 没有它就只能在「剔除条件写错了」和「绘制链坏了」之间来回猜 ——
-        /// 两者的外在症状都是「什么都不画」，但修法完全不同。
-        /// 有了它可以一次分清：
-        ///   · 可见数 > 0  ⇒ 剔除正常，问题在绘制/矩阵侧
-        ///   · 可见数 = 0  ⇒ 剔除条件错了（平面空间 / 包围球 / 矩阵）
-        ///   · 开启 debugForceAll 后可见数 = 全部簇数 ⇒ compute 链本身是好的
+        /// CPU 测试口径严格对齐 ClusterShadowCull.compute 的 CullAll kernel：
+        ///   对每簇包围球 center/radius 与级联的 6 个世界空间平面做
+        ///   dot(plane.xyz, center) + plane.w &lt; -radius ⇒ 完全在外侧 ⇒ 剔除。
+        /// （LOD 判据因 targetTexels&lt;=0 且 _MaxLod=1 恒跳过，CPU 也不做；forceAll 时两边都不判。）
         ///
-        /// ⚠️ 同步 GetData 会卡 GPU 流水线，限频到 1/120 帧，且只在 Debug 模式跑。
-        /// 绝不要用它测性能。
+        /// ⚠️ 同步 GetData 会卡 GPU 流水线，限频到 1/120 帧，绝不要用它测性能。
         /// </summary>
-        public void LogStats()
+        public void VerifyCulling()
         {
-            if (!built || cascadeCount == 0) return;
+            if (!built || cascadeCount == 0 || cpuBounds == null) return;
             if (Time.frameCount - s_lastStatFrame < 120) return;
             s_lastStatFrame = Time.frameCount;
 
-            var counters = new uint[MaxCascades];
             int n = Mathf.Min(cascadeCount, MaxCascades);
+            var counters = new uint[MaxCascades];
             counterBuf.GetData(counters, 0, 0, n);
+
+            // CPU 侧：逐簇逐级联用包围球 vs 世界空间平面做测试，口径与 compute 完全一致
+            long[] cpuVisible = new long[n];
+            for (int k = 0; k < n; k++)
+            {
+                int pc = cpuPlaneCount[k];
+                int baseIdx = k * PlanesPerCascade;
+                int cnt = 0;
+                for (int c = 0; c < clusterCount; c++)
+                {
+                    Vector4 bb = cpuBounds[c];
+                    Vector3 center = new Vector3(bb.x, bb.y, bb.z);
+                    float radius = bb.w;
+                    bool ok = true;
+                    if (debugForceAll == 0)
+                    {
+                        for (int i = 0; i < pc; i++)
+                        {
+                            Vector4 pl = cpuPlanes[baseIdx + i];
+                            if (Vector3.Dot(new Vector3(pl.x, pl.y, pl.z), center) + pl.w < -radius)
+                            { ok = false; break; }
+                        }
+                    }
+                    if (ok) cnt++;
+                }
+                cpuVisible[k] = cnt;
+            }
 
             var sb = new System.Text.StringBuilder();
             sb.Append("[Cluster阴影][Debug] 簇数 = ").Append(clusterCount)
@@ -400,22 +427,28 @@ namespace Cluster
               .Append(" | LOD 判据 = ")
               .Append(targetTexels > 0 ? $"开({targetTexels} texel)" : "关(只画 LOD0)")
               .Append(" | forceAll = ").Append(debugForceAll)
-              .Append(" || 各级联可见簇数: ");
-            for (int i = 0; i < n; i++)
+              .Append("\n  各级联 [k] = CPU可见 / GPU可见: ");
+            bool mismatch = false;
+            long gpuSum = 0;
+            for (int k = 0; k < n; k++)
             {
-                if (i > 0) sb.Append(", ");
-                sb.Append('[').Append(i).Append("]=").Append(counters[i]);
+                long gpu = (long)counters[k];
+                if (k > 0) sb.Append(", ");
+                sb.Append('[').Append(k).Append("]=").Append(cpuVisible[k]).Append('/').Append(gpu);
+                if (cpuVisible[k] != gpu) mismatch = true;
+                gpuSum += gpu;
             }
-            int sum = 0;
-            for (int i = 0; i < n; i++) sum += (int)counters[i];
-            sb.Append("  合计 ").Append(sum).Append(" / 4×").Append(clusterCount).Append(" (全剔除)");
             Debug.Log(sb.ToString());
 
-            if (sum == 0 && debugForceAll == 0)
+            if (mismatch)
             {
-                Debug.LogWarning("[Cluster阴影][Debug] 所有级联可见簇数都是 0 ⇒ 剔除条件有问题，" +
-                                 "不是绘制链的问题。可临时把 debugForceAll 设为 1 验证：" +
-                                 "若强制全画后可见数 = 簇数，就证明 compute 链正常、平面判定有误。");
+                Debug.LogWarning("[Cluster阴影][Debug] CPU 与 GPU 剔除结果不一致 ⇒ 裁剪逻辑有错，" +
+                    "优先检查 _Planes 平面空间 / _ClusterBounds 世界空间 / 矩阵来源是否与 compute 一致。");
+            }
+            else if (gpuSum == 0 && debugForceAll == 0)
+            {
+                Debug.LogWarning("[Cluster阴影][Debug] 所有级联 GPU 可见簇数都是 0 ⇒ 剔除条件有问题（平面/包围球/矩阵），" +
+                    "不是绘制链问题。可把 debugForceAll 临时设为 1 验证：强制全画后可见数=簇数即证明 compute 链正常。");
             }
         }
 

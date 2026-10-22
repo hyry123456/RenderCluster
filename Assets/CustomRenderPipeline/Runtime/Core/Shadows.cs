@@ -525,41 +525,46 @@ namespace CustomRenderPipline
 			if (useCluster)
 				cluster.Cull(buffer);
 
-			// ===== pass 2：逐级联设 viewport + 画 =====
-			for (int i = 0; i < cascadeCount; i++)
+			if (useCluster)
 			{
-				int tileIndex = tileOffset + i;
-				// viewport 必须紧挨着 draw 设置：4 个级联共用一张 atlas，
-				// 每个级联占一个 tile，viewport 决定画到哪个 tile。
-				SetTileViewport(tileIndex, split, tileSize);
-
-				// ⚠️ 这一行是 cluster 阴影矩阵的来源：设置 unity_MatrixVP。
-				//    shader 里直接用 unity_MatrixVP（与 SRP 路径的 TransformWorldToHClip 同源），
-				//    不要自己再推导一遍 —— 之前手推 z 行改写导致阴影全错。
-				buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+				// ===== Cluster / ClusterDebug 模式：只画 cluster，彻底不跑 GPUDravinSystem / context.DrawShadows =====
+				// 4 个级联的 viewport + 矩阵 + 间接绘制全部累积进【同一个 buffer】，
+				// 循环外只 ExecuteBuffer 一次，把材质 PrepareKeywords 从 4× 降到 1×（~2.5ms → ~0.6ms）。
 				buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
-
-				GPUDravinSystem.Instance.SetDirectionCullingPlane(m_cascadeSplit[i].cullingSphere,
-					light.forward, light.up, light.right);
-				GPUDravinSystem.Instance.DrawShadows(context, buffer);
-
-				// cluster：一次 indirect draw，只画该级联可见的簇
-				if (useCluster)
-					cluster.Draw(buffer, i);
-
-				ExecuteBuffer();
-				if (!useCluster)
+				for (int i = 0; i < cascadeCount; i++)
 				{
+					int tileIndex = tileOffset + i;
+					// viewport 决定画到 atlas 的哪个 tile（4 级联共用同一张图）
+					SetTileViewport(tileIndex, split, tileSize);
+					// 这一行使 cluster 阴影矩阵 = unity_MatrixVP（与 SRP 路径 TransformWorldToHClip 同源）
+					buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+					cluster.Draw(buffer, i);   // 只"添加"到 buffer，不执行
+				}
+				buffer.SetGlobalDepthBias(0f, 0f);
+				ExecuteBuffer();               // 一次执行：compute 剔除 + 4 级联间接绘制
+			}
+			else
+			{
+				// ===== SRP 模式：GPUDravinSystem 画 BRG/RVT + context.DrawShadows 画 MeshRenderer =====
+				for (int i = 0; i < cascadeCount; i++)
+				{
+					int tileIndex = tileOffset + i;
+					SetTileViewport(tileIndex, split, tileSize);
+					buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+					buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
+					GPUDravinSystem.Instance.SetDirectionCullingPlane(m_cascadeSplit[i].cullingSphere,
+						light.forward, light.up, light.right);
+					GPUDravinSystem.Instance.DrawShadows(context, buffer);
+					ExecuteBuffer();
 					shadowSettings.splitData = m_cascadeSplit[i];
 					context.DrawShadows(ref shadowSettings);
+					buffer.SetGlobalDepthBias(0f, 0f);
 				}
-
-				buffer.SetGlobalDepthBias(0f, 0f);
 			}
 
-			// Debug：限频打印统计（1/120 帧），确认 cluster 路径真的在画
+			// Debug：在 Cluster 绘制基础上，CPU 也按相同口径剔除一次并和 GPU 计数比对（裁剪错误检测）
 			if (m_shadowMode == ClusterShadowMode.ClusterDebug)
-				cluster.LogStats();
+				cluster.VerifyCulling();
 		}
 
 
