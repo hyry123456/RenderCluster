@@ -2,7 +2,9 @@
 
 ## 1. Cluster 阴影管线（当前定案）
 - 三条路径由资产 `clusterShadowMode` 切换：SRP(0) / Cluster(1) / ClusterDebug(2)。
-  ClusterDebug = 同 GPU 路径 + CPU 复算 + 限频读回 `_Counter`/`_Args` 对账（`LogStats()` 1/120 帧，仅 Debug）。
+  - **SRP**：`GPUDravinSystem.DrawShadows`（画 BRG/RVT）+ `context.DrawShadows`（画 MeshRenderer），逐物体剔除 + SRP Batcher。
+  - **Cluster / ClusterDebug**：**只跑** `cluster.Draw`（GPU 逐簇剔除 + 每级联 `DrawProceduralIndirect`），彻底不跑 GPUDravinSystem / context.DrawShadows（用户选纯 Cluster，丢 BRG/RVT 阴影）。4 个级联绘制累积进同一 CommandBuffer，循环外**只 `ExecuteBuffer()` 一次**（PrepareKeywords 4x→1x）。
+  - **ClusterDebug**：同 Cluster，额外 `VerifyCulling()`：CPU 用与 `ClusterShadowCull.compute` 完全相同的视锥口径剔除一次，与 GPU 读回的 `_Counter` 比对，不一致即报裁剪错误（限频 1/120，同步 GetData 会卡流水，勿测性能）。
 - GPU 逐簇剔除（`ClusterShadowCull.compute`：Reset/CullAll/BuildArgs 三 kernel，整帧 3 dispatch + 每级联 1 次 `DrawProceduralIndirect`）。**只画 LOD0**（`lodCount=1`，`_MaxLod=1` 守卫，`targetTexels<=0` 关闭 LOD 判据）。`clusterShadowForceAll` = 强制全画，区分「剔除错」vs「绘制链坏」。
 - **是真正的 indirect draw**：`BuildArgs` 写 `_Args[k*4+1]=_Counter[k]`（GPU 可见簇数），`Draw()` 用 `DrawProceduralIndirect(argsBuf, 16*k)`；shader 用 `instanceID` 取 `_Visible[_ClusterBase+instanceID]` 得真实簇号。**`argsBuf` 必须用 `ComputeBufferType.IndirectArguments` 创建**（漏了报 "missing IndirectArguments flag"）。
 
