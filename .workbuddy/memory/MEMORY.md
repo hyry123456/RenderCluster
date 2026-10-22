@@ -54,6 +54,7 @@
   - 根目录 `.git`/`.gitignore`/`.gitattributes`；分支 `main`；远程 `origin` = GitHub 私有仓（网页看提交图/diff/一键 Revert）。
   - `.gitignore` 排除：模型(.fbx/.obj/.blend…)、大贴图(.tif/.hdr/.exr/.tga/.psd/.dds)、音频(.wav/.mp3/.ogg…)、`.unitypackage`；**保留** `.png/.jpg` 小图与全部 YAML 文本(.asset/.prefab/.unity/.meta)。
   - 已**移除 LFS**（数据不进 Git，LFS 无用）；仓库仅 ~94MB、零大文件，直接推 GitHub 免费额度。
+  - 推送：`git push`（已全局设 `http.proxy=http://127.0.0.1:7890`，**代理开着即可**；代理关掉则 github 不可达，直连也失败）。⚠️ 代理(Clash 7890)不稳且偏慢——94MB 首次全量推约 5min；**这是一次性成本，之后增量 push 只传改动文件很快**。若代理太慢/连不上，后续可脚本化重试或换出口，再正常 `git push`。
   - ⚠️ Unity 坑：每个被排除二进制的 `.meta`（tiny 文本含 GUID）**必须留在 Git**，只剔二进制本体，否则引用全断。
   - 历史已重写为单一干净初始提交（旧基线含 1.71GB LFS，已 prune）；大资源如需完整备份用 `robocopy Assets D:\备份` 另做，与 Git 无关。
 - 编译验证：Unity 编辑器常被占用时，用 `.workbuddy/compile_check.py`（Unity 自带 Roslyn 直编 Assembly-CSharp）；矩阵数值验证 `.workbuddy/verify_matrix.py`（纯 Python）。
