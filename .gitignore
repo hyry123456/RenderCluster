@@ -30,6 +30,8 @@ desktop.ini
 
 # ===== WorkBuddy 本地备份（已由 git 接管回退）=====
 .workbuddy/backup/
+# 编译脚本的临时输出（compile_check.py 产物，非源码）
+.workbuddy/tmp/
 
 # ===== 数据 / 资源：本地存储，不进 Git（Git 只管代码 + 配置 + 小图）=====
 # 模型
