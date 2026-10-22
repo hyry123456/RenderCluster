@@ -57,5 +57,6 @@
   - 推送：`git push`（已全局设 `http.proxy=http://127.0.0.1:7890`，**代理开着即可**；代理关掉则 github 不可达，直连也失败）。⚠️ 代理(Clash 7890)不稳且偏慢——94MB 首次全量推约 5min；**这是一次性成本，之后增量 push 只传改动文件很快**。若代理太慢/连不上，后续可脚本化重试或换出口，再正常 `git push`。
   - ⚠️ Unity 坑：每个被排除二进制的 `.meta`（tiny 文本含 GUID）**必须留在 Git**，只剔二进制本体，否则引用全断。
   - 历史已重写为单一干净初始提交（旧基线含 1.71GB LFS，已 prune）；大资源如需完整备份用 `robocopy Assets D:\备份` 另做，与 Git 无关。
+  - **回退边界（重要）**：Git 只保证「进 Git 的内容」（代码/YAML/.meta/小图）可 `checkout`/`revert` 精确回退；被排除的二进制资源（模型/大贴图/音频）只在本地磁盘，**删了/盘坏 Git 救不回**，项目会缺引用跑不起来。`.meta` 在 Git 里 ⇒ 从备份恢复二进制后 Unity 能自动重新接上。**严禁 `git clean -fdx`**（会删掉这些 ignored 二进制）；回退用 `git checkout -- <文件>`/`git restore`。完整容灾=Git(代码+引用) + `robocopy Assets D:\备份 /MIR`(载荷)，两者叠加才完整。
 - 编译验证：Unity 编辑器常被占用时，用 `.workbuddy/compile_check.py`（Unity 自带 Roslyn 直编 Assembly-CSharp）；矩阵数值验证 `.workbuddy/verify_matrix.py`（纯 Python）。
 - 未来：Hi-Z 层级深度遮挡剔除；逐贴图 `T=ceil(texSize/CellSize)`；occlusion 接入；清理 `_VirtualDetail` 与旧 System B 九图集。
