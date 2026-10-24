@@ -65,6 +65,18 @@ namespace Cluster
         public bool clipping = false;
 
         /// <summary>
+        /// 是否「需要 alpha cutout（镂空）」的显式开关：草/蕨/灌木这类靠叶片卡牌 + 透明通道抠图的物体。
+        /// Cluster 阴影 shader 是纯几何、不采样贴图，无法做镂空 ⇒ 这类物体必须走 SRP 阴影路径
+        /// （其 ShadowCaster 支持 _CLIPPING，镂空正确），否则会画成实心方块阴影且巨耗。
+        /// 路由条件取 cutoff || clipping：已有镂空材质（clipping=true）自动走 SRP，无需逐个改资产；
+        /// 这个开关让你能单独覆盖（例如某镂空材质也想强行走 Cluster 时可关掉本开关）。
+        /// </summary>
+        public bool cutoff = false;
+
+        /// <summary>是否需走 SRP 阴影路径：cutoff 开关打开，或本身是 alpha 镂空材质（clipping）。</summary>
+        public bool NeedsSRPShadow => cutoff || clipping;
+
+        /// <summary>
         /// 源材质是否真的开了 _MASK_MAP keyword 的【真值】。
         /// 与 <see cref="clipping"/> 同理：不能看 pbrData 是不是 null（资产里可能填了别的东西），
         /// 也不能看 cullOff 阈值。必须用 keyword 真值。

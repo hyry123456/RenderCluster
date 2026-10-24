@@ -61,6 +61,15 @@ namespace Cluster
         /// </summary>
         public static int BRGCullLayer = 30;
 
+        /// <summary>
+        /// 「需 alpha 镂空的物体（草/蕨/灌木）」专用的 rendering layer 位（不是 GameObject layer，
+        /// 是 Renderer.renderingLayerMask 的位，与 BRGCullLayer 的 GameObject 层互不干扰）。
+        /// Cluster 阴影 shader 不采样贴图、无法做镂空，这类物体改走 SRP 阴影路径；
+        /// Shadows.cs 用这个位做 rendering layer mask 过滤，只挑它们进 context.DrawShadows，
+        /// 其余物体（renderingLayerMask 不含此位）被自动跳过，不会与 Cluster 重复绘制。
+        /// </summary>
+        public const int CutoffRenderingLayerBit = 29;
+
 
         /// <summary>当前生效的 Tile 轴数：useTileVT 关时为 1（旧路径，行为完全等价），开启时为 TilesPerAxis。</summary>
         public static int TilesPerAxisValue { get; set; } = 1;

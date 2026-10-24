@@ -126,9 +126,8 @@ namespace Cluster
             asset.indices = allIdx.ToArray();
             asset.clusterMeta = metas.ToArray();
             asset.clusterBounds = bounds.ToArray();
-
-            Debug.Log($"[Cluster烘焙] {mesh.name}：LOD {lodLevels} 级 → " +
-                      $"{metas.Count} 簇（{clusterTris} tri/簇），顶点 {allPos.Count}，索引 {allIdx.Count}");
+            // 烘焙只发生一次（EnsureBaked 按 mesh 缓存），不打日志，避免 Play/重建时刷屏；
+            // 集群总数由 ClusterShadowRenderer.Rebuild 的统一汇总日志输出。
         }
 
         // ---------- 简化：把顶点吸附到 3D 网格，再丢掉退化三角形 ----------

@@ -55,6 +55,10 @@ namespace Cluster
         private bool m_shadowOnlyMode = false;
         private int m_originalLayer = -1;
 
+        /// <summary>cutoff 物体专用 rendering layer 位的还原值（OnDisable 时恢复，避免脏化场景）。</summary>
+        private uint m_originalRLM = 0;
+        private bool m_rlmStored = false;
+
         // shadow-only 模式切换材质用：
         //   m_rvtMaterials   = AssetMat（Unlit/ClusterPBR，ShadowCaster 极简）← 投阴影时用
         //   m_sceneMaterials = 场景原材质（DefferStandard）                    ← 退出该模式时还原
@@ -230,8 +234,38 @@ namespace Cluster
             if(renderAssets == null )
                 renderAssets = new ClusterRenderDataAsset[meshFilter.sharedMesh.subMeshCount];
         }
+        /// <summary>本物体是否有「需 alpha 镂空」的子网格（草/蕨/灌木）。⇒ 必须走 SRP 阴影路径。</summary>
+        public bool UsesCutoff()
+        {
+            if (renderAssets != null)
+                for (int i = 0; i < renderAssets.Length; i++)
+                    if (renderAssets[i] != null && renderAssets[i].NeedsSRPShadow) return true;
+            // 兜底：直接看运行时材质有没有 _CLIPPING（避免资产 clipping 字段未同步导致漏判）
+            var mr = GetComponent<MeshRenderer>();
+            if (mr != null)
+            {
+                var mats = mr.sharedMaterials;
+                if (mats != null)
+                    for (int i = 0; i < mats.Length; i++)
+                        if (mats[i] != null && mats[i].IsKeywordEnabled("_CLIPPING")) return true;
+            }
+            return false;
+        }
+
         private void OnEnable()
         {
+            // 「需 alpha 镂空」的物体（草/蕨/灌木）：标记 rendering layer 位，
+            // 让 Cluster 阴影路径（纯几何、无贴图）跳过它们、改走 SRP 阴影（支持 _CLIPPING）。
+            // 只在 Play 时动 renderingLayerMask，避免脏化场景资产。
+            if (Application.isPlaying && UsesCutoff())
+            {
+                var rlmMr = GetComponent<MeshRenderer>();
+                if (rlmMr != null)
+                {
+                    if (!m_rlmStored) { m_originalRLM = rlmMr.renderingLayerMask; m_rlmStored = true; }
+                    rlmMr.renderingLayerMask = m_originalRLM | (1u << ClusterProverty.CutoffRenderingLayerBit);
+                }
+            }
 
             //material = meshRender.sharedMaterial;
             //material = new Material(Shader.Find("Unlit/ClusterPBR"));
@@ -499,6 +533,14 @@ namespace Cluster
 
         private void OnDisable()
         {
+            // 还原 rendering layer 位（cutoff 物体专用），避免脏化场景资产
+            if (m_rlmStored)
+            {
+                var rlmMr = GetComponent<MeshRenderer>();
+                if (rlmMr != null) rlmMr.renderingLayerMask = m_originalRLM;
+                m_rlmStored = false;
+            }
+
             //BRG 注销（仅当 BRG 管理器存在时才需要；useBRG 关闭时 Instance 为 null，直接跳过）
             if (BatchRenderManager.Instance != null)
                 BatchRenderManager.Instance.Unregister(this);

@@ -540,10 +540,44 @@ namespace CustomRenderPipline
 					buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
 					cluster.Draw(buffer, i);   // 只"添加"到 buffer，不执行
 				}
-				buffer.SetGlobalDepthBias(0f, 0f);
-				ExecuteBuffer();               // 一次执行：compute 剔除 + 4 级联间接绘制
-			}
-			else
+                buffer.SetGlobalDepthBias(0f, 0f);
+                ExecuteBuffer();               // 一次执行：compute 剔除 + 4 级联间接绘制
+
+                // ===== cutout 物体（草/蕨/灌木等需 alpha 镂空的材质）改走 SRP 阴影路径 =====
+                // Cluster 阴影 shader 是纯几何、不采样贴图 ⇒ 这类物体若进 Cluster 会画成
+                // 实心方块 + 生出巨量簇（浪费且形状不对）。故把它们排除出 Cluster，
+                // 这里用 rendering layer mask 只挑出「标记了 cutoff」的物体，
+                // 交给 context.DrawShadows：用物体自身的 ShadowCaster 按原几何投阴影。
+                // 植被/卡片模型本身即外壳几何（只有最外一层），阴影就是卡片形状，无需额外镂空处理。
+                // 非 cutout 物体的 renderingLayerMask 不含该位 ⇒ 被本 pass 自动跳过，不会与 Cluster 重复绘制。
+                // 【2022.3 的过滤口径】ShadowDrawingSettings 根本没有 renderingLayerMask 属性（所有 Unity 版本都没有），
+                // 掩码只能来自"投射阴影的灯光自身"：useRenderingLayerMaskTest=true 时 Unity 按
+                //   (Renderer.renderingLayerMask & Light.renderingLayerMask) != 0
+                // 过滤投射物。所以这里临时把该灯光的掩码切成"只含 cutoff 位"，画完立刻还原。
+                if (ClusterShadowRenderer.Instance.HasCutoffCasters())
+                {
+                    var cutoffLight = cullingResults.visibleLights[light.visibleLightIndex].light;
+                    // Light.renderingLayerMask 在 2022.3 是 int（Renderer 侧那个才是 uint），别混用
+                    int savedLightRLM = cutoffLight != null ? cutoffLight.renderingLayerMask : 0;
+                    if (cutoffLight != null)
+                        cutoffLight.renderingLayerMask = 1 << ClusterProverty.CutoffRenderingLayerBit;
+                    shadowSettings.useRenderingLayerMaskTest = true;
+                    for (int i = 0; i < cascadeCount; i++)
+                    {
+                        int tileIndex = tileOffset + i;
+                        SetTileViewport(tileIndex, split, tileSize);
+                        buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+                        buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
+                        ExecuteBuffer();                 // 应用本級联的 viewport + 矩阵
+                        shadowSettings.splitData = m_cascadeSplit[i];
+                        context.DrawShadows(ref shadowSettings);
+                        buffer.SetGlobalDepthBias(0f, 0f);
+                    }
+                    if (cutoffLight != null)
+                        cutoffLight.renderingLayerMask = savedLightRLM;   // 还原，避免污染后续 pass
+                }
+            }
+            else
 			{
 				// ===== SRP 模式：GPUDravinSystem 画 BRG/RVT + context.DrawShadows 画 MeshRenderer =====
 				for (int i = 0; i < cascadeCount; i++)

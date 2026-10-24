@@ -7,6 +7,7 @@
   - **ClusterDebug**：同 Cluster，额外 `VerifyCulling()`：CPU 用与 `ClusterShadowCull.compute` 完全相同的视锥口径剔除一次，与 GPU 读回的 `_Counter` 比对，不一致即报裁剪错误（限频 1/120，同步 GetData 会卡流水，勿测性能）。
 - GPU 逐簇剔除（`ClusterShadowCull.compute`：Reset/CullAll/BuildArgs 三 kernel，整帧 3 dispatch + 每级联 1 次 `DrawProceduralIndirect`）。**只画 LOD0**（`lodCount=1`，`_MaxLod=1` 守卫，`targetTexels<=0` 关闭 LOD 判据）。`clusterShadowForceAll` = 强制全画，区分「剔除错」vs「绘制链坏」。
 - **是真正的 indirect draw**：`BuildArgs` 写 `_Args[k*4+1]=_Counter[k]`（GPU 可见簇数），`Draw()` 用 `DrawProceduralIndirect(argsBuf, 16*k)`；shader 用 `instanceID` 取 `_Visible[_ClusterBase+instanceID]` 得真实簇号。**`argsBuf` 必须用 `ComputeBufferType.IndirectArguments` 创建**（漏了报 "missing IndirectArguments flag"）。
+- **cutout 分流（2026-10-22 定案）**：`ClusterRenderDataAsset.NeedsSRPShadow = cutoff || clipping` ⇒ `ClusterShadowRenderer.ScanScene` 里 `continue` 跳过（**不烘焙进 Cluster**，这是性能收益所在）+ `ClusterObject.OnEnable` 给 Renderer 打 `renderingLayerMask` bit29(`CutoffRenderingLayerBit`) ⇒ `Shadows.cs` 在 cluster 绘制之后，临时把灯光掩码切成 bit29 单独跑一次 `context.DrawShadows`。无 cutout 物体时 `HasCutoffCasters()` 为 false ⇒ 整段跳过、零开销（当前场景草地已 Disable，故该 pass 不执行）。
 
 ## 2. 铁律（改代码前必看）
 - **阴影矩阵**：`buffer.SetViewProjectionMatrices(view,proj)` 内部已自动 `GL.GetGPUProjectionMatrix`；shader 直接用 `unity_MatrixVP`（= SRP `TransformWorldToHClip`）。**绝不要手推 z 行改写**（曾致阴影全错）。
@@ -48,6 +49,8 @@
 - mask 白回退：无 mask 图时 mask 恒白（AO=1），移植必须带白回退；判 mask 看 `_MASK_MAP` keyword 真值。
 - UnityPerMaterial cbuffer「三处逐字副本」：漏一处 ⇒ cbuffer 不一致 ⇒ pass 不画（阴影缺失但画面正常，易误判）。
 - `_CLIPPING`：`_CullOff` 有值≠该裁，看 keyword 真值。
+- **`ShadowDrawingSettings` 没有 `renderingLayerMask` 属性**（任何 Unity 版本都没有，别臆造）。2022.3 过滤阴影投射物只能：`useRenderingLayerMaskTest=true` + **灯光自身**的 `Light.renderingLayerMask`，判据 `(Renderer.renderingLayerMask & Light.renderingLayerMask)!=0`。要只画某一批物体 ⇒ 临时把灯光掩码切成目标位，画完还原。
+- **`Light.renderingLayerMask` 是 `int`**（`Renderer.renderingLayerMask` 才是 `uint`）⇒ 写 `1 << n`，别写 `1u << n`。
 - 诊断：`NormalDebugMode` 决策树；两套 Debug 别混（assemble 只管预览槽，画面由 DefferPipeline.asset 决定）；截图对比固定相机+1920×1080+只切 UseRVT。
 
 ## 7. 用户偏好 / 工具

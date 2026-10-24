@@ -70,6 +70,9 @@ namespace Cluster
 
         int clusterCount;
         bool built, dirty = true;
+        /// <summary>本帧 ScanScene 是否跳过了「需 alpha 镂空」的投射物（草/蕨/灌木）。
+        /// 有则 Shadows.cs 需用 SRP 路径单独画它们的阴影（Cluster 纯几何 shader 无法镂空）。</summary>
+        bool m_hasCutoffCasters = false;
 
         // ---------------- 每帧级联数据 ----------------
         int cascadeCount;
@@ -78,6 +81,11 @@ namespace Cluster
 		readonly int[] cpuPlaneCount = new int[MaxCascades];
 		/// <summary>世界空间包围球（xyz=中心 w=半径），按簇下标排布，供 Debug 模式 CPU 剔除比对用。</summary>
 		Vector4[] cpuBounds;
+		/// <summary>每帧级联的真实绘制矩阵 proj*view（与 Draw 用的 SetViewProjectionMatrices 同源），
+		/// 供 Debug 模式做"包围盒投进 NDC 立方"的地面真值交叉检验。</summary>
+		readonly Matrix4x4[] cpuProjView = new Matrix4x4[MaxCascades];
+		/// <summary>复用的 GPU 可见集合回读缓冲（避免每帧分配）。</summary>
+		uint[] visibleReadback;
 
         /// <summary>LOD 判据的目标 texel 数。<= 0 = 不做 LOD 判据（当前只有 LOD0）。</summary>
         public float targetTexels = 0f;
@@ -88,6 +96,10 @@ namespace Cluster
         public bool IsReady => built && !dirty;
         public int ClusterCount => clusterCount;
         public int CascadeCount => cascadeCount;
+
+        /// <summary>本帧是否有「需 alpha 镂空」的投射物被 ScanScene 跳过（草/蕨/灌木等）。
+        /// Shadows.cs 据此决定是否额外用 SRP 阴影路径画它们的镂空阴影。</summary>
+        public bool HasCutoffCasters() => m_hasCutoffCasters;
 
         // ---------------- 注册 ----------------
 
@@ -103,6 +115,7 @@ namespace Cluster
         {
             meshes.Clear();
             worlds.Clear();
+            m_hasCutoffCasters = false;
             dirty = true;
         }
 
@@ -110,6 +123,7 @@ namespace Cluster
         /// cluster 路径覆盖的是【整个场景】，SRP 路径也是，这样两条路才可比。</summary>
         void ScanScene()
         {
+            m_hasCutoffCasters = false;
             var mrs = UnityEngine.Object.FindObjectsByType<MeshRenderer>(
                 FindObjectsInactive.Exclude, FindObjectsSortMode.None);
             for (int i = 0; i < mrs.Length; i++)
@@ -117,6 +131,12 @@ namespace Cluster
                 var mr = mrs[i];
                 if (mr == null || !mr.enabled) continue;
                 if (mr.shadowCastingMode == ShadowCastingMode.Off) continue;
+                // 需 alpha 镂空的物体（草/蕨/灌木）走 SRP 阴影路径：Cluster 纯几何 shader 不采样贴图，
+                // 进 Cluster 会画成实心方块 + 巨量簇（浪费且形状不对），故跳过它们、不烘焙进 Cluster，
+                // 并记下"有 cutout 投射物"供 Shadows.cs 单独用 SRP 路径画
+                // （用物体自身材质投阴影即可；几何体本身即外壳卡片，无需额外镂空处理）。
+                var co = mr.GetComponent<ClusterObject>();
+                if (co != null && co.UsesCutoff()) { m_hasCutoffCasters = true; continue; }
                 var mf = mr.GetComponent<MeshFilter>();
                 if (mf == null || mf.sharedMesh == null) continue;
                 Register(mf.sharedMesh, mr.transform.localToWorldMatrix);
@@ -308,6 +328,7 @@ namespace Cluster
             float projScale = 0f;
             if (Mathf.Abs(proj.m11) > 1e-6f) projScale = tileSize * 0.5f * Mathf.Abs(proj.m11);
             cpuCascadeParams[k] = new Vector4(projScale, targetTexels, n, 0f);
+            cpuProjView[k] = projView;   // 真实绘制矩阵，Debug 地面真值检验用
         }
 
         /// <summary>
@@ -371,18 +392,23 @@ namespace Cluster
         // ---------------- 统计（ClusterDebug 模式） ----------------
 
         static int s_lastStatFrame = -999;
+        static bool s_cleanLogged = false;
 
         /// <summary>
-        /// ClusterDebug 模式：在 GPU 剔除 + 绘制之外，CPU 用【完全相同】的视锥测试口径再剔除一次，
-        /// 把 CPU 可见数 与 GPU 计数(_Counter) 比对，不一致就说明裁剪逻辑有错。
+        /// ClusterDebug 模式：CPU 用与 compute 逐位相同的球体视锥口径重算每级联可见集合，
+        /// 再回读 GPU 真正提交的 _Visible 做逐簇集合比对，直接回答"有没有真·遗漏"。
         ///
-        /// CPU 测试口径严格对齐 ClusterShadowCull.compute 的 CullAll kernel：
-        ///   对每簇包围球 center/radius 与级联的 6 个世界空间平面做
-        ///   dot(plane.xyz, center) + plane.w &lt; -radius ⇒ 完全在外侧 ⇒ 剔除。
-        /// （LOD 判据因 targetTexels&lt;=0 且 _MaxLod=1 恒跳过，CPU 也不做；forceAll 时两边都不判。）
+        /// · 漏剔 = CPU 明确在视锥内的簇、却被 GPU 漏画 ⇒ 真·错误剔除。
+        /// · 多画 = GPU 画了、却明确在视锥外的簇 ⇒ _Visible 写入 / buffer bug。
+        /// 另：clusterShadowForceAll=1 时两边都不判 ⇒ cpuSet=gpuSet=全部簇，应完全吻合，
+        /// 可快速验证 compute 写入链本身是否正常。
         ///
+        /// ⚠️ 边界容差：C# 与 HLSL 在视锥平面附近的浮点评估有 ~mm 级差异，会让贴边簇在两边
+        /// 翻面（不是真错误；包围球保守，球在视锥外才剔，绝不会把视锥内几何剔掉）。
+        /// 只有"明确在内却被漏画 / 明确在外却被画了"才上报，过滤掉边界噪声。
         /// ⚠️ 同步 GetData 会卡 GPU 流水线，限频到 1/120 帧，绝不要用它测性能。
         /// </summary>
+        const float CullTolerance = 1e-2f;   // 视锥平面边界容差（米）。只上报距平面 > 此值的"明确"错，过滤浮点噪声。
         public void VerifyCulling()
         {
             if (!built || cascadeCount == 0 || cpuBounds == null) return;
@@ -393,57 +419,106 @@ namespace Cluster
             var counters = new uint[MaxCascades];
             counterBuf.GetData(counters, 0, 0, n);
 
-            // CPU 侧：逐簇逐级联用包围球 vs 世界空间平面做测试，口径与 compute 完全一致
-            long[] cpuVisible = new long[n];
+            // 回读 GPU 实际写出的可见簇列表（_Visible[k*clusterCount + slot] = 簇号）
+            int visCap = MaxCascades * Mathf.Max(1, clusterCount);
+            if (visibleReadback == null || visibleReadback.Length < visCap)
+                visibleReadback = new uint[visCap];
+            visibleBuf.GetData(visibleReadback, 0, 0, visCap);
+
+            var sb = new System.Text.StringBuilder();
+            bool anyError = false;
+
             for (int k = 0; k < n; k++)
             {
                 int pc = cpuPlaneCount[k];
                 int baseIdx = k * PlanesPerCascade;
-                int cnt = 0;
+
+                // ---- CPU 用与 compute 完全相同的球体口径重算本级联可见集合 ----
+                // 并区分"明确在内 / 明确在外 / 边界模糊"，只上报明确的错，过滤 C#/HLSL 浮点边界噪声。
+                var cpuSet = new HashSet<int>();      // 明确在视锥内（应被画）
+                var cpuCulled = new HashSet<int>();   // 明确在视锥外（不应被画）
                 for (int c = 0; c < clusterCount; c++)
                 {
                     Vector4 bb = cpuBounds[c];
                     Vector3 center = new Vector3(bb.x, bb.y, bb.z);
                     float radius = bb.w;
-                    bool ok = true;
-                    if (debugForceAll == 0)
+                    if (debugForceAll != 0) { cpuSet.Add(c); continue; }
+
+                    float dmin = float.MaxValue;     // 距各平面最近的距离（最"危险"的那个平面）
+                    for (int i = 0; i < pc; i++)
                     {
-                        for (int i = 0; i < pc; i++)
+                        Vector4 pl = cpuPlanes[baseIdx + i];
+                        float d = Vector3.Dot(new Vector3(pl.x, pl.y, pl.z), center) + pl.w;
+                        if (d < dmin) dmin = d;
+                    }
+                    // 保守包围球：dmin < -radius 才"整球在视锥外"⇒ 剔除；否则球与视锥相交/在内 ⇒ 保留。
+                    if (dmin < -radius - CullTolerance)
+                        cpuCulled.Add(c);            // 明确在外
+                    else if (dmin >= -radius + CullTolerance)
+                        cpuSet.Add(c);               // 明确在内（±Tolerance 内的模糊簇两边都忽略）
+                }
+
+                // ---- GPU 实际可见集合（来自回读的 _Visible）----
+                int cnt = (int)counters[k];
+                if (cnt < 0) continue;               // 缓冲区尚未就绪（首帧/刚重建的脏读），跳过本次比对
+                cnt = Mathf.Min(cnt, clusterCount);  // 防越界（脏读成超大正数时不崩）
+                var gpuSet = new HashSet<int>();
+                for (int s = 0; s < cnt; s++)
+                    gpuSet.Add((int)visibleReadback[k * clusterCount + s]);
+
+                // ---- 比对：只报"明确"的错 ----
+                // 漏剔：明确在内、却被 GPU 漏画 ⇒ 真·错误剔除。
+                // 多画：GPU 画了、却明确在外 ⇒ _Visible 写入 / buffer 内容错。
+                // 边界模糊簇（dmin 落在 ±Tolerance 内）两边都忽略，避免浮点噪声误报。
+                var missing = new List<int>();
+                foreach (var c in cpuSet) if (!gpuSet.Contains(c)) missing.Add(c);
+                var extra = new List<int>();
+                foreach (var c in gpuSet) if (cpuCulled.Contains(c)) extra.Add(c);
+
+                if (missing.Count > 0 || extra.Count > 0)
+                {
+                    anyError = true;
+                    s_cleanLogged = false;
+                    sb.Append($"\n[级联 {k}] CPU可见={cpuSet.Count} GPU可见={cnt}");
+                    sb.Append($" | 漏剔(真遗漏)={missing.Count} 多画(buffer错)={extra.Count}");
+                    if (missing.Count > 0)
+                    {
+                        sb.Append(" | 漏剔簇(世界坐标): ");
+                        for (int i = 0; i < Mathf.Min(missing.Count, 6); i++)
                         {
-                            Vector4 pl = cpuPlanes[baseIdx + i];
-                            if (Vector3.Dot(new Vector3(pl.x, pl.y, pl.z), center) + pl.w < -radius)
-                            { ok = false; break; }
+                            Vector4 bb = cpuBounds[missing[i]];
+                            sb.Append($"#{missing[i]}({bb.x:F0},{bb.y:F0},{bb.z:F0}) ");
                         }
                     }
-                    if (ok) cnt++;
+                    if (extra.Count > 0)
+                    {
+                        sb.Append(" | 多画簇: ");
+                        for (int i = 0; i < Mathf.Min(extra.Count, 6); i++)
+                            sb.Append('#').Append(extra[i]).Append(' ');
+                    }
                 }
-                cpuVisible[k] = cnt;
             }
 
-            // 默认静默：验证已通过后，正常情况不出任何日志，避免持续刷屏。
-            // 仅在「发现裁剪错误」或「全部级联可见数为 0」时才报警（ClusterDebug 安全网）。
-            bool mismatch = false;
-            long gpuSum = 0;
-            for (int k = 0; k < n; k++)
+            if (anyError)
             {
-                long gpu = (long)counters[k];
-                if (cpuVisible[k] != gpu) mismatch = true;
-                gpuSum += gpu;
+                Debug.LogWarning("[Cluster阴影][Debug] 发现裁剪集合不一致（真·遗漏或 buffer 内容错）：" + sb +
+                    "\n  · 漏剔≠0 ⇒ 确有簇被错误剔除，按世界坐标去场景核对这些簇（多半是包围球/平面空间问题）；" +
+                    "\n  · 多画≠0 ⇒ _Visible 写入的簇号与预期不符（compute 写入 / buffer 绑定 bug）。");
             }
-
-            if (mismatch)
+            else if (debugForceAll == 0)
             {
-                var sb = new System.Text.StringBuilder();
-                sb.Append("[Cluster阴影][Debug] CPU 与 GPU 剔除结果不一致 ⇒ 裁剪逻辑有错。各级联 [k]=CPU可见/GPU可见: ");
-                for (int k = 0; k < n; k++)
-                    sb.Append('[').Append(k).Append("]=").Append(cpuVisible[k]).Append('/').Append((long)counters[k]).Append(k < n - 1 ? ", " : "");
-                Debug.LogWarning(sb.ToString() +
-                    "\n  优先检查 _Planes 平面空间 / _ClusterBounds 世界空间 / 矩阵来源是否与 compute 一致。");
-            }
-            else if (gpuSum == 0 && debugForceAll == 0)
-            {
-                Debug.LogWarning("[Cluster阴影][Debug] 所有级联 GPU 可见簇数都是 0 ⇒ 剔除条件有问题（平面/包围球/矩阵），" +
-                    "不是绘制链问题。可把 debugForceAll 临时设为 1 验证：强制全画后可见数=簇数即证明 compute 链正常。");
+                long sum = 0; foreach (var cc in counters) sum += cc;
+                if (sum == 0)
+                {
+                    Debug.LogWarning("[Cluster阴影][Debug] 所有级联 GPU 可见簇数都是 0 ⇒ 剔除条件有问题（平面/包围球/矩阵），" +
+                        "不是绘制链问题。可把 debugForceAll 临时设为 1 验证：强制全画后可见数=簇数即证明 compute 链正常。");
+                }
+                else if (!s_cleanLogged)
+                {
+                    s_cleanLogged = true;
+                    Debug.Log("[Cluster阴影][Debug] 裁剪集合逐簇比对一致：零遗漏。" +
+                        "若画面仍有阴影洞 ⇒ 问题在绘制/采样侧（顶点拉取·矩阵·图集tile·接收端 cascade 选择），与剔除无关。");
+                }
             }
         }
 

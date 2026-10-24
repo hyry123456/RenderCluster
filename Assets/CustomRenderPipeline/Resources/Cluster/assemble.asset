@@ -29,9 +29,9 @@ MonoBehaviour:
   rvtTrilinearBlend: 0
   brgGBufferExcludeLayer: 31
   UseRVT: 1
-  clusterShadowMode: 1
+  clusterShadowMode: 2
   clusterTargetTexels: 0
-  clusterShadowForceAll: 0
+  clusterShadowForceAll: 1
   useBRG: 0
   useTileVT: 0
   TilesPerAxis: 1
