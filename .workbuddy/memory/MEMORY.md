@@ -11,6 +11,7 @@
 
 ## 2. 铁律（改代码前必看）
 - **阴影矩阵**：`buffer.SetViewProjectionMatrices(view,proj)` 内部已自动 `GL.GetGPUProjectionMatrix`；shader 直接用 `unity_MatrixVP`（= SRP `TransformWorldToHClip`）。**绝不要手推 z 行改写**（曾致阴影全错）。
+- **自定义 HLSLPROGRAM 经 `DrawProceduralIndirect` 画阴影时，worldToClip 必须自己套 `GL.GetGPUProjectionMatrix(proj,true)*view`**（2026-10-26 定案）：它不走 `SetViewProjectionMatrices`，少了这一步 ⇒ D3D 上 NDC z 大量越界被裁光 ⇒ 阴影图全空、零报错（位置探针全绿也查不出）。采样侧 `ConvertToAtlasMatrix(proj*view)` 已用 `usesReversedZBuffer` 做等价 z 取反，两侧深度约定一致。
 - **`_Indices` 是全局顶点号**：shader 直接 `_Positions[_Indices[c*384+vid]]`，别再加簇基址（历史双重偏移坑）。
 - **compute buffer 按 kernel 绑定**：`SetBuffer(kernelIndex,name,buf)`，无 `SetComputeBufferParam`。被多 kernel 共用的 buffer（如 `_Counter`）必须逐 kernel 绑全，漏绑的 dispatch 直接失效（症状：indirect instanceCount=0、无报错）。
 - **剔除平面**：用 `GeometryUtility.CalculateFrustumPlanes(viewProj)`（世界空间，官方保证）；**别用 `ShadowSplitData.GetCullingPlane`**（空间不明，实测剔光世界）。`_ClusterBounds` 必须是世界空间包围球。

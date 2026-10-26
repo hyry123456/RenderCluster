@@ -1,33 +1,40 @@
 // 【真正的 cluster 管线】用于绘制阴影的簇着色器（只写深度，不采任何贴图）。
 //
-// ── 矩阵来源（2026-10-21 修正）──
+// ── 矩阵来源 ──
 // ⚠️ 不要在这里自己推导"世界空间 → 阴影裁剪空间"的矩阵！
 //
-// Shadows.RenderDirectionalShadows 里已经调了
-//     buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
-// 它设置的就是 unity_MatrixVP。而 SRP 路径（context.DrawShadows）画的 ShadowCaster
-// pass 用的正是 TransformWorldToHClip = mul(unity_MatrixVP, float4(posWS,1))。
+// worldToClip 由 C#（Shadows.cs）逐级联算好，经 MaterialPropertyBlock 传入本 shader 的
+// 自定义属性 _ClusterShadowW2C。其计算为：
+//     gpuProj = GL.GetGPUProjectionMatrix(proj, true)   // true = 渲染进 RenderTexture
+//     worldToClip = gpuProj * view
+// 其中 proj/view 来自 ComputeDirectionalShadowMatricesAndCullingPrimitives。
 //
-// 所以本 shader 只要【原样】用 unity_MatrixVP，就与 SRP 路径逐位相同 ——
-// 深度值、深度方向（reversed-Z）、近平面裁剪行为全部一致，
-// 写进 shadow map 的值必然等于采样侧 CompareToAtlasMatrix 读出来比较的值。
+// ★ 为什么必须套 GetGPUProjectionMatrix（2026-10-26 定案的关键修复）：
+// 自定义 HLSLPROGRAM 在 DrawProceduralIndirect 下不走 SetViewProjectionMatrices，而后者内部会
+// 对投影矩阵套 GL.GetGPUProjectionMatrix，把 OpenGL 风格 [-1,1] 的 z 换成平台期望的 [0,1]/reversed-Z
+// 深度约定。裸 proj*view 在 D3D 上让 NDC z 大量落在 [0,1] 之外被裁光 ⇒ 整张阴影图全空（零报错）。
+// 采样侧 ConvertToAtlasMatrix(proj*view) 已用 usesReversedZBuffer 做等价 z 取反，与这里两侧约定一致。
 //
-// ❌ 之前踩的坑：手工把 proj*view 的 z 行改写成 0.5*w行 - 0.5*z行。
-//    那是【推测性推导】—— ComputeDirectionalShadowMatricesAndCullingPrimitives
-//    返回的矩阵本来就是给 SetViewProjectionMatrices 用的，引擎自己在
-//    context.DrawShadows 内部处理平台 Z 约定。手推的结果既没验证、又与引擎行为
-//    不一致（把 z 映射到 [0,1] 但 w 行没跟着变）⇒ 阴影位置/深度全错。
+// ── 关键坑（2026-10-25 定案）──
+// 自定义 HLSLPROGRAM 在 DrawProceduralIndirect 下，worldPose 参数【不会】可靠地喂进内建矩阵
+// UNITY_MATRIX_M（见 Unity 官方论坛 "World transform URP + DrawProcedural"：UNITY_MATRIX_M 在
+// 这类 draw 里保持单位/零矩阵 ⇒ 几何以世界坐标当裁剪坐标，全被裁光 ⇒ 整张阴影图空、零报错）。
+// 因此本 shader【绝不使用 UNITY_MATRIX_M / UNITY_MATRIX_VP 等内建矩阵】，而是用自定义属性
+// _ClusterShadowW2C：C# 每级联经 MaterialPropertyBlock.SetMatrix 逐 draw 显式传入 worldToClip。
+// MaterialPropertyBlock 是命令级 per-draw 数据，互不污染，也不依赖内建矩阵绑定行为，100% 确定生效。
+// （绝不能走 drawMat.SetMatrix / SetGlobalMatrix：共享 Material / 全局属性在命令【执行】时才读，
+//  4 个级联会全拿到最后一次设置的值 ⇒ 阴影错乱。）
 //
-// ── 数据布局（C# 侧 ClusterShadowRenderer.Rebuild 摊平）──
-//   _Positions —— float3，世界空间顶点（静态场景，烘焙时就乘好了世界矩阵）
-//   _Indices  —— int32，【全局顶点号】。每簇固定 384 个（= 128 三角形 × 3），
-//                簇 c 的索引区间 = [c * 384, c * 384 + 384)。
-//                ⇒ 顶点拉取就是：vi = _Indices[c*384 + vertexID]; p = _Positions[vi];
-//   _Visible  —— uint，GPU 剔除后的可见簇列表。索引从 _ClusterBase 起。
+// 所以本 shader 只管 mul(_ClusterShadowW2C, worldPos)，矩阵正确性与一致性由 C# 侧保证。
 //
-// ⚠️ 矩阵/基址必须是【全局属性】（buffer.SetGlobalXxx），不能用 drawMat.SetMatrix：
-//    Material 是共享对象，材质属性在命令【执行】时才读 ⇒ 4 个级联的 draw 全都拿到
-//    最后一次设置的值（第 4 级的矩阵），阴影会是错的。全局属性是命令，顺序有保证。
+// ❌ 之前踩的坑：手工把 proj*view 的 z 行改写成 0.5*w行 - 0.5*z行（推测性推导，已证错）。
+//
+// ── 数据布局（C# 侧 ClusterShadowRenderer.Rebuild / Gather 摊平）──
+//   _Positions —— float3，世界空间顶点（已经按簇内唯一顶点去重，每簇只存唯一顶点）。
+//   索引绘制下不再需要 _Indices / _Visible / _ClusterBase：索引缓冲（drawIdxBuf）里
+//   存的【就是全局顶点号】，VS 直接用 SV_VertexID（= 索引值 + baseVertex）取 _Positions。
+//   GPU 后变换缓存以【索引值】为键 ⇒ 被多个三角形共享的顶点只跑一次顶点着色器
+//   （每簇顶点负荷从 384 降到 ~唯一顶点数，约 6× 减少）。
 Shader "Hidden/ClusterShadowCaster"
 {
     SubShader
@@ -65,26 +72,26 @@ Shader "Hidden/ClusterShadowCaster"
                 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/API/GLES2.hlsl"
             #endif
 
-            // 每簇顶点数。必须与 C# 侧 ClusterShadowRenderer.VertsPerCluster 保持一致！
-            #define VERTS_PER_CLUSTER 384
+            // 引入 Unity 内建变量声明（UNITY_MATRIX_VP / unity_ObjectToWorld 等）。
+            // 裸 HLSLPROGRAM 不会自动声明/绑定这些矩阵（历史曾因用旧名 unity_MatrixVP 拿到零矩阵），
+            // 必须显式 include，UNITY_MATRIX_VP 才能被 SetViewProjectionMatrices 正确喂进来。
+            #include "UnityShaderVariables.cginc"
 
-            StructuredBuffer<float3> _Positions;
-            StructuredBuffer<int>    _Indices;   // 全局顶点号（不是簇内局部号）
-            StructuredBuffer<uint>   _Visible;   // GPU 剔除后的可见簇 id
+            // 每簇三角形数（= indirect args indexCount 的基准）。改这个值必须同步改
+            // C# 侧 ClusterShadowRenderer.TrisPerCluster，否则索引区间错位。
+            #define TRIS_PER_CLUSTER 128
 
-            // unity_MatrixVP 由 CommandBuffer.SetViewProjectionMatrices 设置，
-            // 与 SRP 路径的 TransformWorldToHClip 同一个东西。
-            float4x4 unity_MatrixVP;
-
-            // 该级联在 _Visible 里的起始下标。
-            // ⚠️ 必须声明成 float：CommandBuffer.SetGlobalInt 内部是按 float 存的（Unity 老坑），
-            //    声明成 uint 会读到 float 的位模式。取值 < 2^24 时 float 精确，强转安全。
-            float    _ClusterBase;
+            StructuredBuffer<float3> _Positions;   // 世界空间顶点（烘焙时乘好世界矩阵）
+            // 自定义 world→clip 矩阵（= proj*view），由 C# 经 MaterialPropertyBlock 逐 draw 显式传入。
+            // ⚠️ 不用内建 UNITY_MATRIX_M/V：自定义 HLSLPROGRAM 在 DrawProceduralIndirect 下
+            // 内建矩阵不被 worldPose 可靠喂入（会恒为单位/零矩阵 ⇒ 全裁光）。见 shader 顶部注释。
+            float4x4 _ClusterShadowW2C;
 
             struct Attributes
             {
+                // 索引绘制下 SV_VertexID = 索引值（+baseVertex）= 全局顶点号。
+                // 索引缓冲由 compute 的 Gather 核写入，内容就是 _Positions 的全局下标。
                 uint vertexID : SV_VertexID;
-                uint instanceID : SV_InstanceID;
             };
 
             struct Varyings
@@ -94,13 +101,13 @@ Shader "Hidden/ClusterShadowCaster"
 
             Varyings vert(Attributes i)
             {
-                // instanceID → 可见列表里的第几个 → 真实簇号
-                uint c = _Visible[(uint)_ClusterBase + i.instanceID];
-                int vi = _Indices[c * VERTS_PER_CLUSTER + i.vertexID];
-                float3 p = _Positions[vi];
+                // 直接按索引值取顶点：GPU 后变换缓存以"索引值"为键，
+                // 多个三角形引用同一顶点时只跑一次顶点着色器。
+                // 顶点变换用 _ClusterShadowW2C（= proj*view，由 C# 每级联经 MaterialPropertyBlock 显式传入）。
+                float3 p = _Positions[i.vertexID];
 
                 Varyings o;
-                o.pos = mul(unity_MatrixVP, float4(p, 1.0));
+                o.pos = mul(_ClusterShadowW2C, float4(p, 1.0));
 
                 // Pankaking：把近平面外的几何拉到近平面上，否则它们会被近平面裁掉
                 // ⇒ 那些物体就不投阴影了（贴着光源的物体会"漏阴影"）。

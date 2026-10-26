@@ -536,9 +536,19 @@ namespace CustomRenderPipline
 					int tileIndex = tileOffset + i;
 					// viewport 决定画到 atlas 的哪个 tile（4 级联共用同一张图）
 					SetTileViewport(tileIndex, split, tileSize);
-					// 这一行使 cluster 阴影矩阵 = unity_MatrixVP（与 SRP 路径 TransformWorldToHClip 同源）
-					buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
-					cluster.Draw(buffer, i);   // 只"添加"到 buffer，不执行
+				// SetViewProjectionMatrices 供下方 cutout 的 context.DrawShadows 使用（SRP 路径同源）。
+				buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
+				// cluster 阴影矩阵：worldToClip = GetGPUProjectionMatrix(proj) * view。
+				// ⚠️【关键修复 2026-10-26】绝不能用裸 proj*view：自定义 HLSLPROGRAM 在
+				// DrawProceduralIndirect 下不走 SetViewProjectionMatrices，而后者内部会对投影矩阵
+				// 套 GL.GetGPUProjectionMatrix，把 OpenGL 风格 [-1,1] 的 z 换成平台期望的 [0,1]/reversed-Z
+				// 深度约定。少了这一步 ⇒ D3D 上 NDC z 大量落在 [0,1] 之外被裁光 ⇒ 整张阴影图几乎全空
+				// （与"位置探针全绿、全画旁路也画不出阴影、近处偶尔一个影子 + 移动波动"完全吻合）。
+				// 采样侧 ConvertToAtlasMatrix(proj*view) 已用 usesReversedZBuffer 做等价 z 取反，
+				// 两侧深度约定一致，阴影才能对上。true = 渲染进 RenderTexture，与 SetViewProjectionMatrices 一致。
+				Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(m_cascadeProj[i], true);
+				Matrix4x4 worldToClip = gpuProj * m_cascadeView[i];
+					cluster.Draw(buffer, i, worldToClip);   // 只"添加"到 buffer，不执行
 				}
                 buffer.SetGlobalDepthBias(0f, 0f);
                 ExecuteBuffer();               // 一次执行：compute 剔除 + 4 级联间接绘制
