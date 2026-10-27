@@ -114,7 +114,19 @@ void LitPassFragment (Varyings input,
 
 
 	// float4 albedo = colors.albedo * _render.mainColor;
-	float4 albedo = GetBase(colors);
+
+	// detail 直采（不走 RVT 图集，与 BRG 路径逐字对齐）：
+	// RVT 只有一张 detail 图集、平铺语义与分页冲突会串页，detail 层改用硬件 mipmap + 各向异性直采。
+	// 三个强度（_DetailAlbedo / _DetailNormal / _DetailRoughness）由 C# 侧在没对应贴图时置 0，
+	// 分支既是性能优化也是 NaN 安全闸门。
+	float4 detailMap = float4(0.5, 0.5, 0.5, 1.0);
+	float4 detailNormalMap = float4(0.5, 0.5, 1.0, 1.0);
+	if (INPUT_PROP(float, _DetailAlbedo) > 0.001 || INPUT_PROP(float, _DetailRoughness) > 0.001)
+		detailMap = SAMPLE_TEXTURE2D(_DetailMap, sampler_DetailMap, input.detailUV);
+	if (INPUT_PROP(float, _DetailNormal) > 0.001)
+		detailNormalMap = SAMPLE_TEXTURE2D(_DetailNormalMap, sampler_DetailMap, input.detailUV);
+
+	float4 albedo = GetBase(colors, detailMap);
 	// Alpha Cutout【只对 _CLIPPING 材质生效】，与 DefferStandard 逐字对齐：
 	//   #if defined(_CLIPPING) clip(base.a - GetCutoff()); #endif
 	// 之前是无条件 clip —— _CullOff 每个材质都有值(0.5)，不透明材质的贴图 alpha
@@ -124,7 +136,7 @@ void LitPassFragment (Varyings input,
 	#endif
 
 	float3 preNormal = float3(input.TtoW0.z, input.TtoW1.z, input.TtoW2.z);
-	float3 normal = GetNormalTS(colors);
+	float3 normal = GetNormalTS(colors, detailNormalMap);
 	normal = normalize(float3(dot(input.TtoW0.xyz, normal), dot(input.TtoW1.xyz, normal), dot(input.TtoW2.xyz, normal)));
 
 	float2 normalPack = PackNormal(normal);
@@ -135,7 +147,7 @@ void LitPassFragment (Varyings input,
 	half oneMinusReflectivity = (1 - metallic) * 0.96;
 
 
-	float roughness = GetRoughness(colors);
+	float roughness = GetRoughness(colors, detailMap);
 	float ambientOcclusion = colors.mask.y;
 	float3 sh = GetBakeDate(GI_FRAGMENT_DATA(input), positionWS, preNormal) * ambientOcclusion;
 

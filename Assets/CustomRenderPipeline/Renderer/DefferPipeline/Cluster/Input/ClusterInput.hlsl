@@ -25,6 +25,13 @@
 //   阴影投射物不能走 `Shadows.DrawSRP Batcher`，1219 个投射物逐个 draw（实测 0.45ms → 2.39ms）。
 #include "ClusterDOTSMaterial.hlsl"
 
+// detail 直采所需的纹理声明（与 ClusterPBR_BRG.shader 顶部 TEXTURE2D(_DetailMap) 等价）：
+// 非 BRG 路径改走「传统 tiled 直采」后，detail 通道不再读 RVT 图集，改采样材质自身的 _DetailMap。
+// Unity 按名字自动把材质属性 _DetailMap 绑到这个槽位，sampler_DetailMap 即其默认采样器。
+TEXTURE2D(_DetailMap);
+TEXTURE2D(_DetailNormalMap);
+SAMPLER(sampler_DetailMap);
+
 
 
 
@@ -110,7 +117,9 @@ RVTColors GetColor(float2 uv, uint texId, uint mip, float2 detailUV){
     colors.emission = (INPUT_PROP(float, _UseEmission) > 0.5)
         ? SAMPLE_TEXTURE2D_LOD(_VirtualEmission, sampler_VirtualEmission, localUV, 0)
         : float4(0.0, 0.0, 0.0, 0.0);
-	colors.detail   = SAMPLE_TEXTURE2D_LOD(_VirtualDetail,     sampler_VirtualDetail,   localDetailUV, 0);
+	// detail 改【直采】（见 ClusterPass.hlsl）：RVT detail 图集平铺语义与分页冲突会串页，已弃用。
+	// 结构体字段保留（AddColors/ScaleColors/LerpColors 与 BRG 的副本保持一致），只是填 0。
+	colors.detail   = 0;
 	return colors;
 }
 
@@ -142,21 +151,21 @@ RVTColors ScaleColors(RVTColors c, float s)
     return c;
 }
 
-float4 GetBase (RVTColors colors) {
+float4 GetBase (RVTColors colors, float4 detailMap) {
 	float4 map = colors.albedo;
 	float4 color = INPUT_PROP(float4, _Color);
 
-    float detail = (colors.detail.r * 2.0 - 1.0) * INPUT_PROP(float, _DetailAlbedo);
-	float mask = colors.mask.b;
-	// return map * (1.0 - detailV) + map * map * detailV;
-	// return map * map * detailV;
-	// return map * (1.0 - detailV);
-    map.xyz = lerp(sqrt(map.xyz), detail < 0.0? 0.0 : 1.0, abs(detail) * mask);
-	map.rgb *= map.rgb;
+    if (INPUT_PROP(float, _DetailAlbedo) > 0.001)
+    {
+        float detail = (detailMap.r * 2.0 - 1.0) * INPUT_PROP(float, _DetailAlbedo);
+        float mask = colors.mask.b;
+        map.xyz = lerp(sqrt(map.xyz), detail < 0.0 ? 0.0 : 1.0, abs(detail) * mask);
+        map.rgb *= map.rgb;
+    }
 	return map * color;
 }
 
-float3 GetNormalTS (RVTColors colors) {
+float3 GetNormalTS (RVTColors colors, float4 detailNormalMap) {
 	float4 map = colors.normal;
     float normalScale = INPUT_PROP(float, _NormalScale);
 	// RVT 图集法线是「法线贴图原样拷贝」，用 DecodeNormal（UnpackNormalmapRGorAG）解码。
@@ -165,32 +174,34 @@ float3 GetNormalTS (RVTColors colors) {
 	// 这不是调试开关：flipNormalY=1 时场景法线才是对的，删掉后整场景法线方向反、光照全错。
 	normal.y *= -1.0;
 
-	// detail 法线链路【禁用】——这是"RVT 下法线失效"的根因：
-	// RVT 只有一张 detail 贴图（与 DefferStandard 的 _DetailMap/_DetailNormalMap 两张约定不同），
-	// 资产 detail=null 时走 grayTexture fallback，解出的 detail.z=0 会让 BlendNormalRNM 除零产生 NaN，
-	// 而 Barrel_01 的 _DetailNormal=1、mask.b=1 → detailIntensity 恒为 1 → lerp 直接返回 NaN，
-	// 把正常法线整个污染掉（表面看起来"没有法线"）。标准路径因 _DETAIL_MAP 未开而幸免。
-	// 需要 detail 时按 DefferStandard 的两张贴图约定重新接入。
-	//float3 unpackNormal = UnpackNormal(float3(colors.detail.y, colors.detail.w, 1));
-	//float3 detail = DecodeNormal(float4(unpackNormal, 1.0f), 1.0f);
-	//float detailIntensity = INPUT_PROP(float, _DetailNormal) * colors.mask.b;
-	//float3 blendNor = BlendNormalRNM(normal, detail);
+	// detail 法线【直采 _DetailNormalMap】，与 BRG 路径逐字对齐（不再读 RVT detail 图集）：
+	// 三重安全（历史 NaN 把整条法线链路污染过一次）：
+	//   ① _DetailNormal 由 C# 侧保证：没有 detail 法线贴图时置 0 → 整段不执行；
+	//   ② detail.z 下限 0.05 → BlendNormalRNM 不会除零；
+	//   ③ 混合结果非有限（NaN/Inf）→ 直接回退基础法线。
+	if (INPUT_PROP(float, _DetailNormal) > 0.001)
+	{
+		float3 detail = DecodeNormal(detailNormalMap, 1.0);
+		detail.z = max(detail.z, 0.05);
+		float detailIntensity = INPUT_PROP(float, _DetailNormal) * colors.mask.b;
+		float3 blendNor = BlendNormalRNM(normal, detail);
+		if (!(dot(blendNor, blendNor) < 1.0e6))     // NaN/Inf 兜底
+			return normal;
+		return lerp(normal, blendNor, detailIntensity);
+	}
 	return normal;
-
 }
 
-float GetRoughness (RVTColors colors) {
+float GetRoughness (RVTColors colors, float4 detailMap) {
 	float roughness = INPUT_PROP(float, _Roughness);
 	roughness *= colors.mask.w;
 
-    roughness = lerp(roughness, 1.0f, INPUT_PROP(float, _DetailRoughness) * colors.detail.z * colors.mask.b);
-	// if (c.useDetail) {
-	// 	float detail = GetDetail(c).b * ;
-	// 	float mask = GetMask(c).g;
-	// 	roughness =
-	// 		lerp(roughness, detail < 0.0 ? 0.0 : 1.0, abs(detail) * mask);
-	// }
-	
+	if (INPUT_PROP(float, _DetailRoughness) > 0.001)
+	{
+		float detail = (detailMap.b * 2.0 - 1.0) * INPUT_PROP(float, _DetailRoughness);
+		float mask = colors.mask.g;
+		roughness = lerp(roughness, detail < 0.0 ? 0.0 : 1.0, abs(detail) * mask);
+	}
 	return roughness;
 }
 

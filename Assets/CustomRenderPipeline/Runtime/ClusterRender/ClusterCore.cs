@@ -648,23 +648,13 @@ namespace Cluster
         /// <summary>    /// 检测回读请求状态    /// </summary>
         private void UpdateRequest(CommandBuffer buffer)
         {
-            // 法线诊断模式：每帧下发（Play 中改 assemble.asset.normalDebugMode 立即生效）。
-            // 值实时取自资产，与 DefferPipeline 的最终 blit 判定同源——
-            // 以前这里会顺手写一份静态缓存，缓存不同步就会把 Debug Mode 永久顶掉，已删除。
-            Shader.SetGlobalFloat(ClusterProverty.NormalDebugMode,
-                ClusterProverty.NormalDebugModeValue);
-
             // RVT mip 混合开关（全局）：0=单 mip（快）/ 1=min-max 线性混合（原实现）
             Shader.SetGlobalFloat(ClusterProverty.RVTTrilinearBlend,
                 ClusterControl.Instance.ClusterAssembleAsset.rvtTrilinearBlend ? 1f : 0f);
 
             // ===== Profiler 采样点（CPU 侧）=====
             // 命名规范：<子系统>.<动作>，便于在 Profiler 的 CPU Usage / Timeline 里直接搜。
-            //   Cull.Scene         —— ScriptableRenderContext.Cull（场景剔除）
-            //   BRG.Cull           —— BRG 的 OnPerformCulling（逐实例视锥剔除，跑在渲染工作线程上）
-            //   BRG.UpdateMatrices —— 每帧刷新实例矩阵 + 上传 instance buffer
-            //   BRG.Draw           —— BRG 批次真正提交（量到的是 context.Submit 的 CPU 成本，不是 GPU 成本）
-            //   RVT.Feedback       —— RVT 反馈 pass：把整个不透明场景再画一遍到全屏 RT
+            //   Cull.Scene         —— ScriptableRenderContext.Cull（场景剔除）            //   RVT.Feedback       —— RVT 反馈 pass：把整个不透明场景再画一遍到全屏 RT
             //   RVT.RequestMins    —— 分配最低级页 + 应用上帧反馈结果（CPU 侧）
             //   RVT.PageDraw       —— 把贴图页画进图集（CPU marker + GPU marker，GPU 侧才是大头）
             //   RVT.Compact        —— 反馈压缩 compute（把全屏反馈压成请求标志数组）
@@ -730,7 +720,6 @@ namespace Cluster
                 buffer.ClearRenderTarget(true, true, Color.white);
                 buffer.DisableShaderKeyword("_FEED_BACK_DEBUG");
 
-                GPUDravinSystem.Instance.DrawFeedback(context, buffer, camera);
 
                 //设置该摄像机的物体排序模式，目前是渲染普通物体，因此用一般排序方式
                 var sortingSettings = new SortingSettings(camera)
@@ -748,17 +737,7 @@ namespace Cluster
                 };
                 var filteringSettings = new FilteringSettings(
                     RenderQueueRange.opaque, renderingLayerMask: (uint)layerMask
-                )
-                {
-                    // shadow-only 模式下 BRG 物体的 MeshRenderer 还开着（为了投阴影），
-                    // 而它们的材质已经换成 AssetMat（Unlit/ClusterPBR，**自带 Feedback pass**）。
-                    // 不排除这一层的话，这 1000+ 个物体会【每帧再进一次 feedback pass】，
-                    // 实测多出 ~12 个 draw、约 1ms GPU —— 换材质省下的阴影又全被它吃回去了。
-                    // 它们的 RVT 反馈由 `ClusterPBR_BRG.shader` 自带的 Feedback pass 提交，不依赖这里。
-                    layerMask = ClusterProverty.BRGShadowExcludeLayer >= 0
-                        ? unchecked((int)~(1u << ClusterProverty.BRGShadowExcludeLayer))
-                        : ~0,
-                };
+                );
 
                 ExecuteBuffer(buffer, context);
                 //进行渲染的执行方法

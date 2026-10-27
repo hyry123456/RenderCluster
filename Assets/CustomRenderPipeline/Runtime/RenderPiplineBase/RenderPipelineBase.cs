@@ -169,20 +169,6 @@ namespace CustomRenderPipline
 				drawingSettings.SetShaderPassName(i, legacyShaderTagIds[i]);
 			}
             var filteringSettings = FilteringSettings.defaultValue;
-            // 「阴影交给 MeshRenderer」模式：BRG 物体的 MeshRenderer 仍 enabled，但它们的材质
-            // 在这里会被画成洋红色错误材质（overrideMaterial 走的是"Always"标签，
-            // 配合 overrideMaterial 时 Unity 会无视材质自己的 pass 直接画）。
-            // ⇒ 把排除用的 layer 剔掉，它们只参与阴影 pass。
-            // 注意：属性类名是 ClusterProverty（工程里的原始拼写），不是 Proverty。
-            // 本文件没有 using Cluster，必须写全限定名。
-            if (Cluster.ClusterProverty.BRGShadowExcludeLayer >= 0)
-            {
-                // FilteringSettings.layerMask 是 int（按位解释成 uint 使用），
-                // 直接赋 uint 会 CS0266，必须显式转换。
-                filteringSettings.layerMask = unchecked((int)(
-                    ~(1u << Cluster.ClusterProverty.BRGShadowExcludeLayer)
-                ));
-            }
             context.DrawRenderers(
                 cullingResults, ref drawingSettings, ref filteringSettings
             );

@@ -1,4 +1,4 @@
-﻿using Cluster;
+using Cluster;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Profiling;
@@ -46,11 +46,6 @@ namespace CustomRenderPipline.DefferPipeline
     {
         DefferSetting defferSetting;
 
-        /// <summary>「给相机补排除 layer」只警告一次（否则每帧刷屏）。</summary>
-        static bool s_warnedCameraLayer;
-        /// <summary>「给相机补 BRG 批次专用 layer」只警告一次。</summary>
-        static bool s_warnedBRGCullLayer;
-
         int width, height;
         /// <summary> /// 存储GBuffer的所有Id  /// </summary>
         RenderTargetIdentifier[] gBuffers;
@@ -91,75 +86,6 @@ namespace CustomRenderPipline.DefferPipeline
             this.defferSetting = defferSetting;
             GraphicsSettings.useScriptableRenderPipelineBatching = renderSetting.useSRPBatching;
 
-            // ===== 「BRG 只画 GBuffer、阴影交给 MeshRenderer」模式的开关 =====
-            // BRG 接管阴影后，阴影 pass 从 0.96ms 涨到 4.8ms（Unity 的 SRP Batcher 按材质合批，
-            // 1219 个投射物 → 4 个 SRP Batch；BRG 只能按 (mesh,材质,submesh) 合批 → 134 条命令）。
-            // 所以让 BRG 放弃投影，MeshRenderer 保留原材质画阴影。
-            // 前提：相机的 cullingMask 必须包含排除用的 layer（否则物体直接消失）。
-            // ⚠️ 必须在本帧 Cull()【之前】决定 —— 剔除发生在 cull 阶段，layer 换了才进得了投射物集合。
-            int exclLayer = -1;
-            string exclReason = null;
-            var assemble = ClusterControl.TryGetAssembleAsset();   // 安全取，不会触发资产创建
-            if (assemble == null) exclReason = "assemble 资产未加载";
-            else if (!assemble.useBRG) exclReason = "useBRG = 0";
-            else
-            {
-                int L = assemble.brgGBufferExcludeLayer;
-                if (L < 0 || L >= 32)
-                    exclReason = $"brgGBufferExcludeLayer = {L}（需 0..31；-1 表示关闭该模式）";
-                else
-                {
-                    // 相机看不到该 layer ⇒ 物体直接消失（连阴影也没）。这里是"排除法"最容易踩的一脚：
-                    // 相机的 Culling Mask 若被手工改过（不是 Everything），整个模式会静默失效，
-                    // 表现就是"阴影还是 4ms、控制台什么也没有"。所以直接补进去 + 报一次警告。
-                    if ((camera.cullingMask & (1 << L)) == 0)
-                    {
-                        camera.cullingMask |= 1 << L;
-                        if (!s_warnedCameraLayer)
-                        {
-                            s_warnedCameraLayer = true;
-                            Debug.LogWarning($"[RVT/BRG] 相机 \"{camera.name}\" 的 Culling Mask 不含 layer {L}，" +
-                                "已自动补上（仅本次运行有效）。要永久生效请手动打开该 layer。");
-                        }
-                    }
-                    exclLayer = L;
-                }
-            }
-            if (exclLayer != ClusterProverty.BRGShadowExcludeLayer)
-            {
-                ClusterProverty.BRGShadowExcludeLayer = exclLayer;
-                BatchRenderManager.Instance?.ApplyShadowOnlyMode(exclLayer);
-                // 这条日志是排查「阴影还是 4ms」的第一落点：
-                // 显示「阴影归属 = BRG 批次」就说明模式没生效，括号里会写原因。
-                Debug.Log(exclLayer >= 0
-                    ? $"[RVT/BRG] 阴影归属 = MeshRenderer：BRG 物体已挪到 layer {exclLayer}" +
-                      $"（实例数 {BatchRenderManager.ShadowOnlyInstanceCount}），" +
-                      "BRG 批次不再投阴影（GBuffer 仍由 BRG 画）。"
-                    : $"[RVT/BRG] 阴影归属 = BRG 批次（原因：{exclReason}）。");
-            }
-
-            // BRG 批次自己所在的 layer（BRGCullLayer）必须在【相机】的 cullingMask 里，
-            // 否则连主画面都不画。灯光的 cullingMask 会在 Shadows.ReserveDirectionalShadows
-            // 里被自动去掉这一位 ⇒ BRG 只进主画面、进不了阴影视图。
-            {
-                int cl = ClusterProverty.BRGCullLayer;
-                if (cl >= 0 && cl < 32 && (camera.cullingMask & (1 << cl)) == 0)
-                {
-                    camera.cullingMask |= 1 << cl;
-                    if (!s_warnedBRGCullLayer)
-                    {
-                        s_warnedBRGCullLayer = true;
-                        Debug.LogWarning($"[RVT/BRG] 相机 \"{camera.name}\" 的 Culling Mask 已自动加上 " +
-                            $"layer {cl}（BRG 批次专用层，仅本次运行有效）。");
-                    }
-                }
-            }
-
-
-            // 法线诊断开关：每帧按资产实时值下发，和 DrawFinal 里选 pass 用的是同一个值。
-            // 放在这里（而不是 ClusterCore 的反馈帧里）是为了让它在「关掉 RVT / 暂停 / 非 Game 相机」
-            // 这些反馈不跑的情况下也立即生效、立即失效——诊断只应是叠加，不能反过来锁死 Debug 核心。
-            Shader.SetGlobalFloat(ClusterProverty.NormalDebugMode, ClusterProverty.NormalDebugModeValue);
 
             //执行单个摄像机的gbuffer前操作
             var beforeGBuffers = camera.GetCommandBuffers(CameraEvent.BeforeGBuffer);
@@ -216,7 +142,6 @@ namespace CustomRenderPipline.DefferPipeline
                 buffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
                 buffer.ClearRenderTarget(true, true, Color.black);
                 buffer.EnableShaderKeyword("_FEED_BACK_DEBUG");
-                GPUDravinSystem.Instance.DrawFeedback(context, buffer, camera);
 
                 //设置该摄像机的物体排序模式，目前是渲染普通物体，因此用一般排序方式
                 var sortingSettings = new SortingSettings(camera)
@@ -234,14 +159,7 @@ namespace CustomRenderPipline.DefferPipeline
                 };
                 var filteringSettings = new FilteringSettings(
                     RenderQueueRange.opaque, renderingLayerMask: (uint)renderLayerMask
-                )
-                {
-                    // 同 ClusterCore 的 feedback pass：排除 shadow-only 用的 layer，
-                    // 否则那批 MeshRenderer（材质是 Unlit/ClusterPBR，带 Feedback pass）会被重复画一遍。
-                    layerMask = ClusterProverty.BRGShadowExcludeLayer >= 0
-                        ? unchecked((int)~(1u << ClusterProverty.BRGShadowExcludeLayer))
-                        : ~0,
-                };
+                );
                 ExecuteBuffer();
                 //进行渲染的执行方法
                 context.DrawRenderers(
@@ -272,9 +190,6 @@ namespace CustomRenderPipline.DefferPipeline
             //否则 Persistent 分配的 NativeArray 与 ComputeBuffer 会在运行结束后被报内存泄漏
             if (clusterCore != null)
                 clusterCore.Cleanup();
-            //释放 BRG 管理器（BatchRendererGroup / 实例矩阵缓冲 / 注册的 batch）
-            if (BatchRenderManager.Instance != null)
-                BatchRenderManager.Instance.Dispose();
             lighting?.Dispose();
             spaceReflect?.Dispose();
         }
@@ -291,18 +206,11 @@ namespace CustomRenderPipline.DefferPipeline
                 p.shadowDistance = Mathf.Min(maxShadowDistance, camera.farClipPlane);
                 //赋值裁剪结果
                 //Profiler 采样点：Cull.Scene —— 场景剔除（ScriptableRenderContext.Cull）。
-                //它是主线程上最贵的一段之一：内部会跑 Unity 的整个剔除管线，
-                //并且【会触发 BRG 的 OnPerformCulling 回调】（那段在渲染工作线程上，
-                //要切到 Render Thread 行才看得到，标记名 BRG.Cull）。
+                //它是主线程上最贵的一段之一：内部会跑 Unity 的整个剔除管线。
                 Profiler.BeginSample("Cull.Scene");
                 cullingResults = context.Cull(ref p);
                 Profiler.EndSample();
 
-                // 剔除对照：无论 BRG 开还是关，都用 Unity 内置 GeometryUtility 统计一遍
-                // 场景 MeshRenderer 的视锥可见数，作为「相机到底看得见多少」的稳定基线，
-                // 用来判断 BRG 的 1159/1159 究竟是「剔除写错」还是「本来就都看得见」。
-                // 内部每 300 帧才真跑一次，不产生额外开销。
-                CullDiagnostics.ReportSceneRenderers(camera);
 
                 return true;
             }
@@ -436,53 +344,15 @@ namespace CustomRenderPipline.DefferPipeline
                 PerObjectData.OcclusionProbeProxyVolume
             };
             filteringSettings = new FilteringSettings(
-                RenderQueueRange.opaque, renderingLayerMask: (uint)renderingLayerMask)
-            {
-                // 「阴影交给 MeshRenderer」模式：这些物体的 MeshRenderer 仍 enabled，
-                // 它们只画阴影、不该画 GBuffer（否则与 BRG 批次双重绘制）⇒ 排除掉该 layer。
-                // FilteringSettings.layerMask 是 int，这里按位当作 uint 用，需显式转换
-                layerMask = unchecked((int)(
-                    ClusterProverty.BRGShadowExcludeLayer >= 0
-                        ? ~(1u << ClusterProverty.BRGShadowExcludeLayer)
-                        : 0xffffffffu
-                )),
-            };
+                RenderQueueRange.opaque, renderingLayerMask: (uint)renderingLayerMask);
 
             //进行渲染的执行方法
             context.DrawRenderers(
                 cullingResults, ref drawingSettings, ref filteringSettings
             );
 
-            //=== BRG 迁移 Step1（附加式）：GBuffer MRT 仍绑定的此刻提交一次，
-            //让 BRG 把 GBuffer pass 额外绘制进 GBuffer。原 DrawRenderers 已先画过，故为叠加，
-            //画面兜底仍在；若 BRG 提交时机/裁剪有问题，仍可对比排查。===
-            if (ClusterControl.Instance.ClusterAssembleAsset.useBRG
-                && BatchRenderManager.Instance != null
-                && BatchRenderManager.Instance.HasBatches)
-            {
-                BatchRenderManager.Instance.UpdateMatrices();
-                //Frame Debugger 标记：BRG 的 draw command 在 context.Submit() 时才真正绘制，
-                //用 C# Profiler 样本圈出独立标题 "BRG.Draw"，便于在 Profiler/Frame Debugger 里
-                //确认 BRG 有没有画、画了什么。（注：原先写的 "RenderLoop.DrawBRG" 与 Unity 内部
-                //同名 marker 冲突，且 CommandBuffer 样本会被 ExecuteBuffer 的 Clear 断开 → 报
-                //"Non-matching Profiler.EndSample"，所以改成 C# Profiler 样本并改名。）
-                //
-                //【重要】这里量到的是【context.Submit 的 CPU 成本】，不是 BRG 绘制的 GPU 成本。
-                //BRG 的 GPU 成本要去 Frame Debugger / RenderDoc 看 "Hybrid Batch Group" 条目。
-                //另外这次 Submit 是【帧中提交】（整帧的最后一次 Submit 在 Submit() 里），
-                //目的是让 BRG 的 GBuffer 绘制赶在光照 pass 之前落地，代价是多一次提交/次刷新。
-                ExecuteBuffer();
-                Profiler.BeginSample("BRG.Draw");
-                context.Submit();
-                Profiler.EndSample();
-                ExecuteBuffer();
-            }
-
-            // 旧的「逐簇 DrawMesh」路径已移除：几何统一由上面的 BRG 绘制，
-            // 纹理精度由 Tile-VT 保证，不再需要簇这一层。
-
-            //渲染GPU驱动的标准PBR数据
-            GPUDravinSystem.Instance.DrawGBuffer(context, buffer, camera);
+            // 几何由上面的 context.DrawRenderers(cullingResults) 走 SRP 绘制；
+            // 纹理精度由 RVT / Tile-VT 保证。
         }
 
 
@@ -527,9 +397,6 @@ namespace CustomRenderPipline.DefferPipeline
                 cullingResults, ref drawingSettings, ref filteringSettings
             );
 
-            //绘制ComputeShader实现的物体
-            GPUDravinSystem.Instance.DrawTransparent(context, buffer, camera);
-
 
 
             ExecuteBuffer();
@@ -543,9 +410,6 @@ namespace CustomRenderPipline.DefferPipeline
             buffer.SetRenderTarget(
                 ShaderProperty.ColorAttachmentId, RenderBufferLoadAction.Load, RenderBufferStoreAction.Store,
                 DefferProperty.GBufferDepthId, RenderBufferLoadAction.Load, RenderBufferStoreAction.Store);
-
-            //放在这里，保证先渲染完默认模型后渲染天空盒
-            GPUDravinSystem.Instance.DrawOpaque(context, buffer, camera);
 
             ExecuteBuffer();
             //绘制天空盒
@@ -586,17 +450,12 @@ namespace CustomRenderPipline.DefferPipeline
                     (int)DefferRenderPass._CopyColor);
             }
 
-            GPUDravinSystem.Instance.DrawSkyboxLater(context, buffer, camera);
-
             if (RenderSSR)
             {
                 buffer.SetRenderTarget(
                     gBuffers,
                     DefferProperty.GBufferDepthId);
 
-
-                //为了拓展需要反射效果，但是又不直接使用BRDF的渲染时执行的方法,
-                GPUDravinSystem.Instance.DrawBeforeSSR(context, buffer, camera);
                 buffer.SetRenderTarget(
                     ShaderProperty.ColorAttachmentId, RenderBufferLoadAction.Load, RenderBufferStoreAction.Store,
                     DefferProperty.GBufferDepthId, RenderBufferLoadAction.Load, RenderBufferStoreAction.Store);
@@ -638,18 +497,7 @@ namespace CustomRenderPipline.DefferPipeline
             // 结果管线资产上的 Debug Mode 在 Scene 视图里【完全没反应】——而 Scene 视图正是
             // 平时看效果的主要窗口。现在 Game / Scene 两条分支共用同一个 pass，行为一致。
             int pass;
-            // 法线诊断模式（Assemble.normalDebugMode）非 0 时优先级最高：
-            // BRG 把诊断内容写进了 RT0(albedo) 通道，这里在 GBuffer 渲染之后的最终 blit
-            // 直接输出它。这样只改 Assemble 上那一个字段就能看到诊断，
-            // 不需要再去 RenderPipeline 资产把 Debug Mode 切成 Albedo。
-            // 注意：NormalDebugModeValue 现在是【实时读资产】，0 就是 0——
-            // 以前它是个只在 RVT 反馈帧里同步的静态缓存，关掉 RVT/暂停后就永久停在旧值，
-            // 会把这里钉死在 _DebugAlbedo，表现为「Normal Debug 关掉了，管线 Debug Mode 还是不起作用」。
-            if (ClusterProverty.NormalDebugModeValue > 0)
-            {
-                pass = (int)DefferRenderPass._DebugAlbedo;
-            }
-            else switch (defferSetting.debugMode)
+            switch (defferSetting.debugMode)
             {
                 case DefferDebugMode.Normal:
                     pass = (int)DefferRenderPass._DebugNormal; break;
@@ -712,8 +560,6 @@ namespace CustomRenderPipline.DefferPipeline
             }
 
             lighting.Cleanup();		//灯光数据清除
-
-            GPUDravinSystem.Instance.CleanUp(context, buffer);
 
         }
 

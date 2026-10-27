@@ -15,7 +15,6 @@ namespace Cluster
             textureNodesBuffer = Shader.PropertyToID("_TextureNodesBuffer"),
             sumTextureCount = Shader.PropertyToID("_SumTextureCount"),
             tilesPerAxis = Shader.PropertyToID("_TilesPerAxis"),
-            normalDebugMode = Shader.PropertyToID("_NormalDebugMode"),
             rvtTrilinearBlend = Shader.PropertyToID("_RVTTrilinearBlend"),
 
             virtualAlbedo = Shader.PropertyToID("_VirtualAlbedo"),
@@ -32,38 +31,13 @@ namespace Cluster
         public static int LevelPadding => levelPadding;
         public static int SumTextureCount => sumTextureCount;
         public static int TilesPerAxis => tilesPerAxis;
-        public static int NormalDebugMode => normalDebugMode;
-
         /// <summary>RVT mip 混合开关：0=单 mip（快）/ 1=min-max 线性混合（原实现，慢一倍）。</summary>
         public static int RVTTrilinearBlend => rvtTrilinearBlend;
 
-        /// <summary>
-        /// 「阴影交给 MeshRenderer、BRG 只画 GBuffer」模式用的排除 layer（-1 = 关闭该模式）。
-        /// BRG 物体被挪到这个 layer，GBuffer pass 与 DrawUnsupportedShaders 排除它，
-        /// 于是它的 MeshRenderer 只画阴影（走 Unity 的 SRP Batcher 路径，快 4 倍），不画 GBuffer。
-        /// 注意：排除的是【GBuffer】，不是阴影 —— 名字里的 Exclude 指的是"把 GBuffer 绘制排除掉"。
-        /// </summary>
-        public static int BRGShadowExcludeLayer = -1;
-
-        /// <summary>
-        /// BRG 批次专用 layer（相机可见、灯光**不可见**）——用于让 BRG 物理上无法投阴影。
-        ///
-        /// 背景（2026-10-21）：删掉 BRG shader 的 ShadowCaster pass 之后，阴影 pass 仍然
-        /// 比"完全不开 BRG"慢 ~1.6ms，说明 `context.DrawShadows` 依旧把 BRG 批次画进了
-        /// 阴影图（BatchFilterSettings.shadowCastingMode = Off 在 2022.3 的 SRP 下不可靠）。
-        ///
-        /// 这里换一条【剔除层面】的路：`BatchFilterSettings.layer` 决定该批次属于哪个 layer，
-        /// Unity 用视图自己的 cullingMask 过滤批次。
-        ///   · 相机的 cullingMask 加上这一层 → 主画面照画；
-        ///   · 灯光的 cullingMask 去掉这一层 → 阴影视图的剔除直接pass掉该批次。
-        /// 两层分工：MeshRenderer 的物体在 BRGShadowExcludeLayer(31)（灯光**要**看见 → 投阴影），
-        /// BRG 批次在 BRGCullLayer(30)（灯光**不要**看见 → 永不投阴影）。
-        /// </summary>
-        public static int BRGCullLayer = 30;
 
         /// <summary>
         /// 「需 alpha 镂空的物体（草/蕨/灌木）」专用的 rendering layer 位（不是 GameObject layer，
-        /// 是 Renderer.renderingLayerMask 的位，与 BRGCullLayer 的 GameObject 层互不干扰）。
+        /// 是 Renderer.renderingLayerMask 的位）。
         /// Cluster 阴影 shader 不采样贴图、无法做镂空，这类物体改走 SRP 阴影路径；
         /// Shadows.cs 用这个位做 rendering layer mask 过滤，只挑它们进 context.DrawShadows，
         /// 其余物体（renderingLayerMask 不含此位）被自动跳过，不会与 Cluster 重复绘制。
@@ -73,25 +47,6 @@ namespace Cluster
 
         /// <summary>当前生效的 Tile 轴数：useTileVT 关时为 1（旧路径，行为完全等价），开启时为 TilesPerAxis。</summary>
         public static int TilesPerAxisValue { get; set; } = 1;
-
-        /// <summary>
-        /// 当前生效的法线诊断模式（0=关闭）。供 DefferPipeline 的最终 blit 判断：
-        /// 非 0 时强制走 _DebugAlbedo pass 输出诊断通道，用户只改 Assemble 上这一个字段就能立刻看到诊断。
-        ///
-        /// 【必须实时读资产，不能缓存】以前是 `public static int ... { get; set; }`，只有
-        /// ClusterCore.UpdateRequest（条件：Play + 未暂停 + cameraType==Game + UseRVT 开）里才同步。
-        /// 一旦在那之后关掉 UseRVT / 退出 Play / 暂停 / 关掉 Game 视图，缓存值就永久停在旧值
-        /// → 最终 blit 一直被强制到 _DebugAlbedo → 表现为「Normal Debug 明明设回 0 了，
-        /// 管线资产自己的 Debug Mode 还是不生效」。直接读资产后，Off 状态对渲染零干预。
-        /// </summary>
-        public static int NormalDebugModeValue
-        {
-            get
-            {
-                var asset = ClusterControl.Instance.ClusterAssembleAsset;
-                return asset == null ? 0 : (int)asset.normalDebugMode;
-            }
-        }
 
         public static int VirtualAlbedo => virtualAlbedo;
         public static int VirtualNormal => virtualNormal;

@@ -12,6 +12,7 @@ Shader "Unlit/ClusterPBR"
 
 
 		_DetailMap("Details", 2D) = "linearGrey" {}
+        _DetailNormalMap("Detail Normals", 2D) = "bump" {}
         _Color("Main Color", Color) = (1, 1, 1, 1)
         _DetailAlbedo("Detail Albedo", Range(0, 1)) = 0
         _DetailNormal("Detail Normal", Range(0, 1)) = 0

@@ -60,7 +60,7 @@ namespace Cluster
         /// Alpha Cutout 开关的【真值】，从源材质 _CLIPPING keyword 搬运而来。
         /// 注意：cullOff 只是阈值（每个材质默认 0.5），"有阈值 ≠ 该裁"；
         /// 真正决定是否裁切的是 _CLIPPING keyword，必须用这个布尔判断，不能用 cullOff > 0。
-        /// （与 BRG 路径 GetOrCreateBRGMaterial 里 src.IsKeywordEnabled("_CLIPPING") 的判定保持一致。）
+        /// （与 GetOrCreateClusterPBRMaterial 里 src.IsKeywordEnabled("_CLIPPING") 的判定保持一致。）
         /// </summary>
         public bool clipping = false;
 

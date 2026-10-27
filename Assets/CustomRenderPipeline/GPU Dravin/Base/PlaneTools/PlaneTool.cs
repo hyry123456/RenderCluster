@@ -1,4 +1,4 @@
-﻿using CustomRenderPipline;
+using CustomRenderPipline;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -201,57 +201,6 @@ namespace KWS
             _planeCompute.DispatchIndirect(_kernelOfBuildLodMap, _indirectArgsBuffer, 0);
 
             planeBase.AfterPingPongCreateTree(_planeCompute);
-        }
-
-        public void CullingNode(CommandBuffer buffer, PlaneBase planeBase)
-        {
-            buffer.SetComputeVectorArrayParam(_planeCompute, PlaneConstant.CameraFrustumPlanes, GPUDravinSystem.Instance.CameraPlane);
-            buffer.SetComputeVectorArrayParam(_planeCompute, PlaneConstant.NodeSize, planeBase.NodeSize);
-            buffer.SetComputeVectorParam(_planeCompute, PlaneConstant.BeginPosition, planeBase.WorldPosition);
-            buffer.SetComputeBufferParam(_planeCompute, _kernelOfBuildPatches, PlaneConstant.FinalNodeList, planeBase._finalNodeListBuffer);    //未裁剪
-            buffer.SetComputeBufferParam(_planeCompute, _kernelOfBuildPatches, PlaneConstant.CulledPatchList, planeBase._culledPatchBuffer);    //裁剪后
-            buffer.SetComputeVectorParam(_planeCompute, PlaneConstant.Extent, planeBase.Extent);
-            buffer.CopyCounterValue(planeBase._finalNodeListBuffer, _indirectArgsBuffer, 0);
-            buffer.DisableShaderKeyword(PlaneConstant.MIN_MAX_HIGHT_MAP);
-
-            planeBase.BeforeCulling(_planeCompute, buffer);
-
-            buffer.DispatchCompute(_planeCompute, _kernelOfBuildPatches, _indirectArgsBuffer, 0);
-
-            //要偏移4字节，因为Mesh indirect的第二个才是存储数量
-            buffer.CopyCounterValue(planeBase._culledPatchBuffer, planeBase.args, 4);
-            buffer.SetBufferCounterValue(planeBase._culledPatchBuffer, 0);
-#if UNITY_EDITOR
-            if (planeBase.useBounds)
-            {
-                buffer.SetComputeBufferParam(_planeCompute, _kernelOfBounds, PlaneConstant.FinalNodeList, planeBase._finalNodeListBuffer);    //未裁剪
-                buffer.SetComputeBufferParam(_planeCompute, _kernelOfBounds, PlaneConstant.BoundsList, planeBase._boundsBuffer);    //裁剪后
-                buffer.DispatchCompute(_planeCompute, _kernelOfBounds, _indirectArgsBuffer, 0);
-                buffer.SetBufferCounterValue(planeBase._boundsBuffer, 0);
-            }
-#endif
-            planeBase.AfterCulling(_planeCompute, buffer);
-        }
-
-        public void CullingShadowNode(CommandBuffer buffer, PlaneBase planeBase)
-        {
-            buffer.SetComputeVectorArrayParam(_planeCompute, PlaneConstant.CameraFrustumPlanes, GPUDravinSystem.Instance.ShadowPlane);
-            buffer.SetComputeVectorArrayParam(_planeCompute, PlaneConstant.NodeSize, planeBase.NodeSize);
-            buffer.SetComputeVectorParam(_planeCompute, PlaneConstant.BeginPosition, planeBase.WorldPosition);
-            buffer.SetComputeBufferParam(_planeCompute, _kernelOfShadowBuildPatches, PlaneConstant.FinalNodeList, planeBase._finalNodeListBuffer);    //未裁剪
-            buffer.SetComputeBufferParam(_planeCompute, _kernelOfShadowBuildPatches, PlaneConstant.CulledPatchList, planeBase._culledPatchBuffer);    //裁剪后
-            buffer.SetComputeVectorParam(_planeCompute, PlaneConstant.Extent, planeBase.Extent);
-            buffer.CopyCounterValue(planeBase._finalNodeListBuffer, _indirectArgsBuffer, 0);
-            buffer.DisableShaderKeyword(PlaneConstant.MIN_MAX_HIGHT_MAP);
-
-            planeBase.BeforeCulling(_planeCompute, buffer);
-
-            buffer.DispatchCompute(_planeCompute, _kernelOfShadowBuildPatches, _indirectArgsBuffer, 0);
-
-            //要偏移4字节，因为Mesh indirect的第二个才是存储数量
-            buffer.CopyCounterValue(planeBase._culledPatchBuffer, planeBase.args, 4);
-            buffer.SetBufferCounterValue(planeBase._culledPatchBuffer, 0);
-            planeBase.AfterCulling(_planeCompute, buffer);
         }
 
     }

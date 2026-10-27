@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.Rendering;
 using Cluster;
 
@@ -10,12 +10,6 @@ namespace CustomRenderPipline
 
 		const int maxShadowedDirLightCount = 4, maxShadowedOtherLightCount = 16;
 		const int maxCascades = 4;
-
-		/// <summary>「自动把排除 layer 补进灯光 Culling Mask」只警告一次。</summary>
-		static bool s_warnedExclLayer;
-
-		/// <summary>「自动把 BRG 批次专用 layer 从灯光 Culling Mask 移除」只警告一次。</summary>
-		static bool s_warnedBRGCullLayer;
 
 		static string[] directionalFilterKeywords = {
 			"_DIRECTIONAL_PCF3",
@@ -103,17 +97,6 @@ namespace CustomRenderPipline
 		/// <summary>本帧的阴影路径（资产开关缓存）：SRP / Cluster / ClusterDebug。</summary>
 		ClusterShadowMode m_shadowMode = ClusterShadowMode.SRP;
 
-		/// <summary>
-		/// 阴影 split（方向光的级联 / 点光的 cube 面）的剔除包围球，键 = visibleLightIndex。
-		/// 供 BRG 的阴影视图做【按级联】的逐实例剔除：BRG 的
-		/// `BatchDrawCommand.splitVisibilityMask` 就是"这条命令在哪些 split 里可见"，
-		/// 一个 split 恰好 = 一个级联（Unity 官方文档原话）。
-		/// 球取自 Unity 自己的 ShadowSplitData.cullingSphere —— 普通 MeshRenderer 的
-		/// 阴影投射物剔除用的也正是它，所以语义与 Unity 一致，不会再出现「远处没阴影」。
-		/// 时序：BRG 的 OnPerformCulling 跑在 context.Cull 阶段（早于本帧阴影计算），
-		/// 所以 BRG 拿到的是【上一帧】的球（静态物体无差别；半径另留 25% 余量）。
-		/// </summary>
-
 		/// <summary>初始化本帧阴影渲染所需的上下文（渲染上下文 / 剔除结果 / 阴影设置）。</summary>
 		public void Setup(
 			ScriptableRenderContext context, CullingResults cullingResults,
@@ -149,43 +132,6 @@ namespace CustomRenderPipline
                 light.shadows != LightShadows.None && light.shadowStrength > 0f
             )
             {
-                // 【阴影交给 MeshRenderer 的模式】灯光的 cullingMask 必须包含 BRG 用的排除 layer，
-                // 否则这些物体不会进入 shadow caster 集合 ⇒ 完全没有阴影（且很难一眼看出原因）。
-                // 处理方式：直接把它补进灯光的 Culling Mask（而不是"关掉该模式并回退"）。
-                // 回退会让 BRG 批次重新投阴影 ⇒ BRG 与 MeshRenderer 同时投 = 阴影画两遍、
-                // 成本翻倍，而画面完全正常，是比"没阴影"更难查的状态。
-                // 只改运行时对象，退出 Play 场景重载即恢复，不会脏化场景。
-                int exclLayer = ClusterProverty.BRGShadowExcludeLayer;
-                if (exclLayer >= 0 && exclLayer < 32 &&
-                    (light.cullingMask & (1 << exclLayer)) == 0)
-                {
-                    light.cullingMask |= 1 << exclLayer;
-                    if (!s_warnedExclLayer)
-                    {
-                        s_warnedExclLayer = true;
-                        Debug.LogWarning($"[RVT/BRG] 已把 layer {exclLayer} 自动补进方向光 \"{light.name}\" 的 " +
-                            "Culling Mask（仅本次运行有效，不会写进场景）。" +
-                            "要永久生效请手动打开该 layer；不想用这个模式就把 brgGBufferExcludeLayer 设为 -1。");
-                    }
-                }
-
-                // ★ BRG 批次自己在 BRGCullLayer 上，把它从灯光的 cullingMask 里【去掉】——
-                // 这样阴影视图的剔除阶段就会直接跳过整条 BRG 批次，是"BRG 不投阴影"最可靠的一层拦截：
-                // 它不依赖 BatchFilterSettings.shadowCastingMode（2022.3 的 SRP 下不可靠），
-                // 也不依赖 shader 有没有 ShadowCaster pass。
-                int brgLayer = ClusterProverty.BRGCullLayer;
-                if (!BatchRenderManager.BRGCastsShadows &&
-                    brgLayer >= 0 && brgLayer < 32 &&
-                    (light.cullingMask & (1 << brgLayer)) != 0)
-                {
-                    light.cullingMask &= ~(1 << brgLayer);
-                    if (!s_warnedBRGCullLayer)
-                    {
-                        s_warnedBRGCullLayer = true;
-                        Debug.LogWarning($"[RVT/BRG] 已把 layer {brgLayer}（BRG 批次专用层）从方向光 " +
-                            $"\"{light.name}\" 的 Culling Mask 移除（仅本次运行有效）⇒ BRG 不再参与阴影投射。");
-                    }
-                }
 				float maskChannel = -1;
 				LightBakingOutput lightBaking = light.bakingOutput;
 				if (
@@ -201,15 +147,7 @@ namespace CustomRenderPipline
                     visibleLightIndex, out Bounds b
                 ))
                 {
-                    // BRG 接管绘制后，场景物体的 MeshRenderer 被禁用，不会进入 cullingResults 的
-                    // shadow caster 集合，于是 GetShadowCasterBounds 对本该投射阴影的光返回 false，
-                    // 导致该方向光被“无投射物”跳过 —— 表现即“开了 BRG 后阴影全没了/出错”。
-                    // 只要本工程仍有 BRG 实例在投射阴影，就不能据此跳过本光。
-                    if (BatchRenderManager.Instance == null ||
-                        !BatchRenderManager.Instance.HasBatches)
-                    {
-                        return new Vector4(-light.shadowStrength, 0f, 0f, maskChannel);
-                    }
+                    return new Vector4(-light.shadowStrength, 0f, 0f, maskChannel);
                 }
 
                 shadowedDirectionalLights[shadowedDirLightCount] =
@@ -253,9 +191,7 @@ namespace CustomRenderPipline
 			int newLightCount = shadowedOtherLightCount + (isPoint ? 6 : 1);
 			if (
 				newLightCount > maxShadowedOtherLightCount ||
-				(!cullingResults.GetShadowCasterBounds(visibleLightIndex, out Bounds b)
-					&& (BatchRenderManager.Instance == null ||
-						!BatchRenderManager.Instance.HasBatches))
+				!cullingResults.GetShadowCasterBounds(visibleLightIndex, out Bounds b)
 			)
 			{
 				return new Vector4(-light.shadowStrength, 0f, 0f, maskChannel);
@@ -475,7 +411,7 @@ namespace CustomRenderPipline
 
 		if (useCluster)
 		{
-				// ===== Cluster / ClusterDebug 模式：只画 cluster，彻底不跑 GPUDravinSystem / context.DrawShadows =====
+				// ===== Cluster / ClusterDebug 模式：只画 cluster（cutout 另行走 SRP 阴影）=====
 				// 4 个级联的 viewport + 矩阵 + 间接绘制全部累积进【同一个 buffer】，
 				// 循环外只 ExecuteBuffer 一次，把材质 PrepareKeywords 从 4× 降到 1×（~2.5ms → ~0.6ms）。
 				buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
@@ -537,16 +473,13 @@ namespace CustomRenderPipline
             }
             else
 			{
-				// ===== SRP 模式：GPUDravinSystem 画 BRG/RVT + context.DrawShadows 画 MeshRenderer =====
+				// ===== SRP 模式：context.DrawShadows 画 MeshRenderer =====
 				for (int i = 0; i < cascadeCount; i++)
 				{
 					int tileIndex = tileOffset + i;
 					SetTileViewport(tileIndex, split, tileSize);
 					buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
 					buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
-					GPUDravinSystem.Instance.SetDirectionCullingPlane(m_cascadeSplit[i].cullingSphere,
-						light.forward, light.up, light.right);
-					GPUDravinSystem.Instance.DrawShadows(context, buffer);
 					ExecuteBuffer();
 					shadowSettings.splitData = m_cascadeSplit[i];
 					context.DrawShadows(ref shadowSettings);
@@ -640,11 +573,7 @@ namespace CustomRenderPipline
 			);
 
 			buffer.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
-			buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
-			//GPUDravinSystem.Instance.DrawShadows(context, buffer,
-			//	ClustDrawType.Shadow, projectionMatrix * viewMatrix);
-            GPUDravinSystem.Instance.DrawShadows(context, buffer);
-			ExecuteBuffer();
+			buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);			ExecuteBuffer();
 			context.DrawShadows(ref shadowSettings);
 			buffer.SetGlobalDepthBias(0f, 0f);
 		}
@@ -685,10 +614,6 @@ namespace CustomRenderPipline
 
 				buffer.SetViewProjectionMatrices(viewMatrix, projectionMatrix);
 				buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
-				//GPUDravinSystem.Instance.DrawShadows(context, buffer,
-				//	ClustDrawType.Shadow, projectionMatrix * viewMatrix);
-				GPUDravinSystem.Instance.DrawShadows(context, buffer);
-
 				ExecuteBuffer();
                 context.DrawShadows(ref shadowSettings);
                 buffer.SetGlobalDepthBias(0f, 0f);

@@ -51,8 +51,8 @@
   `_SumTextureCount = 贴图数 × T*T`，`tileIndex = tileY*T + tileX`。
 - **tile 推导必须先 Wrap 再切**：`tileUV = frac(baseUV) * T`。`baseUV` 经 `_MainTex_ST` 后可能 >1，
   若直接 `*T` 再 `clamp(0,T-1)`，所有重复段都会被压到最后一个 tile（整片拉伸、法线方向全错）。
-- **四处公式必须逐字一致**：`FeedbackPass.hlsl`（请求）、`ClusterPBR_BRG.shader`（GBuffer + 自带 Feedback 两个 Pass）、
-  `ClusterInput.hlsl`（GetColor）、`RVTFeedbackCompact.compute`（解码 pageId）。
+- **三处公式必须逐字一致**：`FeedbackPass.hlsl`（请求）、`ClusterInput.hlsl`（GetColor 取数）、
+  `RVTFeedbackCompact.compute`（解码 pageId）。
   任何一处漏改都会变成"请求的页 ≠ 采样的页"。
   （第五处 `ClusterPBR_Cluster.shader` 已随「簇渲染路径」一起归档到 `_Deprecated/ClusterPath/`。）
 - **采集侧 padding 映射**（`RVTShader.shader` Pass3）：正确写法是先剔 padding 再缩放到 tile 子矩形
@@ -66,17 +66,12 @@
 3. 若近处剧烈跳动或漏页：优先检查 `mipsOffset` / `FeedbackZoomScale` / `CellCount`（见上）。
 4. 本管线仅需在 PC 上测试，暂不考虑移动端兼容。
 
-### BRG 迁移（进行中）
-- **Step 0（已完成）**：SRP Batcher 已开；`csc.rsp(-unsafe)` 已加；`ClusterPBR.shader` 四个 pass 注入 `DOTS_INSTANCING_ON`（`#pragma target 4.5`）；`ClusterInput.hlsl` 改双路径（`UNITY_DOTS_INSTANCED_PROP_WITH_DEFAULT` 回退材质值）；`INPUT_PROP(type,name)` 宏 12 处调用补类型。
-- **Step 1（已实现，待 Unity 验证）**：新增 `Runtime/ClusterRender/BatchRenderManager.cs`，在 `ClusterAssembleAsset` 加 `useBRG` 开关（默认 **false**，零回归）。
-  - 集成方式为**「附加式」**：`useBRG` 开启时，`ClusterObject` 仍走原 `DrawRenderers` 路径，并额外把自身（按 submesh）注册进 BRG；`DefferPipeline.DrawGBuffer` 在 GBuffer MRT 仍绑定时多 `Submit` 一次让 BRG 再画一遍 GBuffer。
-  - 这样即便 BRG 的提交时机/裁剪有误，原路径仍作画面兜底，便于对比排查。
-  - **批次合并（已实现）**：`BatchRenderManager` 以 `(mesh, 材质, submesh)` 为 key 合并——同 key 的物体收进同一条「多实例」batch（每个实例一份 `unity_ObjectToWorld`/`unity_WorldToObject`，按 2 的次幂容量增长重建）；`OnPerformCulling` 对每条 batch 只发 **1 个 draw command**（逐实例做 box-vs-frustum，可见下标进 `visibleInstances`）。`ClusterObject` 侧用 `GetOrCreateBRGMaterial` 按**源材质缓存复用**同一个 BRG 材质实例，这是合并生效的前提（否则每个物体一份克隆材质 → 又退化成「一物体一批」）。
-    - ⚠️ 合并粒度天然受 mesh/材质限制：不同 mesh 或不同材质的物体**不会**合并（一次 draw 只能一个 mesh，材质属性是 per-batch 非 per-instance），故「全场景一个批」不可能，只能「同 mesh+同材质」合并。
-    - 变换矩阵经 `unity_ObjectToWorld` / `unity_WorldToObject` metadata 传入（首部 64 字节零矩阵 + 32 字节对齐留白，o2w 基址 96、w2o 基址 96+48*capacity，与官方 SimpleBRGExample 一致）。
-    - `_MapId` 等其余材质属性走 `UnityPerMaterial` cbuffer 全局值（BRG 未注册它们的 per-instance metadata，高位置 0 → 回退材质值）；裁剪回调已做真实视锥剔除以避免多实例下整批漏裁。
-  - **验证步骤**：编辑器里把 `assemble.asset` 的 `useBRG` 勾上 → 进 Play。预期：画面与关闭时无差异（叠加绘制）；若 BRG 路径异常（黑块/错位），关掉 `useBRG` 即恢复，并把现象反馈。
-- **Step 2+（待定）**：改为「替换式」+ 真·多实例合并（per-instance `_MapId` 的 metadata 布局）、视锥裁剪、动画物体支持。
+### 渲染路径（已定案：SRP + Cluster）
+- 几何**统一由 MeshRenderer 走 SRP**（`context.DrawRenderers(cullingResults)`，逐物体剔除 + SRP Batcher）。
+- 原 BRG（BatchRendererGroup）路径已**整体移除**：`BatchRenderManager`、`Unlit/ClusterPBR_BRG`、`CullDiagnostics`
+  及相关开关（`useBRG`、`brgGBufferExcludeLayer`、`BRGShadowExcludeLayer`、`BRGCullLayer`）全部删除。
+- `GPUDravinSystem` 已简化为「场景光照全局量上传」（`_MySkybox` 天空盒反射、`_Sh9` 间接漫反射），
+  不再承担绘制调度（原 DrawNode 链表与各阶段 Draw 方法已删）。
 
 ### 已知限制 / 待办
 - 已支持 Tile 粒度虚拟贴图（`useTileVT`），单页 = 一张贴图的一个 tile；页池容量（`CellCount`）不随 T 放大，
@@ -95,8 +90,8 @@
 ### 1. 三条路径的分工
 | 模式 | 走什么 | 说明 |
 |------|--------|------|
-| SRP(0) | `GPUDravinSystem.DrawShadows` + `context.DrawShadows` | Unity 原生 ShadowCaster，逐物体剔除 + SRP Batcher；BRG/RVT 阴影也在此档。 |
-| Cluster(1) | 只跑 `cluster.Draw` | GPU 逐簇剔除 + 每级联一次 `DrawProceduralIndirect`；彻底不跑 `GPUDravinSystem` / `context.DrawShadows`（用户选纯 Cluster 时即丢弃 BRG/RVT 阴影）。 |
+| SRP(0) | `context.DrawShadows` | Unity 原生 ShadowCaster，逐物体剔除 + SRP Batcher。 |
+| Cluster(1) | 只跑 `cluster.Draw` | GPU 逐簇剔除 + 每级联一次 `DrawProceduralIndirect`；不跑 `context.DrawShadows`（alpha 镂空的 cutout 物体除外，见下）。 |
 | ClusterDebug(2) | 同 Cluster | 与 Cluster 完全相同的绘制路径（早期版本的 CPU 侧 `VerifyCulling` 已在 debug 清理中移除，当前不做额外 CPU 验证）。 |
 
 ### 2. 整体流程（Cluster / ClusterDebug）
