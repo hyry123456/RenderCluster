@@ -1,6 +1,11 @@
 #ifndef CLUSTER_DOTS_MATERIAL
 #define CLUSTER_DOTS_MATERIAL
 
+// 簇实例化绘制（Cluster 画 GBuffer / Feedback）时，材质参数来自每簇 StructuredBuffer，
+// 不存在 UnityPerMaterial —— 由 ClusterGBufferInput.hlsl 预先定义 CLUSTER_INSTANCED_MATERIAL
+// 并接管 INPUT_PROP，所以下面整段（UnityPerMaterial + INPUT_PROP）都要跳过。
+#if !(defined(CLUSTER_INSTANCED_MATERIAL) && CLUSTER_INSTANCED_MATERIAL)
+
 // ============================================================================
 // DOTS(BRG) 变体共用的材质声明脚手架。
 //
@@ -50,6 +55,7 @@ CBUFFER_START(UnityPerMaterial)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseMask)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseNormal)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseEmission)
+	UNITY_DEFINE_INSTANCED_PROP(float4, _EmissionColor)
 CBUFFER_END
 
 // ── DOTS 实例元数据：保持 DOTS cbuffer 存活（本 BRG 只注册矩阵 metadata，
@@ -69,6 +75,7 @@ UNITY_DOTS_INSTANCING_START(MaterialPropertyMetadata)
 	UNITY_DOTS_INSTANCED_PROP(float, _UseMask)
 	UNITY_DOTS_INSTANCED_PROP(float, _UseNormal)
 	UNITY_DOTS_INSTANCED_PROP(float, _UseEmission)
+	UNITY_DOTS_INSTANCED_PROP(float4, _EmissionColor)
 UNITY_DOTS_INSTANCING_END(MaterialPropertyMetadata)
 
 #define INPUT_PROP(type, name) UNITY_ACCESS_DOTS_INSTANCED_PROP_WITH_DEFAULT(type, name)
@@ -95,9 +102,12 @@ UNITY_INSTANCING_BUFFER_START(UnityPerMaterial)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseMask)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseNormal)
 	UNITY_DEFINE_INSTANCED_PROP(float, _UseEmission)
+	UNITY_DEFINE_INSTANCED_PROP(float4, _EmissionColor)
 UNITY_INSTANCING_BUFFER_END(UnityPerMaterial)
 
 #define INPUT_PROP(type, name) UNITY_ACCESS_INSTANCED_PROP(UnityPerMaterial, name)
 #endif
+
+#endif // !CLUSTER_INSTANCED_MATERIAL
 
 #endif // CLUSTER_DOTS_MATERIAL

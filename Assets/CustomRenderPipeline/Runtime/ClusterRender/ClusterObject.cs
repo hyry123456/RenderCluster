@@ -17,25 +17,41 @@ namespace Cluster
         private uint m_originalRLM = 0;
         private bool m_rlmStored = false;
 
+        // ===== 「静态才进 Cluster」的守卫 =====
+        // 簇数据是世界空间烘焙的、世界矩阵只在注册时抓一次。物体一旦真的动起来
+        //（水车/门/机关），继续留在 Cluster 里会一直画在旧位置，所以这里每帧比一次 Transform：
+        // 变了就退出 Cluster、还原掩码，把绘制交回 SRP（动态物体走 SRP 本来就够快）。
+        private Vector3 m_regPos;
+        private Quaternion m_regRot;
+        private bool m_registered;
+
         // ===== RVT 图集绑定（材质属性 + anisoLevel）=====
         // 图集在 ClusterCore.Initialize 里创建，时机晚于本组件的 OnEnable，所以用静态字段暂存，
         // 在两处应用：① ClusterCore 创建图集后调 ApplyAtlasTextures 回填【已经克隆/已使用】的材质；
         // ② 之后新建的克隆材质在 GetOrCreateClusterPBRMaterial 里立即绑定。
         // 为什么要绑成材质属性：Unity 只有在采样器对应「材质属性纹理」时才沿用该纹理自己的
         // anisoLevel。用纯全局纹理 + sampler_linear_repeat，aniso 恒为 1，掠射角会明显糊。
-        private static Texture s_atlasAlbedo, s_atlasNormal, s_atlasMask, s_atlasEmission, s_atlasDetail;
+        private static Texture s_atlasAlbedo, s_atlasNormal, s_atlasMask;
 
         /// <summary>ClusterObject 用到的所有源材质（AssetMat），供 ApplyAtlasTextures 回填</summary>
         private static readonly System.Collections.Generic.HashSet<Material> s_sourceMaterials
             = new System.Collections.Generic.HashSet<Material>();
 
-        public static void ApplyAtlasTextures(Texture albedo, Texture normal, Texture mask,
-            Texture emission, Texture detail)
+        public static void ApplyAtlasTextures(Texture albedo, Texture normal, Texture mask)
         {
             s_atlasAlbedo = albedo; s_atlasNormal = normal; s_atlasMask = mask;
-            s_atlasEmission = emission; s_atlasDetail = detail;
 
             foreach (var src in s_sourceMaterials) BindAtlas(src);
+            // Cluster 画 GBuffer 的材质也要绑（它同样靠「材质属性纹理」才拿到图集的 anisoLevel）
+            if (ClusterGBufferRenderer.HasInstance)
+                ClusterGBufferRenderer.Instance.BindAtlas(albedo, normal, mask);
+        }
+
+        /// <summary>供 ClusterGBufferRenderer 在「图集先建好、物体后注册」时回填。</summary>
+        public static bool TryGetAtlas(out Texture albedo, out Texture normal, out Texture mask)
+        {
+            albedo = s_atlasAlbedo; normal = s_atlasNormal; mask = s_atlasMask;
+            return albedo != null && normal != null && mask != null;
         }
 
         private static void BindAtlas(Material mat)
@@ -44,8 +60,6 @@ namespace Cluster
             if (s_atlasAlbedo   != null) mat.SetTexture("_VirtualAlbedo",   s_atlasAlbedo);
             if (s_atlasNormal   != null) mat.SetTexture("_VirtualNormal",   s_atlasNormal);
             if (s_atlasMask     != null) mat.SetTexture("_VirtualMask",     s_atlasMask);
-            if (s_atlasEmission != null) mat.SetTexture("_VirtualEmission", s_atlasEmission);
-            if (s_atlasDetail   != null) mat.SetTexture("_VirtualDetail",   s_atlasDetail);
         }
 
 
@@ -150,23 +164,20 @@ namespace Cluster
 
         private void OnEnable()
         {
-            // 「需 alpha 镂空」的物体（草/蕨/灌木）：标记 rendering layer 位，
-            // 让 Cluster 阴影路径（纯几何、无贴图）跳过它们、改走 SRP 阴影（支持 _CLIPPING）。
-            // 只在 Play 时动 renderingLayerMask，避免脏化场景资产。
-            if (Application.isPlaying && UsesCutoff())
-            {
-                var rlmMr = GetComponent<MeshRenderer>();
-                if (rlmMr != null)
-                {
-                    if (!m_rlmStored) { m_originalRLM = rlmMr.renderingLayerMask; m_rlmStored = true; }
-                    rlmMr.renderingLayerMask = m_originalRLM | (1u << ClusterProverty.CutoffRenderingLayerBit);
-                }
-            }
+            bool cutoff = UsesCutoff();
+            var cfg = Application.isPlaying ? ClusterControl.Instance.ClusterAssembleAsset : null;
 
-            //material = meshRender.sharedMaterial;
-            //material = new Material(Shader.Find("Unlit/ClusterPBR"));
-            //meshRender.sharedMaterial = material;
-            if (Application.isPlaying && ClusterControl.Instance.ClusterAssembleAsset.UseRVT)
+            // rendering layer 位（Renderer.renderingLayerMask，不是 GameObject layer）：
+            //   位 29 = 「需 alpha 镂空的投射物」⇒ Cluster 阴影跳过、改走 SRP 阴影（这里打）；
+            //   位 28 = 「由 Cluster 画 GBuffer」⇒ 注册【成功之后】才打（见下面），
+            //           否则注册失败（无 mesh / 无材质）的物体会被 SRP 剔掉却没人画它 ⇒ 整块消失。
+            // 只在 Play 时动 renderingLayerMask，避免脏化场景资产。
+            if (Application.isPlaying && cutoff)
+                SetRenderingLayerBit(1u << ClusterProverty.CutoffRenderingLayerBit, keepOriginal: true);
+
+            // cutout 物体（草/蕨/灌木）【不进 RVT】：它们本来就不参与 Cluster 绘制，又需要 _CLIPPING 镂空。
+            // 改走 DefferStandard 直采 -> alpha 更锐、不占图集 slot，也让图集腾出 alpha 通道给 emission。
+            if (Application.isPlaying && cfg.UseRVT && !cutoff)
             {
                 var meshRender = GetComponent<MeshRenderer>();
                 // 先抓取场景里【原本挂着的材质】，必须在下面 meshRender.materials 覆盖之前。
@@ -197,18 +208,29 @@ namespace Cluster
                         s_sourceMaterials.Add(materials[i]);
                     }
                 }
-                // 纯 SRP 路径：MeshRenderer 直接用克隆材质（Unlit/ClusterPBR）画 GBuffer、投阴影。
+                // MeshRenderer 仍然保留并换上克隆材质：SRP 阴影那条路还要靠它投阴影。
+                // clusterMode 非 SRP 时，几何改由 Cluster 画进 GBuffer，GBuffer pass 按 layer 位排除这些物体。
                 if (meshRender != null) meshRender.materials = materials;
 
-                // 几何由 MeshRenderer 走 SRP（DrawRenderers）绘制；
-                // 纹理精度走 RVT / Tile-VT（按 tile 分页 + 逐页 mip），两者正交、各管一件事。
-            //{
-            //    currentIndex = instance.AllocateTextureId(
-            //        new TextureMapNode(albedo, normal, mask, emission, detail));
-            //    material.SetInt("_MapId", currentIndex);
-            //}
-        }
-        else if (Application.isPlaying)
+                var meshFilter = GetComponent<MeshFilter>();
+                // GBuffer 是否交给 Cluster 由 clusterGBuffer 独立控制（默认 false = GBuffer 仍走 SRP）。
+                // 不开时【不要注册、也不要动 renderingLayerMask】，否则物体被贴上 bit28 后
+                // SRP 的 DrawRenderers 就再也画不到它们了。
+                if (cfg.clusterMode != ClusterMode.SRP && cfg.clusterGBuffer && meshRender != null
+                    && meshFilter != null && meshFilter.sharedMesh != null
+                    && ClusterGBufferRenderer.Instance.Register(this, meshFilter.sharedMesh,
+                        transform.localToWorldMatrix, materials, indexs))
+                {
+                    m_regPos = transform.position;
+                    m_regRot = transform.rotation;
+                    m_registered = true;
+                    // ⚠️ rendering layer mask 是【包含式】的：过滤判定 (renderer.rlm & filter) != 0。
+                    // 只把 bit28 从 filter 里清掉【排不掉】这些物体（它们还有 bit0 能通过），
+                    // 所以这里必须让它们【只】保留 bit28 —— 这样才能从 SRP 的所有 pass 一起消失。
+                    SetRenderingLayerBit(1u << ClusterProverty.ClusterRenderingLayerBit, keepOriginal: false);
+                }
+            }
+            else if (Application.isPlaying)
         {
             // 不用 RVT：切到工程自己的 DefferStandard（带 OutGBuffer tag，直采贴图），
             // 即「Scene 视图模式」在延迟管线里的等价物。RVT 相关代码全部保留，随时可再开对比。
@@ -282,7 +304,11 @@ namespace Cluster
                 if (ra.pbrData != null) m.EnableKeyword("_MASK_MAP");
                 // Alpha Cutout 用源材质的 _CLIPPING keyword 真值判定，不能用 cullOff 阈值
                 // （阈值每个材质默认 0.5，"有阈值≠该裁"，否则会误把不透明材质当 cutout 裁掉）。
-                if (ra.clipping) m.EnableKeyword("_CLIPPING");
+                // 优先取【场景原材质】的 keyword：旧资产的 renderAssets[i].clipping 可能没同步成 true，
+                // 只信字段会把草/蕨这类 cutout 材质画成实心卡片。
+                bool srcClip = (i < original.Length && original[i] != null)
+                    ? original[i].IsKeywordEnabled("_CLIPPING") : ra.clipping;
+                if (srcClip) m.EnableKeyword("_CLIPPING");
                 // detail 默认不开：RVT 路径下 detail 基本没生效（多数资产 detail=null），
                 // 这里同样保持关闭，避免引入新变量。需要时再开 _DETAIL_MAP 并填 _DetailMap 等。
 
@@ -294,9 +320,46 @@ namespace Cluster
         }
 
 
+        /// <summary>改 Renderer.renderingLayerMask。
+        /// keepOriginal = true  → 原掩码 | bit（cutout：还要留在 SRP 阴影里）；
+        /// keepOriginal = false → 只保留 bit（Cluster 接管：必须丢掉 bit0 才能真正排掉）。</summary>
+        private void SetRenderingLayerBit(uint bit, bool keepOriginal)
+        {
+            var mr = GetComponent<MeshRenderer>();
+            if (mr == null) return;
+            if (!m_rlmStored) { m_originalRLM = mr.renderingLayerMask; m_rlmStored = true; }
+            mr.renderingLayerMask = keepOriginal ? (m_originalRLM | bit) : bit;
+        }
+
+        /// <summary>物体动起来了 ⇒ 退出 Cluster 绘制、掩码还原，交回 SRP（只掉一次）。</summary>
+        private void DropToSRP()
+        {
+            m_registered = false;
+            if (ClusterGBufferRenderer.HasInstance)
+                ClusterGBufferRenderer.Instance.Unregister(this);
+            if (m_rlmStored)
+            {
+                var mr = GetComponent<MeshRenderer>();
+                if (mr != null) mr.renderingLayerMask = m_originalRLM;
+                m_rlmStored = false;
+            }
+        }
+
+        private void Update()
+        {
+            if (!m_registered) return;
+            if ((transform.position - m_regPos).sqrMagnitude > 1e-6f
+                || Quaternion.Angle(transform.rotation, m_regRot) > 0.05f)
+                DropToSRP();
+        }
+
         private void OnDisable()
         {
-            // 还原 rendering layer 位（cutoff 物体专用），避免脏化场景资产
+            m_registered = false;
+            if (ClusterGBufferRenderer.HasInstance)
+                ClusterGBufferRenderer.Instance.Unregister(this);
+
+            // 还原 rendering layer 位（cutoff / Cluster GBuffer 专用），避免脏化场景资产
             if (m_rlmStored)
             {
                 var rlmMr = GetComponent<MeshRenderer>();

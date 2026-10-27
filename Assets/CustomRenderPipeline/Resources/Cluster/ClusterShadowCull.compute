@@ -6,15 +6,23 @@
 //   BuildArgs（每级联一线程，写 indirect args）
 // ⇒ 整帧 3 个 dispatch + 每级联 1 次间接绘制。级联被压进 shader 内循环，而非每级联一次 dispatch。
 //
-// 数据链路：compute 只产出可见簇 ID 列表 _Visible（UAV 可写、无需跨缓冲拷贝）；
-// 绘制时由 shader 在 VS 里查 _Visible + _Indices + _Positions 还原几何；
-// 索引缓冲退化为一次创建、永不再写的静态单位缓冲。
+// 数据链路：CullAll 产出每级联的可见槽位表 _SlotOf（不可见 = 0xFFFFFFFF），
+// BuildIndices 再把【可见】簇的全局顶点号铺进索引缓冲 _DrawIdx；
+// 绘制时 shader 的 VS 直接 _Positions[SV_VertexID] —— 一次顺序读取，无任何查表。
+//
+// 为什么要建真索引（2026-10-28 定案，与 GBuffer 同一套）：
+//   静态单位索引缓冲 [0,1,2,...] 每个索引只用一次 ⇒ GPU 顶点缓存零复用，
+//   一个 128 三角形的簇唯一顶点只有约 66 个，却要跑 384 次 VS（约 5.8 倍）。
+//   ⚠️ 只对【可见】簇建索引：写量 = 可见簇数 × 384 × 级联数。按全部簇建会到上百 MB
+//      （上一版就是写 188MB、compute 反烧 1.6ms 而失败）。
+//   ⚠️ dispatch 规模必须跟实际量走：一维展开 + _SlotOf 早退，别按上界开方阵。
 //
 // 剔除口径：每级联 worldToClip = GL.GetGPUProjectionMatrix(proj,true)*view（与绘制侧逐位一致），
 // 用其 6 个世界空间视锥平面与簇包围球做球-平面测试，不漏不重。
 // 坑：裸 proj*view 在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除；cullingSphere 球-球测试是级联内含球 ⇒ 漏四角。
 #pragma kernel Reset
 #pragma kernel CullAll
+#pragma kernel BuildIndices
 #pragma kernel BuildArgs
 
 StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=半径
@@ -22,18 +30,28 @@ StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=
 // 每级联 6 个世界空间视锥平面（来自 GeometryUtility.CalculateFrustumPlanes(worldToClip)）。
 // worldToClip 与绘制侧 GL.GetGPUProjectionMatrix(proj,true)*view 逐位一致。
 StructuredBuffer<float4> _Planes;   // 长度 = maxCascade * 6
-// 每级联一个参数：(projScale, targetTexels, 未用, _MaxLod)
+// 每级联一个参数：(projScale, targetTexels(LOD), minTexels(小簇剔除), 未用)
 StructuredBuffer<float4> _CascadeParams;
+// [簇 × 384] = 该角点对应的全局顶点号（重建期烘死，静态）
+StructuredBuffer<int>    _CornerGvid;
 
 RWStructuredBuffer<uint> _Visible;                // [cascade * _ClusterCount + slot] = 簇下标（可见簇的紧凑列表）
+// [cascade * _ClusterCount + 簇] = 该簇在本级联的可见槽位；不可见写 0xFFFFFFFF。
+// BuildIndices 靠它早退，索引缓冲才只需要覆盖「场景总簇数」而不是「组数 × 上界」。
+RWStructuredBuffer<uint> _SlotOf;
 RWStructuredBuffer<uint> _Counter;                // [cascade] = 该级联可见簇数
 RWStructuredBuffer<uint> _Args;                   // [cascade * 5 + 0..4] = 索引间接绘制 args
+
+// 索引缓冲本体：GraphicsBuffer 用 Target.Index | Target.Raw 创建，
+// 既能当 index buffer 读、又能当 UAV 写 ⇒ compute 直接写、draw 直接用，单缓冲零拷贝。
+RWByteAddressBuffer      _DrawIdx;
 
 int _CascadeCount;
 int _ClusterCount;
 int _MaxLod;                                     // 当前可用 LOD 级数（只有 LOD0 ⇒ 1）
 int _TrisPerCluster;
 int _DebugForceAll;                              // 非 0 = 跳过所有剔除，全可见（排查用）
+int _IdxDimX;                                    // BuildIndices 的 x 维线程数（= 组数 × 64）
 
 // 纯清零：dispatch 1 组即可
 [numthreads(64, 1, 1)]
@@ -56,6 +74,8 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 
     for (int k = 0; k < _CascadeCount; k++)
     {
+        _SlotOf[k * _ClusterCount + c] = 0xFFFFFFFFu;   // 先当不可见，顺手清掉上帧残留
+
         float4 cp = _CascadeParams[k];
         bool ok = true;
 
@@ -72,10 +92,16 @@ void CullAll(uint3 id : SV_DispatchThreadID)
             }
             if (outside) ok = false;
 
+            // 簇投影到阴影图上的半径（texel）。cp.x = tileSize*0.5*|proj11|。
+            float texelRadius = radius * cp.x;
+
+            // 小簇剔除：投影半径不到 cp.z 个 texel 的簇，它投出来的阴影只有一两个像素、
+            // 经 PCF 模糊后基本不可见，但每簇 384 顶点的开销是实打实的（0 = 关闭）。
+            if (ok && cp.z > 0.0 && texelRadius < cp.z) ok = false;
+
             // LOD 选择（仅当 targetTexels > 0 且有多级 LOD 时才有意义）
             if (ok && cp.y > 0.0 && _MaxLod > 1)
             {
-                float texelRadius = radius * cp.x;
                 float target = cp.y;
                 if (texelRadius > target)              ok = (lod == 0);
                 else if (texelRadius * 2.0 <= target)  ok = (lod == _MaxLod - 1);
@@ -88,7 +114,36 @@ void CullAll(uint3 id : SV_DispatchThreadID)
         uint slot;
         InterlockedAdd(_Counter[k], 1u, slot);
         if ((int)slot < _ClusterCount)
+        {
             _Visible[k * _ClusterCount + (int)slot] = c;
+            _SlotOf[k * _ClusterCount + c] = slot;
+        }
+    }
+}
+
+// 每线程一个 (簇, 角点)，线程内循环所有级联 ——
+// _CornerGvid[idx] 对 4 个级联是同一个值，读一次就够，比「每级联开一份 dispatch」省 4 倍读取。
+// dispatch = ceil(总簇数 × 384 / 64)，与级联数无关。
+// ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 二维拆开，用 _IdxDimX 把 (x,y) 拼回一维。
+[numthreads(64, 1, 1)]
+void BuildIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.y * (uint)_IdxDimX + id.x;
+    uint perCluster = (uint)(_TrisPerCluster * 3);
+    if ((int)idx >= _ClusterCount * (int)perCluster) return;
+
+    uint c      = idx / perCluster;
+    uint corner = idx - c * perCluster;
+    uint gvid   = (uint)_CornerGvid[idx];
+
+    for (int k = 0; k < _CascadeCount; k++)
+    {
+        uint slot = _SlotOf[k * _ClusterCount + c];
+        if (slot == 0xFFFFFFFFu) continue;
+
+        // 每级联在 _DrawIdx 里分一段（起点 = 级联 × 簇数 × 384），startIndex 是纯常量
+        uint dst = ((uint)k * (uint)_ClusterCount * perCluster + slot * perCluster + corner) * 4u;
+        _DrawIdx.Store(dst, gvid);
     }
 }
 
@@ -96,8 +151,7 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 //   [0]=indexCount(本级联可见簇 × 每簇 384 索引)
 //   [1]=instanceCount（固定 1：单实例，索引缓冲已内含全部可见簇）
 //   [2]=startIndexLocation  [3]=baseVertexLocation  [4]=startInstanceLocation
-// 注意：索引缓冲是单位缓冲（[0,1,2,...,N]），SV_VertexID = 0..N；shader 用 vid/384 取
-// _Visible 槽位、vid%384 取簇内角点，自行查 _Indices 得全局顶点号。故 indexCount 仍是可见簇数×384。
+// 索引缓冲由 BuildIndices 按【可见】簇铺好，值就是全局顶点号 ⇒ VS 直接 _Positions[SV_VertexID]。
 [numthreads(8, 1, 1)]
 void BuildArgs(uint3 id : SV_DispatchThreadID)
 {
@@ -107,7 +161,7 @@ void BuildArgs(uint3 id : SV_DispatchThreadID)
     uint perCluster = (uint)_TrisPerCluster * 3u;
     _Args[k * 5 + 0] = (uint)_Counter[k] * perCluster;          // indexCount
     _Args[k * 5 + 1] = 1;                                     // instanceCount
-    _Args[k * 5 + 2] = 0;                                     // startIndexLocation
+    _Args[k * 5 + 2] = k * (uint)_ClusterCount * perCluster;   // startIndexLocation = 本级联在 _DrawIdx 的起点
     _Args[k * 5 + 3] = 0;                                     // baseVertexLocation
     _Args[k * 5 + 4] = 0;                                     // startInstanceLocation
 }

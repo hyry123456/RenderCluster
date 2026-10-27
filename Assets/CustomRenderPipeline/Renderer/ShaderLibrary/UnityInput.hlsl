@@ -1,4 +1,4 @@
-﻿#ifndef CUSTOM_UNITY_INPUT_INCLUDED
+#ifndef CUSTOM_UNITY_INPUT_INCLUDED
 #define CUSTOM_UNITY_INPUT_INCLUDED
 
 CBUFFER_START(UnityPerDraw)
@@ -88,9 +88,11 @@ float4 _LevelData[7];		//x:Begin,y:tileSizeX,z:tileSizeY,
 float4 _LevelPadding[7];	//x:tilePaddingX, y:tilePaddingY
 TEXTURE2D(_VirtualAlbedo);
 TEXTURE2D(_VirtualNormal);
-TEXTURE2D(_VirtualMask);		//r:metallic Mask, g:ao, b:detail Mask, a:roughness
-TEXTURE2D(_VirtualEmission);
-TEXTURE2D(_VirtualDetail);		//R:Detail map albedo，G:Detail normal y, B: Detail smoothness, A:Detail Normal Map x
+// 【3 张图集】布局见 TileTable.cs：
+//   _VirtualAlbedo : rgb=albedo, a=emission.r
+//   _VirtualNormal : rg=normal.xy(0..1), b=detailMask, a=roughness
+//   _VirtualMask   : r=metallic, g=AO, b=emission.g, a=emission.b
+TEXTURE2D(_VirtualMask);
 
 //【各向异性过滤的关键】必须为每张图集声明【自己的】采样器 sampler_Virtual*，而不是用
 //全局的 sampler_linear_repeat。原因：Unity 只有在「采样器对应的是一个材质属性纹理」时，
@@ -101,8 +103,6 @@ TEXTURE2D(_VirtualDetail);		//R:Detail map albedo，G:Detail normal y, B: Detail
 SAMPLER(sampler_VirtualAlbedo);
 SAMPLER(sampler_VirtualNormal);
 SAMPLER(sampler_VirtualMask);
-SAMPLER(sampler_VirtualEmission);
-SAMPLER(sampler_VirtualDetail);
 
 //------------------------我的管线传入的数据------------------------
 

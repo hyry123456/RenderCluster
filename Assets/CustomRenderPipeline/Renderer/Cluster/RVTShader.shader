@@ -88,7 +88,6 @@ Shader "Unlit/RVTShader"
                 TEXTURE2D(_RVTNormalSrc);
                 TEXTURE2D(_RVTPBRDataSrc);
                 TEXTURE2D(_RVTEmissionSrc);
-                TEXTURE2D(_RVTDetailSrc);
 
                 float _PaddingSize;
                 // Tile 粒度虚拟贴图：把源贴图的采样范围从“整张”缩小到“某个 tile 的子矩形”。
@@ -121,12 +120,11 @@ Shader "Unlit/RVTShader"
                     return o;
                 }
 
+                // 3 个渲染目标，通道打包见 TileTable.cs 的布局说明。
                 struct RVTTarget{
-                    float4 _VisualAlbedo   : SV_Target0;
-                    float4 _VisualNormal   : SV_Target1;
-                    float4 _VisualPBRData  : SV_Target2;
-                    float4 _VisualEmission : SV_Target3;
-                    float4 _VirtualDetail : SV_Target4;	
+                    float4 _VisualAlbedo : SV_Target0;   // rgb=albedo, a=emission.r
+                    float4 _VisualNormal : SV_Target1;   // rg=normal.xy, b=detailMask, a=roughness
+                    float4 _VisualMask   : SV_Target2;   // r=metallic, g=AO, b=emission.g, a=emission.b
                 };
 
                 void frag(v2f_drawTex i, out RVTTarget o)
@@ -143,14 +141,19 @@ Shader "Unlit/RVTShader"
                     float2 cellUV = (i.uv - float2(_PaddingSize, _PaddingSize)) / (1.0 - 2.0 * _PaddingSize);
                     i.uv = _TileOrigin.xy + cellUV * _TileScale.xy;
 
-                    o._VisualAlbedo   = SAMPLE_TEXTURE2D(_RVTAlbedoSrc, sampler_linear_clamp, i.uv);
-                    //o._VisualAlbedo   = float4(i.uv.xy, 0, 1);
-                    // 法线：原样拷贝法线贴图（RG/A 通道编码）。读取侧用 DecodeNormal 解码。
-                    // 切勿改成八面体：本图集存的是"贴图像素"，不是"解好的方向"；成对改错一侧会让法线翻向背面。
-                    o._VisualNormal   = SAMPLE_TEXTURE2D(_RVTNormalSrc, sampler_linear_clamp, i.uv);
-                    o._VisualPBRData  = SAMPLE_TEXTURE2D(_RVTPBRDataSrc, sampler_linear_clamp, i.uv);
-                    o._VisualEmission = SAMPLE_TEXTURE2D(_RVTEmissionSrc, sampler_linear_clamp, i.uv);
-                    o._VirtualDetail  = SAMPLE_TEXTURE2D(_RVTDetailSrc, sampler_linear_clamp, i.uv);
+                    float4 albedoSrc = SAMPLE_TEXTURE2D(_RVTAlbedoSrc, sampler_linear_clamp, i.uv);
+                    float4 normalSrc = SAMPLE_TEXTURE2D(_RVTNormalSrc, sampler_linear_clamp, i.uv);
+                    float4 maskSrc   = SAMPLE_TEXTURE2D(_RVTPBRDataSrc, sampler_linear_clamp, i.uv);
+                    float4 emiSrc    = SAMPLE_TEXTURE2D(_RVTEmissionSrc, sampler_linear_clamp, i.uv);
+
+                    // 源法线可能是 RG 或 AG(DXT5nm) 编码 -> 先解成方向，再按 xy*0.5+0.5 存两通道。
+                    // 读取侧只做 RG 解码 + z 重建；绝不能再对图集样本调 UnpackNormalmapRGorAG（会二次解码）。
+                    float3 n = DecodeNormal(normalSrc, 1.0);
+                    float2 nxy = n.xy * 0.5 + 0.5;
+
+                    o._VisualAlbedo = float4(albedoSrc.rgb, emiSrc.r);
+                    o._VisualNormal = float4(nxy, maskSrc.b, maskSrc.a);
+                    o._VisualMask   = float4(maskSrc.r, maskSrc.g, emiSrc.g, emiSrc.b);
                 }
 
             ENDHLSL

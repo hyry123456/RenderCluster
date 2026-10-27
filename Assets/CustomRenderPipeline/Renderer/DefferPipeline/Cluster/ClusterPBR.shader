@@ -14,6 +14,8 @@ Shader "Unlit/ClusterPBR"
 		_DetailMap("Details", 2D) = "linearGrey" {}
         _DetailNormalMap("Detail Normals", 2D) = "bump" {}
         _Color("Main Color", Color) = (1, 1, 1, 1)
+        // emission 的 HDR 颜色。DefferStandard 是 map.rgb * color.rgb，这里保持一致。
+        [HDR] _EmissionColor("Emission Color", Color) = (0, 0, 0, 1)
         _DetailAlbedo("Detail Albedo", Range(0, 1)) = 0
         _DetailNormal("Detail Normal", Range(0, 1)) = 0
         _DetailRoughness("Detail Roughness", Range(0, 1)) = 0
@@ -30,8 +32,6 @@ Shader "Unlit/ClusterPBR"
         [HideInInspector] _VirtualAlbedo("RVT Albedo", 2D) = "white" {}
         [HideInInspector] _VirtualNormal("RVT Normal", 2D) = "white" {}
         [HideInInspector] _VirtualMask("RVT Mask", 2D) = "white" {}
-        [HideInInspector] _VirtualEmission("RVT Emission", 2D) = "white" {}
-        [HideInInspector] _VirtualDetail("RVT Detail", 2D) = "white" {}
     }
     SubShader
     {

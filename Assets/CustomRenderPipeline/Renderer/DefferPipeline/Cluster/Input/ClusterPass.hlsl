@@ -20,6 +20,11 @@ struct Varyings {
 	float2 detailUV : VAR_DETAIL_UV;
 	GI_VARYINGS_DATA
 	UNITY_VERTEX_INPUT_INSTANCE_ID
+	// 簇实例化路径专用：当前片元该用哪个【材质槽位】（每簇常量缓冲的下标）。
+	// SRP 路径不读它，编译期整段消失。
+	#if defined(CLUSTER_INSTANCED)
+		nointerpolation uint matIdx : VAR_MAT_IDX;
+	#endif
 };
 
 Varyings LitPassVertex (Attributes input) {
@@ -43,7 +48,9 @@ Varyings LitPassVertex (Attributes input) {
 	return output;
 }
 
-void LitPassFragment (Varyings input,
+// 片元主体。抽成独立函数是为了让「MeshRenderer 走 SRP」和「簇实例化绘制」两条路
+// 共用同一份着色代码（INPUT_PROP 在簇路径里被重定向到每簇常量缓冲，见 ClusterGBufferInput.hlsl）。
+void ClusterGBufferShade (Varyings input,
         out DefferTarget target
     ) 
 	{
@@ -157,7 +164,9 @@ void LitPassFragment (Varyings input,
 	//   延迟最终合成阶段（DefferCameraPass.hlsl:138）会用 _Sh9 统一算一次间接漫反射并叠加
 	//   （DefferStandard / BRG 路径都是这么做的）。这里再烘一遍就是【双重叠加】⇒ 画面偏亮。
 	//   （B 档「太亮」就是这个原因。）
-	float3 emissive = colors.emission.xyz;
+	// 乘 _EmissionColor（HDR）。DefferStandard 的 GetEmission 就是 map.rgb * color.rgb；
+	// 之前漏了这一步，火把这类自发光物体会直接用贴图原值（偏暗 / 强度不对）。
+	float3 emissive = colors.emission.xyz * INPUT_PROP(float4, _EmissionColor).rgb;
 
 	float3 normalRT = float3(normalPack, 1);
 
@@ -173,6 +182,12 @@ void LitPassFragment (Varyings input,
 	target._GBufferRT1 = float4(normalRT, 1);
 	target._GBufferRT2 = float4(emissive, roughness);
 	target._GBufferRT3 = float4(refl, ambientOcclusion);     //暂时没有反射
+}
+
+// MeshRenderer（SRP）路径的片元入口：材质参数走 UnityPerMaterial。
+void LitPassFragment (Varyings input, out DefferTarget target)
+{
+	ClusterGBufferShade(input, target);
 }
 
 

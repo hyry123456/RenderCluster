@@ -95,7 +95,7 @@ namespace CustomRenderPipline
 		Vector4 atlasSizes;
 
 		/// <summary>本帧的阴影路径（资产开关缓存）：SRP / Cluster / ClusterDebug。</summary>
-		ClusterShadowMode m_shadowMode = ClusterShadowMode.SRP;
+		ClusterMode m_mode = ClusterMode.SRP;
 
 		/// <summary>初始化本帧阴影渲染所需的上下文（渲染上下文 / 剔除结果 / 阴影设置）。</summary>
 		public void Setup(
@@ -215,15 +215,15 @@ namespace CustomRenderPipline
 
 		public void Render()
 		{
-			// 本帧阴影路径（资产开关）：SRP / Cluster / ClusterDebug。
-			// ClusterDebug 走与 Cluster 完全相同的 GPU 路径，只是每级联追加 CPU/GPU 对账日志。
-			m_shadowMode = ClusterControl.Instance != null
-				? ClusterControl.Instance.ClusterAssembleAsset.clusterShadowMode
-				: ClusterShadowMode.SRP;
+			// 本帧绘制路径（资产唯一开关）：SRP / Cluster / ClusterDebug。
+			// ClusterDebug 与 Cluster 完全相同，只额外强制「不做剔除」，用来区分剔除错 vs 绘制链坏。
+			m_mode = ClusterControl.Instance != null
+				? ClusterControl.Instance.ClusterAssembleAsset.clusterMode
+				: ClusterMode.SRP;
 
 			// 【真正的 cluster 管线】首次（或物体有变动时）把所有簇摊平到世界空间。
 			// 只在 cluster 两条路径下触发，SRP 模式零开销。
-			if (m_shadowMode != ClusterShadowMode.SRP)
+			if (m_mode != ClusterMode.SRP)
 			{
 				ClusterShadowRenderer.Instance.Rebuild();
 			}
@@ -341,15 +341,16 @@ namespace CustomRenderPipline
 			// ===== 两条阴影路径的分岔（资产上切换，几何/灯光/级联设置都不用动）=====
 			//   SRP         ：逐物体剔除 + SRP Batcher + context.DrawShadows
 			//   Cluster     ：逐簇 GPU 剔除 + 每级联一次 DrawProceduralIndirect
-			//   ClusterDebug：同 Cluster，额外打印统计信息
-			bool useCluster = m_shadowMode == ClusterShadowMode.Cluster ||
-							  m_shadowMode == ClusterShadowMode.ClusterDebug;
+			//   ClusterDebug：同 Cluster，但强制不做剔除（全簇可见）
+			bool useCluster = m_mode != ClusterMode.SRP;
 			ClusterShadowRenderer cluster = ClusterShadowRenderer.Instance;
 			if (useCluster)
 			{
-				cluster.targetTexels = ClusterControl.Instance.ClusterAssembleAsset.clusterTargetTexels;
-				cluster.debugForceAll = ClusterControl.Instance.ClusterAssembleAsset.clusterShadowForceAll
-					? 1 : 0;   // 1 = 强制全可见（隔离测试：区分"剔除错" vs "绘制链坏"）；0 = 标准 compute 剔除
+				var cfg = ClusterControl.Instance.ClusterAssembleAsset;
+				cluster.targetTexels = cfg.clusterTargetTexels;
+				cluster.minTexels = cfg.clusterShadowMinTexels;
+				// ClusterDebug 默认强制全可见：Debug 能画、Cluster 画不出来 ⇒ 剔除问题；两者都空 ⇒ 绘制链问题。
+				cluster.debugForceAll = (m_mode == ClusterMode.ClusterDebug || cfg.clusterForceAll) ? 1 : 0;
 				cluster.BeginLight();
 			}
 
@@ -392,17 +393,21 @@ namespace CustomRenderPipline
 				}
 			}
 
-		// ===== 一次性 GPU 剔除：整帧只有 Reset / CullAll / BuildArgs 三个 dispatch =====
+		// ===== 一次性 GPU 剔除 + 索引展开：整帧只有 Reset / CullAll / BuildIndices / BuildArgs 四个 dispatch =====
 		if (useCluster)
 		{
-			// compute 剔除（Reset / CullAll / BuildArgs）统一录进独立 CommandBuffer 并立即执行：
-			//   · CullAll 把可见簇 ID 直接原子追加进 _Visible（RWStructuredBuffer，UAV 可写，
-			//     无"Index 缓冲不能当 UAV"的限制，也【不需要任何 Raw→Index 跨类型拷贝】⇒ 不再慢、不再错），
-			//   · BuildArgs 写好 indirect args。
-			// 绘制时 shader 在 VS 里查 _Visible + _Indices + _Positions 还原几何（拼索引从 compute 移到 VS）。
-			// 本方案已彻底删除 CopyForDraw，也不再需要 GetData 强制同步 stall：
-			//   _Args 由 compute 写出、被 DrawProceduralIndirect 的固定功能单元消费；SRP 上下文内
-			//   ExecuteCommandBuffer 已让 compute 先于后续绘制落地，资源屏障由 Unity 处理。
+			// compute 统一录进独立 CommandBuffer 并立即执行：
+			//   · CullAll      —— 逐簇球-平面剔除，可见的原子取一个槽位写进 _ClusterSlot（UAV 可写）；
+			//   · BuildIndices —— 把「可见簇的顶点号」展开进索引缓冲 _DrawIdx。该缓冲创建为
+			//                     GraphicsBuffer.Target.Index | Target.Raw：compute 用 RWByteAddressBuffer
+			//                     写、draw 直接当 index buffer 用，单缓冲、无需任何 Raw→Index 拷贝。
+			//                     （D3D11 不允许 Index 同时是 Structured，但允许同时是 Raw。）
+			//   · BuildArgs    —— 写 5 个 uint 的索引 indirect args。
+			// 绘制用带 indexBuffer 的 DrawProceduralIndirect ⇒ 映射到 DrawIndexedInstancedIndirect：
+			//   SV_VertexID 就是索引值（= _Positions 全局顶点号），VS 只需一次顺序读取，
+			//   GPU 后变换顶点缓存也能真正复用 ⇒ VS 次数 ≈ 唯一顶点数（与非索引时的「簇数×384」比少 3~4 倍）。
+			// 不再需要 GetData 强制同步 stall：_Args 由 compute 写出、被间接绘制的固定功能单元消费；
+			// ExecuteCommandBuffer 已让 compute 先于后续绘制落地，资源屏障由 Unity 处理。
 			var cullCmd = new CommandBuffer { name = "ClusterCull" };
 			cluster.Cull(cullCmd);
 			context.ExecuteCommandBuffer(cullCmd);
@@ -453,6 +458,8 @@ namespace CustomRenderPipline
                     var cutoffLight = cullingResults.visibleLights[light.visibleLightIndex].light;
                     // Light.renderingLayerMask 在 2022.3 是 int（Renderer 侧那个才是 uint），别混用
                     int savedLightRLM = cutoffLight != null ? cutoffLight.renderingLayerMask : 0;
+                    // 这个开关会泄漏到后面的点光/聚光阴影 pass，必须存/还原
+                    bool savedRLMTest = shadowSettings.useRenderingLayerMaskTest;
                     if (cutoffLight != null)
                         cutoffLight.renderingLayerMask = 1 << ClusterProverty.CutoffRenderingLayerBit;
                     shadowSettings.useRenderingLayerMaskTest = true;
@@ -469,6 +476,7 @@ namespace CustomRenderPipline
                     }
                     if (cutoffLight != null)
                         cutoffLight.renderingLayerMask = savedLightRLM;   // 还原，避免污染后续 pass
+                    shadowSettings.useRenderingLayerMaskTest = savedRLMTest;
                 }
             }
             else

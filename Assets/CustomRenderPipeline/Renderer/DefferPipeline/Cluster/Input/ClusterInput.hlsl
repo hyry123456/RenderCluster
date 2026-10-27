@@ -103,20 +103,35 @@ RVTColors GetColor(float2 uv, uint texId, uint mip, float2 detailUV){
     localDetailUV.y = 1.0 - localDetailUV.y;
 #endif
 	
+	// 【3 张图集】按 TileTable.cs 的布局拼回各语义通道。
+	// 每张图集用自己的采样器（跟随纹理 anisoLevel），不要用全局 sampler_linear_repeat —— 见 UnityInput.hlsl。
+	float useMask = INPUT_PROP(float, _UseMask);
+	float useEmission = INPUT_PROP(float, _UseEmission);
+
+	float4 rtAlbedo = SAMPLE_TEXTURE2D_LOD(_VirtualAlbedo, sampler_VirtualAlbedo, localUV, 0);
+	float4 rtNormal = SAMPLE_TEXTURE2D_LOD(_VirtualNormal, sampler_VirtualNormal, localUV, 0);
+	// mask 图集同时承载 emission.gb，所以「有 emission」时也得取样
+	float4 rtMask = (useMask > 0.5 || useEmission > 0.5)
+		? SAMPLE_TEXTURE2D_LOD(_VirtualMask, sampler_VirtualMask, localUV, 0)
+		: float4(0.0, 0.0, 0.0, 0.0);
+
 	RVTColors colors;
-	//每张图集用自己的采样器（跟随纹理 anisoLevel），不要用全局 sampler_linear_repeat —— 见 UnityInput.hlsl 的说明
-	colors.albedo   = SAMPLE_TEXTURE2D_LOD(_VirtualAlbedo,     sampler_VirtualAlbedo,   localUV, 0);
-    colors.normal   = SAMPLE_TEXTURE2D_LOD(_VirtualNormal,     sampler_VirtualNormal,   localUV, 0);
-    // 【mask 白回退】与 DefferStandard 的 GetMask(c) 逐字对齐：没有 _MASK_MAP keyword 时
-    // mask 恒为白(1) —— 否则 metallic/roughness/AO 会被无关贴图整层带偏
-    //（本工程 5 个资产的 pbrData 填的是高光图，g 通道≈0 ⇒ AO≈0 ⇒ 物体在延迟管线里直接变纯黑）。
-    // 同时【跳过这次取样】：没有 mask map 时图集里那份 mask 本来就不该用。
-    colors.mask     = (INPUT_PROP(float, _UseMask) > 0.5)
-        ? SAMPLE_TEXTURE2D_LOD(_VirtualMask, sampler_VirtualMask, localUV, 0)
-        : float4(1.0, 1.0, 1.0, 1.0);
-    colors.emission = (INPUT_PROP(float, _UseEmission) > 0.5)
-        ? SAMPLE_TEXTURE2D_LOD(_VirtualEmission, sampler_VirtualEmission, localUV, 0)
-        : float4(0.0, 0.0, 0.0, 0.0);
+	colors.albedo = float4(rtAlbedo.rgb, 1.0);
+	// normal 只存 xy（0..1 编码），z 在 GetNormalTS 里重建
+	colors.normal = float4(rtNormal.rg, 0.0, 1.0);
+
+	// 【mask 白回退】与 DefferStandard 的 GetMask(c) 逐字对齐：没有 _MASK_MAP keyword 时
+	// mask 恒为白(1) —— 否则 metallic/roughness/AO 会被无关贴图整层带偏
+	//（本工程 5 个资产的 pbrData 填的是高光图，g 通道≈0 ⇒ AO≈0 ⇒ 物体在延迟管线里直接变纯黑）。
+	// 布局：metal/AO 在 mask 图集的 R/G，detailMask/roughness 在 normal 图集的 B/A。
+	colors.mask = (useMask > 0.5)
+		? float4(rtMask.r, rtMask.g, rtNormal.b, rtNormal.a)
+		: float4(1.0, 1.0, 1.0, 1.0);
+
+	// emission：r 在 albedo 图集的 A，g/b 在 mask 图集的 B/A
+	colors.emission = (useEmission > 0.5)
+		? float4(rtAlbedo.a, rtMask.b, rtMask.a, 1.0)
+		: float4(0.0, 0.0, 0.0, 0.0);
 	// detail 改【直采】（见 ClusterPass.hlsl）：RVT detail 图集平铺语义与分页冲突会串页，已弃用。
 	// 结构体字段保留（AddColors/ScaleColors/LerpColors 与 BRG 的副本保持一致），只是填 0。
 	colors.detail   = 0;
@@ -168,8 +183,13 @@ float4 GetBase (RVTColors colors, float4 detailMap) {
 float3 GetNormalTS (RVTColors colors, float4 detailNormalMap) {
 	float4 map = colors.normal;
     float normalScale = INPUT_PROP(float, _NormalScale);
-	// RVT 图集法线是「法线贴图原样拷贝」，用 DecodeNormal（UnpackNormalmapRGorAG）解码。
-	float3 normal = DecodeNormalSafe(map, normalScale);
+	// 图集里只存 normal.xy（0..1 编码），z 用 sqrt(1-|xy|^2) 重建 —— 与 UE RVT 的 BC5 法线一致。
+	// 注意：这里【不能】再调 DecodeNormal（它是给「原样贴图像素」用的，会对已解码的 xy 二次解码）。
+	// 写法对齐 Unity 的 UnpackNormalmapRGorAG：z 用未缩放的 xy 算，再把 xy 乘 normalScale（不做归一化）。
+	float2 nxy = map.xy * 2.0 - 1.0;
+	float3 normal = float3(nxy * normalScale, sqrt(saturate(1.0 - dot(nxy, nxy))));
+	// 非法样本兜底（图集页未调入 / 无贴图）：与 DecodeNormalSafe 同一判据
+	if (normal.z < 0.02) normal = float3(0.0, 0.0, 1.0);
 	// 法线贴图绿通道为 DirectX 约定（Y 朝下），Unity 切线空间是 OpenGL 约定（Y 朝上）→ 必须翻转 Y。
 	// 这不是调试开关：flipNormalY=1 时场景法线才是对的，删掉后整场景法线方向反、光照全错。
 	normal.y *= -1.0;

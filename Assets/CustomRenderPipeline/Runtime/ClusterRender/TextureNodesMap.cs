@@ -11,15 +11,14 @@ namespace Cluster
     {
         public Texture2D albedo; public Texture2D normal;
         public Texture2D mask; public Texture2D emision;
-        public Texture2D detail;        //detail只需要一张
-        public TextureMapNode(Texture2D ab, Texture2D no, Texture2D pbr, Texture2D em,
-            Texture2D de)
+        // detail 已移出 RVT（改材质贴图直采）=> 不参与去重键：
+        // 同一套基础贴图的多个材质可以共用同一个 texId，不再因为 detail 不同被拆成多份。
+        public TextureMapNode(Texture2D ab, Texture2D no, Texture2D pbr, Texture2D em)
         {
             albedo = ab == null ? Texture2D.whiteTexture : ab;
             normal = no == null ? Texture2D.normalTexture : no;
             mask = pbr == null ? Texture2D.whiteTexture : pbr;
             emision = em == null ? Texture2D.blackTexture : em;
-            detail = de == null ? Texture2D.grayTexture : de;
         }
 
         public TextureMapNode(Texture2D[] textures)
@@ -28,7 +27,6 @@ namespace Cluster
             normal = textures[1];
             mask = textures[2];
             emision = textures[3];
-            detail = textures[4];
         }
     }
 
@@ -203,7 +201,6 @@ namespace Cluster
             tile.normal = texturesNode.normal;
             tile.mask = texturesNode.mask;
             tile.emison = texturesNode.emision;
-            tile.detial = texturesNode.detail;
 
             //否则就创建结点
             for (int i = 0; i < texturesNodes.Length; i++)
@@ -293,7 +290,7 @@ namespace Cluster
             }
             BRDF_Tile tile = (BRDF_Tile)tN.tileData;
             TextureMapNode mapNode = new TextureMapNode(
-                tile.albedo, tile.normal, tile.mask, tile.emison, tile.detial);
+                tile.albedo, tile.normal, tile.mask, tile.emison);
             if (textureMap.TryGetValue(mapNode, out index))
             {
                 texturesNodes[index].useCount--;

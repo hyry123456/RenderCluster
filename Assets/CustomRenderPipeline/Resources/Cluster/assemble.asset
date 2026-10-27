@@ -25,14 +25,13 @@ MonoBehaviour:
   debugFeedbackZoom: {fileID: 0}
   rvtDebugTex: {fileID: 0}
   debugMode: 0
-  normalDebugMode: 0
   rvtTrilinearBlend: 0
-  brgGBufferExcludeLayer: 31
   UseRVT: 1
-  clusterShadowMode: 1
+  clusterMode: 1
+  clusterGBuffer: 1
   clusterTargetTexels: 0
-  clusterShadowForceAll: 0
-  useBRG: 0
+  clusterShadowMinTexels: 1
+  clusterForceAll: 0
   useTileVT: 0
   TilesPerAxis: 4
   savePath: C:/Study/UnityProjects/RenderCluster/Assets/StreamingAssets/ClusterData/

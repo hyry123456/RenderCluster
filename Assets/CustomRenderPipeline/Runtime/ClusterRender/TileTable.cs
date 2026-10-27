@@ -10,11 +10,17 @@ namespace Cluster
     /// </summary>
     public class TileTable
     {
+        // 【3 张图集布局】5 张 -> 3 张，每张 RGBA8，共 12 通道，正好用满：
+        //   _VirtualAlbedos : R,G,B = albedo ; A = emission.r
+        //   _VirtualNormals : R,G   = normal.xy(编码 0..1) ; B = detailMask ; A = roughness
+        //   _VirtualMasks   : R     = metallic ; G = AO ; B = emission.g ; A = emission.b
+        // 为什么能省：
+        //   · detail 已改成「材质贴图直采」，原 detail 图集是死数据（占了 1/5 内存仍在填）；
+        //   · emission 并进 albedo/mask 的空闲通道，代价为 0，且布局一次定死、以后不用再重排；
+        //   · normal 只存 xy，z 由读取侧 sqrt(1-|xy|^2) 重建 —— 与 UE RVT 的 BC5 法线一致。
         public RenderTexture _VirtualAlbedos;
         public RenderTexture _VirtualNormals;
         public RenderTexture _VirtualMasks;
-        public RenderTexture _VirtualEmisons;
-        public RenderTexture _VirtualDetails;
 
         private static int
             PaddingSizeId = Shader.PropertyToID("_PaddingSize"),
@@ -25,7 +31,6 @@ namespace Cluster
             NormalId = Shader.PropertyToID("_RVTNormalSrc"),
             PBRDataId = Shader.PropertyToID("_RVTPBRDataSrc"),
             EmissionId = Shader.PropertyToID("_RVTEmissionSrc"),
-            DetailId = Shader.PropertyToID("_RVTDetailSrc"),
             TileOriginId = Shader.PropertyToID("_TileOrigin"),
             TileScaleId = Shader.PropertyToID("_TileScale")
             ;
@@ -34,7 +39,6 @@ namespace Cluster
         public static int _NormalId => NormalId;
         public static int _PBRDataId => PBRDataId;
         public static int _EmissionId => EmissionId;
-        public static int _DetailId => DetailId;
         public static int _TileOriginId => TileOriginId;
         public static int _TileScaleId => TileScaleId;
 
@@ -125,8 +129,6 @@ namespace Cluster
             _VirtualAlbedos = CreateAtlasRT(texSizeX, finalTexSizeY);
             _VirtualNormals = CreateAtlasRT(texSizeX, finalTexSizeY);
             _VirtualMasks   = CreateAtlasRT(texSizeX, finalTexSizeY);
-            _VirtualEmisons = CreateAtlasRT(texSizeX, finalTexSizeY);
-            _VirtualDetails = CreateAtlasRT(texSizeX, finalTexSizeY);
 
             // 【必须固定 7，不能按 mipLevel 动态分配】
             // Unity 的全局数组尺寸在【首次 SetGlobalVectorArray 注册时】就被固定，
@@ -165,7 +167,7 @@ namespace Cluster
                 tileMat = material;
 
             //存储全部的Gbuffer数组
-            rvtBuffersId = new RenderTargetIdentifier[5];
+            rvtBuffersId = new RenderTargetIdentifier[3];
         }
 
         /// <summary>
@@ -193,8 +195,6 @@ namespace Cluster
             ReleaseRT(ref _VirtualAlbedos);
             ReleaseRT(ref _VirtualNormals);
             ReleaseRT(ref _VirtualMasks);
-            ReleaseRT(ref _VirtualEmisons);
-            ReleaseRT(ref _VirtualDetails);
         }
 
         private static void ReleaseRT(ref RenderTexture rt)
@@ -248,15 +248,13 @@ namespace Cluster
                 return;       //这种情况一定是异步问题，导致结点已经舍去，但是还是设置了值
             }
 
-            //注意：必须先把5张图集赋值给 rvtBuffersId，再调用 SetRenderTarget。
+            //注意：必须先把 3 张图集赋值给 rvtBuffersId，再调用 SetRenderTarget。
             //CommandBuffer.SetRenderTarget(RenderTargetIdentifier[]) 在入队时就会拷贝数组内容，
             //原来的写法在每次会话的第一页绘制时数组还是全0（BuiltinRenderTextureType.None），
             //第一页会画到空目标上，图集里留下一个永不绘制的黑块
             rvtBuffersId[0] = _VirtualAlbedos;
             rvtBuffersId[1] = _VirtualNormals;
             rvtBuffersId[2] = _VirtualMasks;
-            rvtBuffersId[3] = _VirtualEmisons;
-            rvtBuffersId[4] = _VirtualDetails;
 
             buffer.SetRenderTarget(rvtBuffersId, _VirtualAlbedos.depthBuffer);
             block.SetMatrix(ClusterProverty.ImageMVPId, matrix);
@@ -271,7 +269,7 @@ namespace Cluster
             block.SetVector(TileScaleId, new Vector4(invT, invT, 0f, 0f));
 
             // ===== Profiler 采样点 =====
-            // C# 侧只量到「记录命令」的成本（很小）；真正的开销在 GPU（一次 5 渲染目标、CellSize² 的绘制）。
+            // C# 侧只量到「记录命令」的成本（很小）；真正的开销在 GPU（一次 3 渲染目标、CellSize² 的绘制）。
             // 所以这里额外打一个【命令缓冲 GPU marker】：Begin/End 都在同一个 buffer 内、中间没有
             // ExecuteBuffer（buffer.Clear() 会把 marker 切断 → Non-matching EndSample），
             // 因此它是合法的成对采样，能在 Profiler 的 GPU 时间线 / Frame Debugger 里看到。

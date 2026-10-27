@@ -1,0 +1,136 @@
+// 【cluster 管线】GBuffer 用的逐簇 GPU 剔除 + 索引重排。
+//
+// 与阴影版的差别只有一点：可见列表按【detail 贴图组】分段，而不是按级联分段。
+// 因为参数（_MapId / _Color / detail 强度…）走每簇常量缓冲，唯一还绑在图上的只剩
+// _DetailMap / _DetailNormalMap 这两张【每材质】贴图 —— 所以一次 draw 只能覆盖
+// 「detail 贴图对相同」的簇，其余按组分开画（本工程实测 ≤17 组）。
+//
+// 整帧 4 个 dispatch：
+//   Reset        （1 组，清零每组的计数器）
+//   CullAll      （每簇一线程，摄像机视锥球-平面测试，通过则原子追加进本组列表）
+//   BuildIndices （每 (角点, 可见槽位, 组) 一线程，把可见簇的顶点号铺进索引缓冲）
+//   BuildArgs    （每组一线程，写【索引】间接绘制 args：5 个 uint）
+//
+// 为什么要建索引（2026-10-27 定案，这是 GBuffer 追平 SRP 的关键）：
+//   非索引绘制 vertexCount = 可见簇数 × 384，一个 128 三角形的簇唯一顶点只有约 66 个
+//   ⇒ 每簇白跑 318 次 VS（约 5.8 倍）。索引绘制让 GPU 的顶点缓存真正生效，
+//   VS 调用次数回落到「唯一顶点数」。
+//   ⚠️ 只对【可见】簇建索引：写量 = 可见簇数 × 384。若按全部簇 × 全部组来写会到上百 MB，
+//   那是上一版把这条路做废的原因（写了 188MB、compute 反烧 1.6ms）。
+//
+// 剔除口径：worldToClip = GL.GetGPUProjectionMatrix(proj,true)*view（与绘制侧逐位一致），
+// 从它提 6 个世界空间视锥平面做球-平面测试。
+// 坑：裸 proj*view 在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除（阴影路径踩过）。
+#pragma kernel Reset
+#pragma kernel CullAll
+#pragma kernel BuildIndices
+#pragma kernel BuildArgs
+
+StructuredBuffer<float4> _ClusterBounds;          // xyz=世界包围球中心 w=半径
+StructuredBuffer<uint>   _ClusterGroup;           // 每簇属于哪个 detail 贴图组
+StructuredBuffer<uint4>  _ClusterInfo;            // x=顶点段起点 y=材质槽位（这里只取 y）
+
+StructuredBuffer<float4> _Planes;                 // 6 个世界空间视锥平面（摄像机视图）
+
+// [簇 × 384] = 该角点对应的【全局顶点号】（重建期烘死，静态）
+StructuredBuffer<uint>   _CornerGvid;
+// [group] = 该组在 _DrawIdx 里的起点（uint 偏移，重建期算好的前缀和）
+StructuredBuffer<uint>   _DrawBase;
+
+// [group * _ClusterCount + slot] = (簇下标, 材质槽位)
+RWStructuredBuffer<uint2> _Visible;
+// [簇] = 该簇本帧的可见槽位；不可见写 0xFFFFFFFF。
+// BuildIndices 用它做反查：这样 dispatch 就能按「总簇数 × 384」一维展开，
+// 不必按「组内簇数上限 × 组数」开方阵（那会开出上千万线程，比省下的 draw 还贵）。
+RWStructuredBuffer<uint>  _SlotOf;
+RWStructuredBuffer<uint> _Counter;                // [group] = 该组可见簇数
+
+// 索引间接绘制 args：5 个 uint
+//   [0] indexCount  [1] instanceCount  [2] startIndex  [3] baseVertex  [4] startInstance
+RWStructuredBuffer<uint> _Args;
+
+// 索引缓冲本体。GraphicsBuffer 用 Target.Index | Target.Raw 创建 ⇒ D3D11 里
+// 既能当 index buffer 读、又能当 UAV 写（不允许同时是 Structured，但允许同时是 Raw），
+// 所以这里声明成 RWByteAddressBuffer，单缓冲零拷贝。
+RWByteAddressBuffer      _DrawIdx;
+
+int _GroupCount;
+int _ClusterCount;
+int _TrisPerCluster;
+int _DebugForceAll;                               // 非 0 = 跳过剔除，全可见（排查用）
+int _IdxDimX;                                     // BuildIndices 的 x 维线程数（= 组数 × 64）
+
+// 纯清零：dispatch 1 组即可
+[numthreads(64, 1, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _GroupCount) _Counter[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void CullAll(uint3 id : SV_DispatchThreadID)
+{
+    uint c = id.x;
+    if ((int)c >= _ClusterCount) return;
+
+    _SlotOf[c] = 0xFFFFFFFFu;          // 先当不可见，顺手清掉上帧残留
+
+    float4 bb = _ClusterBounds[c];
+
+    if (_DebugForceAll == 0)
+    {
+        // 球-平面：球在视锥内 ⇔ 对全部 6 个平面 dot(pl.xyz, center)+pl.w >= -radius
+        for (int p = 0; p < 6; p++)
+        {
+            float4 pl = _Planes[p];
+            if (dot(pl.xyz, bb.xyz) + pl.w < -bb.w) return;
+        }
+    }
+
+    uint g = _ClusterGroup[c];
+    uint slot;
+    InterlockedAdd(_Counter[g], 1u, slot);
+    if ((int)slot < _ClusterCount)
+    {
+        _Visible[g * _ClusterCount + (int)slot] = uint2(c, _ClusterInfo[c].y);
+        _SlotOf[c] = slot;
+    }
+}
+
+// 一维展开：idx = 簇下标 × 384 + 角点。不可见的簇靠 _SlotOf 直接退出（不写索引）。
+// 规模 = 总簇数 × 384，与组数、每组簇数上限都无关。
+// ⚠️ 别改成「y = 组内簇数上限、z = 组」的方阵：那是上千万线程，实测把省下的 draw 全吃回去。
+// ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 必须二维拆开，所以用 _IdxDimX 把 (x,y) 拼回一维。
+[numthreads(64, 1, 1)]
+void BuildIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.y * (uint)_IdxDimX + id.x;
+    uint perCluster = (uint)(_TrisPerCluster * 3);
+    if ((int)idx >= _ClusterCount * (int)perCluster) return;
+
+    uint c      = idx / perCluster;
+    uint corner = idx - c * perCluster;
+
+    uint slot = _SlotOf[c];
+    if (slot == 0xFFFFFFFFu) return;
+
+    uint g   = _ClusterGroup[c];
+
+    uint dst = (_DrawBase[g] + slot * perCluster + corner) * 4u;
+    _DrawIdx.Store(dst, _CornerGvid[idx]);
+
+}
+
+[numthreads(8, 1, 1)]
+void BuildArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint g = id.x;
+    if ((int)g >= _GroupCount) return;
+
+    uint perCluster = (uint)(_TrisPerCluster * 3);
+    _Args[g * 5 + 0] = (uint)_Counter[g] * perCluster;   // indexCount
+    _Args[g * 5 + 1] = 1;                                // instanceCount
+    _Args[g * 5 + 2] = _DrawBase[g];                     // startIndex = 该组在 _DrawIdx 的起点
+    _Args[g * 5 + 3] = 0;                                // baseVertex
+    _Args[g * 5 + 4] = 0;                                // startInstance
+}

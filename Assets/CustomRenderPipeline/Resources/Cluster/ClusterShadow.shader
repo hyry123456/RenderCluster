@@ -29,12 +29,11 @@
 //
 //
 // ── 数据布局（C# 侧 ClusterShadowRenderer.Rebuild 摊平）──
-//   _Positions —— float3 世界空间顶点
-//   索引缓冲是【静态单位缓冲 [0..N]】（drawIdxBuf），SV_VertexID = vid = 0..N；
-//   VS 用 vid/384 取 _Visible 槽位、vid%384 取簇内角点：
-//     cluster = _Visible[_CascadeBase + vid/384]  → 真实簇号
-//     gvid    = _Indices[cluster*384 + vid%384]   → 全局顶点号
-//     pos     = _Positions[gvid]
+//   _Positions —— float3 世界空间顶点（世界坐标，烘焙时乘好）
+//   索引缓冲由 compute（BuildIndices）每帧只给【可见】簇铺好，索引值就是全局顶点号：
+//     pos = _Positions[SV_VertexID]
+//   一次顺序读取、无任何查表。GPU 的顶点缓存因此能真正复用（一个 128 三角形的簇
+//   唯一顶点只有约 66 个，此前用静态单位索引缓冲会白跑 384 次 VS，约 5.8 倍）。
 Shader "Hidden/ClusterShadowCaster"
 {
     SubShader
@@ -45,9 +44,12 @@ Shader "Hidden/ClusterShadowCaster"
             ColorMask 0
             ZWrite On
             ZTest LEqual
-            // 关背面剔除：场景里可能有单面片/薄片，剔背面容易漏阴影；
-            // 多出来的光栅化开销远小于顶点拉取本身的开销。
-            Cull Off
+            // ⚠️ 必须与 SRP 路径的 ShadowCaster 口径一致：ClusterPBR.shader 的 ShadowCaster
+            // pass 没写 Cull 指令 ⇒ 默认 Cull Back。这里若写 Cull Off，等于把每个投射物的
+            // 三角形再画一遍背面（光栅化 ×2），而阴影图里背面根本不参与最终深度。
+            // 2026-10-27 实测：这是 Cluster 阴影比 SRP 慢一截的主要原因之一。
+            // 只有场景里出现「必须双面投影」的单面片（旗帜/布/卡片植被）时才需要改回 Cull Off。
+            Cull Back
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -82,18 +84,14 @@ Shader "Hidden/ClusterShadowCaster"
             #define TRIS_PER_CLUSTER 128
 
             StructuredBuffer<float3> _Positions;   // 世界空间顶点（烘焙时乘好世界矩阵）
-            StructuredBuffer<int>   _Indices;      // 全局顶点号（源码），每簇固定 384 个（= 128 三角形×3）
-            StructuredBuffer<uint>  _Visible;      // [cascadeBase + slot] = 可见簇下标（compute 产出的紧凑列表）
             // 自定义 world→clip 矩阵（= proj*view），由 C# 经 MaterialPropertyBlock 逐 draw 显式传入。
             // ⚠️ 不用内建 UNITY_MATRIX_M/V：自定义 HLSLPROGRAM 在 DrawProceduralIndirect 下
             // 内建矩阵不被 worldPose 可靠喂入（会恒为单位/零矩阵 ⇒ 全裁光）。见 shader 顶部注释。
             float4x4 _ClusterShadowW2C;
-            uint     _CascadeBase;                 // = 级联下标 × 簇数，定位 _Visible 里本联的紧凑段
 
             struct Attributes
             {
-                // 单位索引导下 SV_VertexID = 0,1,2,...,N（索引缓冲是 [0..N] 的静态单位缓冲）。
-                // 用它推出"第几个可见簇 + 簇内第几个角点"，再查 _Visible + _Indices 得全局顶点号。
+                // 索引绘制下 SV_VertexID = 索引值 = 全局顶点号（baseVertex 恒 0）
                 uint vertexID : SV_VertexID;
             };
 
@@ -104,21 +102,8 @@ Shader "Hidden/ClusterShadowCaster"
 
             Varyings vert(Attributes i)
             {
-                // 顶点还原（替代原"索引缓冲预拼全局顶点号"的做法）：
-                //   本方案把"拼索引"从 compute 移到 VS，彻底去掉 Raw→Index 跨类型拷贝这座桥。
-                //   vid     = 0..可见簇数×384-1
-                //   slot    = vid / 384        → 第几个可见簇（_Visible 里的紧凑槽位）
-                //   corner  = vid % 384        → 簇内第几个角点
-                //   cluster = _Visible[cascadeBase + slot]   → 真实簇号
-                //   gvid    = _Indices[cluster*384 + corner]  → 全局顶点号
-                //   pos     = _Positions[gvid]
-                uint perCluster = (uint)TRIS_PER_CLUSTER * 3u;
-                uint vid    = i.vertexID;
-                uint slot   = vid / perCluster;
-                uint corner = vid % perCluster;
-                uint clusterID = _Visible[_CascadeBase + slot];
-                uint gvid   = (uint)_Indices[(int)(clusterID * perCluster + corner)];
-                float3 p = _Positions[gvid];
+                // 索引值就是全局顶点号 ⇒ 只有一次顺序读取，没有 _Visible / _Indices 的间接查表。
+                float3 p = _Positions[i.vertexID];
 
                 Varyings o;
                 o.pos = mul(_ClusterShadowW2C, float4(p, 1.0));

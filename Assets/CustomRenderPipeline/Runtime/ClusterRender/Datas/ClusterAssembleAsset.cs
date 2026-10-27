@@ -8,16 +8,25 @@ using UnityEngine.Serialization;
 
 namespace Cluster
 {
-    /// <summary>阴影用哪条路径渲染。</summary>
-    public enum ClusterShadowMode
+    /// <summary>
+    /// 整条管线的绘制路径。**一个开关管全部**（GBuffer / RVT Feedback / 阴影一起切），
+    /// 不允许出现「GBuffer 走 Cluster、阴影走 SRP」这类混搭。
+    /// </summary>
+    public enum ClusterMode
     {
-        /// <summary>Unity 常规路径：逐物体剔除 + SRP Batcher + context.DrawShadows。</summary>
+        /// <summary>Unity 常规路径：逐物体剔除 + SRP Batcher（context.DrawRenderers / DrawShadows）。</summary>
         SRP = 0,
-        /// <summary>真正的 cluster 路径：一次 DrawProcedural 把全部簇画一遍（顶点拉取，不绑顶点缓冲）。
-        /// 【当前不做剔除】：视锥剔除交给 GPU 的 NDC 裁剪，阴影裁剪留到以后。</summary>
+        /// <summary>
+        /// Cluster：场景里的静态物体全部改由簇绘制 ——
+        /// GBuffer、RVT Feedback、阴影三者共用同一份烘焙簇数据，各自一次 GPU 逐簇剔除。
+        /// 动态物体（动画/移动的 Transform）仍走 SRP，它们本来就快，没必要进簇。
+        /// </summary>
         Cluster = 1,
-        /// <summary>ClusterDebug：与 Cluster 【完全相同】的 GPU 路径，只额外限频打印统计信息。
-        /// 仅调试用，不要用来测性能（打印本身有开销）。</summary>
+        /// <summary>
+        /// ClusterDebug：绘制路径与 Cluster 完全相同，只额外【强制不做剔除】（全簇可见）。
+        /// 判据：Debug 下能画出来、Cluster 下画不出来 ⇒ 剔除口径/包围球有问题；
+        ///       两者都画不出来 ⇒ 绘制链（缓冲绑定 / shader 取数）有问题。
+        /// </summary>
         ClusterDebug = 2,
     }
 
@@ -41,8 +50,6 @@ namespace Cluster
         Albedo,
         Normal,
         Mask,
-        Emission,
-        Detail,
     }
 
 
@@ -102,12 +109,28 @@ namespace Cluster
         public bool UseRVT = true;
 
         /// <summary>
-        /// 阴影渲染走哪条路：
-        ///   SRP     = Unity 常规（逐物体剔除 + SRP Batcher + context.DrawShadows）；
-        ///   Cluster = 逐簇 GPU 剔除 + 每级联一次 DrawProceduralIndirect（顶点拉取）。
-        /// 两条路可以随时互切对比，几何/灯光/级联设置【都不用动】。
+        /// 整条管线的绘制路径（**唯一开关**）：
+        ///   SRP     = Unity 常规（逐物体剔除 + SRP Batcher），Cluster 相关代码全部不参与；
+        ///   Cluster = 静态物体的 GBuffer / RVT Feedback / 阴影全部由簇绘制；
+        ///   ClusterDebug = 同 Cluster，但强制不做剔除（排查剔除 vs 绘制链）。
+        /// 几何 / 灯光 / 级联设置都不用动，随时互切对比。
         /// </summary>
-        public ClusterShadowMode clusterShadowMode = ClusterShadowMode.SRP;
+        public ClusterMode clusterMode = ClusterMode.SRP;
+
+        /// <summary>
+        /// **独立于 clusterMode 的子开关**：是否让 Cluster 接管 GBuffer（+ RVT Feedback）。
+        ///
+        /// true（默认）—— 静态不透明物体的 GBuffer / RVT Feedback 由簇绘制：
+        ///   几何从 `_Positions` 等缓冲里按可见簇还原，按「detail 贴图对」分组，每组一次
+        ///   `DrawProceduralIndirect`（本场景 13 组）。相比 SRP 逐物体提交（~900 次 draw），
+        ///   **CPU 侧 draw 提交从几百次降到十几次**；GPU 侧顶点走 SRV 取数，比 IA 略贵。
+        ///
+        /// false —— 即使 clusterMode = Cluster（阴影走簇），模型 GBuffer 也仍由 SRP 的
+        ///   DrawRenderers 画。用于把「阴影」和「GBuffer」两条性能曲线彻底分开排查。
+        ///
+        /// 只有 Game 摄像机 + UseRVT + clusterMode ≠ SRP 时才会真的生效；Scene 视图永远走 SRP。
+        /// </summary>
+        public bool clusterGBuffer = true;
 
         /// <summary>
         /// Cluster 路径下，期望【一个簇】投影到阴影图上占多少 texel —— 用于逐簇 LOD 选择。
@@ -127,14 +150,26 @@ namespace Cluster
         public float clusterTargetTexels = 0f;
 
         /// <summary>
-        /// 排查用：非 0 时 compute 跳过所有剔除，所有簇对所有级联全可见。
+        /// 阴影里「小到看不出来」的簇直接剔掉：簇投影到阴影图上的半径小于这个 texel 数就跳过。
         ///
-        /// 配合 clusterShadowMode = ClusterDebug 用，判据：
-        ///   · 开启后可见数 = 全部簇数 ⇒ compute 链正常，问题在平面/包围球判定
-        ///   · 开启后可见数仍是 0     ⇒ 剔除链本身坏了（buffer 没绑上 / kernel 没跑）
+        /// 判据：texelRadius = 簇世界半径 × projScale，projScale 由该级联的正交投影与 tile 尺寸算出。
+        /// 一个半径不到 1 texel 的簇，它投出来的阴影本身就只有一两个像素、再经 PCF 模糊后基本不可见，
+        /// 但顶点开销是实打实的（每簇 384 个顶点 × 4 个级联）。
+        ///
+        /// ⚠️ 0 = 关闭（默认，行为与以前完全一致）。想再快就试 0.5 ~ 1.0；
+        ///    调太大远处小物体的阴影会整片消失（细长物体不受影响——它们的包围球半径很大）。
+        /// </summary>
+        public float clusterShadowMinTexels = 0f;
+
+        /// <summary>
+        /// 排查用：非 0 时 **GBuffer 与阴影的剔除都跳过**，所有簇全部可见。
+        ///
+        /// 判据（配合 clusterMode = ClusterDebug 已默认开启）：
+        ///   · 全开后画得出来、正常时画不出来 ⇒ 剔除口径 / 包围球有问题；
+        ///   · 全开也画不出来                 ⇒ 绘制链本身坏了（缓冲没绑上 / shader 取数错）。
         /// 正常渲染时务必保持关闭（否则等于退回全画）。
         /// </summary>
-        public bool clusterShadowForceAll = false;
+        public bool clusterForceAll = false;
 
         /// <summary>Tile 粒度虚拟贴图开关。默认关：RVT 走「整图一格」(T=1) 旧路径，与历史行为完全等价。
         /// 开启后，每张贴图按 TilesPerAxis×TilesPerAxis 切块，反馈编码 32-bit pageId=(texId,mip,tileX,tileY)，

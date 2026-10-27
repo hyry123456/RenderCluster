@@ -65,12 +65,11 @@ namespace Cluster
         MaterialPropertyBlock m_mpb;     // [绘制] 逐 draw 显式传入 world→clip 矩阵（per-draw，互不污染）
         ComputeShader cullShader;
         ComputeBuffer posBuf, idxBuf, boundsBuf;
-        // 索引缓冲退化为【单一静态单位缓冲】：创建时写入 [0,1,2,...,N]，之后永不再写。
-        // compute 只产出可见簇列表 _Visible（RWStructuredBuffer，可写、无拷贝）；绘制时由 shader 在 VS 内
-        // 用 SV_VertexID 查 _Visible + _Indices + _Positions 还原几何。
-        // 坑：D3D11 下 Index 缓冲不能当 compute UAV 写，故绝不能让 compute 直接写本缓冲（会静默丢弃）。
+        // 索引缓冲由 compute 每帧按【可见】簇重排（Target.Index | Raw ⇒ 可当 UAV 写、也可当索引读）。
+        // 这样 GPU 顶点缓存能真正复用（每簇 384 角点 → 约 66 次 VS），VS 里只剩 _Positions[SV_VertexID]。
         GraphicsBuffer drawIdxBuf;
         ComputeBuffer planesBuf, cascadeParamBuf, visibleBuf, counterBuf, argsBuf;
+        ComputeBuffer slotBuf;
 
         int clusterCount;
         bool built, dirty = true;
@@ -85,6 +84,10 @@ namespace Cluster
 
         /// <summary>LOD 判据的目标 texel 数。<= 0 = 不做 LOD 判据（当前只有 LOD0）。</summary>
         public float targetTexels = 0f;
+
+        /// <summary>投影半径小于这个 texel 数的簇直接跳过（0 = 关闭）。见资产同名字段说明。
+        /// 这是「不改几何、不改绘制方式」就能再省一批顶点开销的唯一旋钮。</summary>
+        public float minTexels = 0f;
 
         /// <summary>调试开关：非 0 时 compute 跳过所有剔除、强制全可见（隔离测试用）。</summary>
         public int debugForceAll = 0;
@@ -140,19 +143,16 @@ namespace Cluster
             dirty = true;
         }
 
-        /// <summary>给所有用到的 mesh 补烘焙（没有 ClusterMeshAsset 的就现场烘一份，只烘一次）。</summary>
+        /// <summary>给所有用到的 mesh 补烘焙。走全局 ClusterMeshCache 的【合并切簇】那一份
+        /// （splitBySubmesh: false）：阴影是纯几何、不采材质，合并切簇可以去掉「每个 submesh
+        /// 最后一簇都要补齐到 128 三角形」产生的填充簇，簇数少 20~40%，也不生成 normal/tangent/uv。</summary>
         public void EnsureBaked()
         {
             for (int i = 0; i < meshes.Count; i++)
             {
                 var m = meshes[i];
                 if (m == null || baked.ContainsKey(m)) continue;
-                var asset = ScriptableObject.CreateInstance<ClusterMeshAsset>();
-                asset.sourceMesh = m;
-                asset.clusterTriCount = TrisPerCluster;
-                asset.lodCount = 1;          // 只烘 LOD0：当前阴影只画 LOD0
-                ClusterMeshBaker.Bake(asset);
-                baked[m] = asset;
+                baked[m] = ClusterMeshCache.Get(m, splitBySubmesh: false);
             }
         }
 
@@ -237,17 +237,17 @@ namespace Cluster
             idxBuf.SetData(fullIdx);
             boundsBuf.SetData(allBounds.ToArray());
 
-            // 静态单位索引缓冲：内容 [0,1,2,...,clusterCount*384-1]，创建一次、永不再写（不参与任何拷贝）。
-            // DrawProceduralIndirect 必须传 indexBuffer，shader 的 VS 用 SV_VertexID(= 单位值) 推出
-            // 可见簇槽位与簇内角点，再查 _Visible + _Indices + _Positions 还原几何。
-            int idxCap = clusterCount * VertsPerCluster;
-            drawIdxBuf = new GraphicsBuffer(GraphicsBuffer.Target.Index, idxCap, 4);
-            var identity = new int[idxCap];
-            for (int n = 0; n < idxCap; n++) identity[n] = n;
-            drawIdxBuf.SetData(identity);
-
             // 剔除用的 buffer 大小都按"级联数 × 簇数"来，宁可多 alloc 也不要重分配
             int maxC = Mathf.Max(1, MaxCascades);
+
+            // 真索引缓冲：每级联一段（起点 = 级联 × 簇数 × 384），由 compute 每帧只给【可见】簇写。
+            // Target.Index | Target.Raw：D3D11 不允许索引缓冲同时是 Structured，但允许同时是 Raw
+            // ⇒ compute 用 RWByteAddressBuffer 写、draw 直接当索引读，单缓冲零拷贝。
+            drawIdxBuf = new GraphicsBuffer(GraphicsBuffer.Target.Index | GraphicsBuffer.Target.Raw,
+                maxC * clusterCount * VertsPerCluster, 4);
+
+            // [级联 × 簇] = 该簇在本级联的可见槽位（不可见 = 0xFFFFFFFF），BuildIndices 靠它早退。
+            slotBuf = new ComputeBuffer(maxC * clusterCount, 4, ComputeBufferType.Default);
             planesBuf = new ComputeBuffer(maxC * PlanesPerCascade, 16, ComputeBufferType.Default);
             cascadeParamBuf = new ComputeBuffer(maxC, 16, ComputeBufferType.Default);
             visibleBuf = new ComputeBuffer(maxC * clusterCount, 4, ComputeBufferType.Default);
@@ -262,6 +262,12 @@ namespace Cluster
             built = true;
             dirty = false;
 
+#if UNITY_EDITOR
+            // 排查/对比用：阴影 pass 的几何量就是「簇数 × 每簇顶点」。
+            // 和 SRP 对比时看 Profiler 里 Shadows 的顶点数，这两个数直接决定光栅化开销。
+            Debug.Log($"[Cluster阴影] 重建：{clusterCount} 簇 / {allPos.Count} 顶点 / {allIdx.Count} 索引" +
+                      $"/ {clusterCount * TrisPerCluster} 三角形（合并切簇，仅 LOD0，Cull Back）");
+#endif
         }
 
         void Load()
@@ -327,7 +333,7 @@ namespace Cluster
             // 正交投影下 proj[1][1] = 2/(top-bottom)，世界半径 r 对应 NDC y = r*proj11，再乘 tileSize/2 得 texel。
             float projScale = 0f;
             if (Mathf.Abs(proj.m11) > 1e-6f) projScale = tileSize * 0.5f * Mathf.Abs(proj.m11);
-            cpuCascadeParams[k] = new Vector4(projScale, targetTexels, 0f, 0f);
+            cpuCascadeParams[k] = new Vector4(projScale, targetTexels, minTexels, 0f);
         }
 
         /// <summary>
@@ -354,9 +360,10 @@ namespace Cluster
             // _Counter / _Args / _Visible 被 Reset / CullAll / BuildArgs 共用 ⇒ 三个都要绑。
             int kReset = cullShader.FindKernel("Reset");
             int kCull = cullShader.FindKernel("CullAll");
+            int kIdx = cullShader.FindKernel("BuildIndices");
             int kArgs = cullShader.FindKernel("BuildArgs");
 
-            foreach (int k in new[] { kReset, kCull, kArgs })
+            foreach (int k in new[] { kReset, kCull, kIdx, kArgs })
             {
                 cullShader.SetInt("_CascadeCount", cascadeCount);
                 cullShader.SetInt("_ClusterCount", clusterCount);
@@ -370,36 +377,46 @@ namespace Cluster
                 cullShader.SetBuffer(k, "_Planes", planesBuf);
                 cullShader.SetBuffer(k, "_CascadeParams", cascadeParamBuf);
                 cullShader.SetBuffer(k, "_ClusterBounds", boundsBuf);
+                cullShader.SetBuffer(k, "_SlotOf", slotBuf);
             }
+            // 只有 BuildIndices 用到这两份
+            cullShader.SetBuffer(kIdx, "_CornerGvid", idxBuf);
+            cullShader.SetBuffer(kIdx, "_DrawIdx", drawIdxBuf);
 
             cmd.DispatchCompute(cullShader, kReset, 1, 1, 1);
             cmd.DispatchCompute(cullShader, kCull, groups, 1, 1);
+
+            // 索引重排：总簇数 × 384 个角点，每线程一个，内部循环所有级联
+            // （_CornerGvid 对 4 个级联是同一个值，只读一次）。
+            // ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 二维拆开，kernel 用 _IdxDimX 拼回一维。
+            int totalGroups = Mathf.Max(1,
+                Mathf.CeilToInt(clusterCount * (float)VertsPerCluster / ThreadGroupSize));
+            int gx = Mathf.Min(65535, totalGroups);
+            int gy = Mathf.Max(1, Mathf.CeilToInt(totalGroups / (float)gx));
+            cullShader.SetInt("_IdxDimX", gx * ThreadGroupSize);
+            cmd.DispatchCompute(cullShader, kIdx, gx, gy, 1);
+
             cmd.DispatchCompute(cullShader, kArgs, cGroups, 1, 1);
-            // compute 只写 _Visible（可见簇紧凑列表，UAV 可写，无需任何跨缓冲拷贝）。
-            // 绘制时 shader 在 VS 里查 _Visible + _Indices + _Positions 还原几何。
         }
 
-        /// <summary>画一个级联：索引缓冲是静态单位缓冲 drawIdxBuf（[0..N]），shader 用 SV_VertexID 推出
-        /// 可见簇槽位与簇内角点，再查 _Visible + _Indices + _Positions 还原几何。
-        /// 经 MaterialPropertyBlock 逐 draw 传 _CascadeBase（= cascadeIndex*簇数，定位 _Visible 段）与 _ClusterShadowW2C。
-        /// argsBuf[cascadeIndex*5] 里 startIndexLocation 恒为 0。</summary>
+        /// <summary>画一个级联：索引缓冲由 compute 每帧按【可见】簇重排，索引值就是全局顶点号
+        /// ⇒ VS 只有一次 _Positions[SV_VertexID] 顺序读取。
+        /// 经 MaterialPropertyBlock 逐 draw 传 _ClusterShadowW2C（自定义 HLSL 拿不到内建矩阵）。
+        /// argsBuf[cascadeIndex*5] 的 startIndexLocation = 该级联在索引缓冲里的起点。</summary>
         public void Draw(CommandBuffer cmd, int cascadeIndex, Matrix4x4 worldToClip)
         {
             if (!built || drawMat == null || cullShader == null) return;
             if (cascadeIndex < 0 || cascadeIndex >= cascadeCount) return;
             if (drawIdxBuf == null) return;
 
-            // 索引绘制：用 CommandBuffer.DrawProceduralIndirect 的【索引重载】，
-            //   indexBuffer = drawIdxBuf（静态单位缓冲 [0..clusterCount*384-1]，SV_VertexID = 0..N），
-            //   bufferWithArgs = argsBuf（BuildArgs 写好 5 个 uint，startIndexLocation 恒 0），
-            //   instanceCount = 1。shader 在 VS 里用 vid/384 取 _Visible 槽位、vid%384 取簇内角点，
-            //   再查 _Visible + _Indices + _Positions 还原几何（不再依赖任何跨缓冲拷贝）。
+            // 索引绘制：CommandBuffer.DrawProceduralIndirect 的【索引重载】——
+            //   indexBuffer = drawIdxBuf（compute 已按可见簇铺好全局顶点号），
+            //   bufferWithArgs = argsBuf（BuildArgs 写好 5 个 uint），instanceCount = 1。
             //   args 偏移 = 每级联 5 个 uint（20 字节）。
             // world→clip 不走 DrawProceduralIndirect 的 worldPose：自定义 HLSLPROGRAM 下它不喂内建矩阵
             //（恒为单位矩阵 ⇒ 全裁光），改为逐 draw 经 MaterialPropertyBlock 传自定义 _ClusterShadowW2C。
             if (m_mpb == null) m_mpb = new MaterialPropertyBlock();
             m_mpb.SetMatrix("_ClusterShadowW2C", worldToClip);
-            m_mpb.SetInt("_CascadeBase", cascadeIndex * clusterCount);
             cmd.DrawProceduralIndirect(drawIdxBuf, Matrix4x4.identity, drawMat, 0,
                 MeshTopology.Triangles, argsBuf, sizeof(uint) * 5 * cascadeIndex, m_mpb);
         }
@@ -412,6 +429,7 @@ namespace Cluster
             planesBuf?.Release(); cascadeParamBuf?.Release();
             visibleBuf?.Release(); counterBuf?.Release(); argsBuf?.Release();
             drawIdxBuf?.Release(); drawIdxBuf = null;
+            slotBuf?.Release(); slotBuf = null;
             posBuf = idxBuf = boundsBuf = null;
             planesBuf = cascadeParamBuf = visibleBuf = counterBuf = argsBuf = null;
             built = false;

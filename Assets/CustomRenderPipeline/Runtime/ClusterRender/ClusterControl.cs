@@ -19,9 +19,7 @@ namespace Cluster
 
             virtualAlbedo = Shader.PropertyToID("_VirtualAlbedo"),
             virtualNormal = Shader.PropertyToID("_VirtualNormal"),
-            virtualMask = Shader.PropertyToID("_VirtualMask"),
-            virtualEmission = Shader.PropertyToID("_VirtualEmission"),
-            virtualDetail = Shader.PropertyToID("_VirtualDetail");
+            virtualMask = Shader.PropertyToID("_VirtualMask");
 
 
         public static int VTFeedbackParamId => vTFeedbackParamId;
@@ -44,6 +42,14 @@ namespace Cluster
         /// </summary>
         public const int CutoffRenderingLayerBit = 29;
 
+        /// <summary>
+        /// 「由 Cluster 画 GBuffer」的物体专用 rendering layer 位（Renderer.renderingLayerMask 的位）。
+        /// 这些物体仍然保留 MeshRenderer（否则 SRP 阴影那条路会一起失效），只是 GBuffer pass
+        /// 用 FilteringSettings.renderingLayerMask 把它们剔出去，避免与 Cluster 重复绘制。
+        /// 只在 clusterMode 非 SRP 时打这个位；Scene 视图不清位 ⇒ 那里照旧走 SRP。
+        /// </summary>
+        public const int ClusterRenderingLayerBit = 28;
+
 
         /// <summary>当前生效的 Tile 轴数：useTileVT 关时为 1（旧路径，行为完全等价），开启时为 TilesPerAxis。</summary>
         public static int TilesPerAxisValue { get; set; } = 1;
@@ -51,8 +57,6 @@ namespace Cluster
         public static int VirtualAlbedo => virtualAlbedo;
         public static int VirtualNormal => virtualNormal;
         public static int VirtualMask => virtualMask;
-        public static int VirtualEmission => virtualEmission;
-        public static int VirtualDetail => virtualDetail;
     }
 
 

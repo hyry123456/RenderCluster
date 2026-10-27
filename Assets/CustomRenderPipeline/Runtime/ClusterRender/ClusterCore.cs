@@ -126,9 +126,9 @@ namespace Cluster
                 if (atlasSide > maxSide)
                 {
                     int allowed = Mathf.Max(1, (int)(maxSide / (long)cellSpan / mipsLevel));
-                    long gb = atlasSide * atlasSide * 4L * 5 / (1024L * 1024L * 1024L);
+                    long gb = atlasSide * atlasSide * 4L * 3 / (1024L * 1024L * 1024L);
                     Debug.LogError($"[RVT] 图集边长 {atlasSide} 超过 GPU 上限 {maxSide}" +
-                        $"（5 张约 {gb}GB，必然创建失败）。已临时把 CellCount {cellCount} 降为 {allowed}。" +
+                        $"（3 张约 {gb}GB，必然创建失败）。已临时把 CellCount {cellCount} 降为 {allowed}。" +
                         $"请到 assemble.asset 调小 CellSize / CellCount / Mips Level。");
                     cellCount = allowed;
                 }
@@ -141,8 +141,7 @@ namespace Cluster
                 // 必须绑成材质属性（不是纯全局纹理），Unity 才会沿用图集的 anisoLevel=8，
                 // 否则掠射角表面（桶身、地面）会丢各向异性过滤，比标准路径明显糊。
                 ClusterObject.ApplyAtlasTextures(
-                    tileTable._VirtualAlbedos, tileTable._VirtualNormals, tileTable._VirtualMasks,
-                    tileTable._VirtualEmisons, tileTable._VirtualDetails);
+                    tileTable._VirtualAlbedos, tileTable._VirtualNormals, tileTable._VirtualMasks);
 
                 // 图集一创建就把预览槽接上，不必等第一帧反馈跑完（否则 Play 的头几帧还是 Missing）
                 SyncDebugTex(asset, tileTable);
@@ -171,8 +170,6 @@ namespace Cluster
             Shader.SetGlobalTexture(ClusterProverty.VirtualAlbedo, tileTable._VirtualAlbedos);
             Shader.SetGlobalTexture(ClusterProverty.VirtualNormal, tileTable._VirtualNormals);
             Shader.SetGlobalTexture(ClusterProverty.VirtualMask, tileTable._VirtualMasks);
-            Shader.SetGlobalTexture(ClusterProverty.VirtualEmission, tileTable._VirtualEmisons);
-            Shader.SetGlobalTexture(ClusterProverty.VirtualDetail, tileTable._VirtualDetails);
 
             //GPU 请求压缩的 compute（compute shader 不能 Shader.Find，只能走 Resources 引用加载）
             if (feedbackCompactCS == null)
@@ -441,12 +438,6 @@ namespace Cluster
                     break;
                 case RVTDebugMode.Mask:
                     asset.rvtDebugTex = table._VirtualMasks;
-                    break;
-                case RVTDebugMode.Emission:
-                    asset.rvtDebugTex = table._VirtualEmisons;
-                    break;
-                case RVTDebugMode.Detail:
-                    asset.rvtDebugTex = table._VirtualDetails;
                     break;
             }
         }
@@ -720,30 +711,37 @@ namespace Cluster
                 buffer.ClearRenderTarget(true, true, Color.white);
                 buffer.DisableShaderKeyword("_FEED_BACK_DEBUG");
 
-
-                //设置该摄像机的物体排序模式，目前是渲染普通物体，因此用一般排序方式
-                var sortingSettings = new SortingSettings(camera)
-                {
-                    criteria = SortingCriteria.CommonOpaque
-                };
-
-                //第一次渲染只绘制GBuffer，且GBuffer仅渲染非透明
-                var drawingSettings = new DrawingSettings(
-                    feedbackTagId, sortingSettings
-                )
-                {
-                    enableDynamicBatching = true,
-                    enableInstancing = true,
-                };
-                var filteringSettings = new FilteringSettings(
-                    RenderQueueRange.opaque, renderingLayerMask: (uint)layerMask
-                );
-
+                // clusterMode 非 SRP 时，反馈也用 Cluster 画：与 GBuffer 共用同一份可见簇列表，
+                // 天然保证「请求的页 = 采样的页」（用两套几何画反馈/GBuffer 时它们是会分叉的）。
+                bool clusterDrawn = ClusterGBufferRenderer.HasInstance
+                    && ClusterGBufferRenderer.Instance.DrawFeedback(buffer);
                 ExecuteBuffer(buffer, context);
-                //进行渲染的执行方法
-                context.DrawRenderers(
-                    cullingResults, ref drawingSettings, ref filteringSettings
-                );
+
+                if (!clusterDrawn)
+                {
+                    //设置该摄像机的物体排序模式，目前是渲染普通物体，因此用一般排序方式
+                    var sortingSettings = new SortingSettings(camera)
+                    {
+                        criteria = SortingCriteria.CommonOpaque
+                    };
+
+                    //第一次渲染只绘制GBuffer，且GBuffer仅渲染非透明
+                    var drawingSettings = new DrawingSettings(
+                        feedbackTagId, sortingSettings
+                    )
+                    {
+                        enableDynamicBatching = true,
+                        enableInstancing = true,
+                    };
+                    var filteringSettings = new FilteringSettings(
+                        RenderQueueRange.opaque, renderingLayerMask: (uint)layerMask
+                    );
+
+                    //进行渲染的执行方法
+                    context.DrawRenderers(
+                        cullingResults, ref drawingSettings, ref filteringSettings
+                    );
+                }
 
                 //缩放纹理，并准备读入CPU
                 NewRequest(buffer);

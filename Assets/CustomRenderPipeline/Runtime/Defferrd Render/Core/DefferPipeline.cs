@@ -54,6 +54,10 @@ namespace CustomRenderPipline.DefferPipeline
         AmbientOcclusion ambientOcclusion = new AmbientOcclusion();
         ClusterCore clusterCore = new ClusterCore();
 
+        /// <summary>本帧 GBuffer 是否交给 Cluster 绘制（Game 摄像机 + 资产开关 + 数据就绪）。</summary>
+        /// <summary>本帧 GBuffer 是否由 Cluster 绘制（= clusterMode 非 SRP 且剔除已就绪）。</summary>
+        bool useCluster;
+
         bool RenderSSR
         {
             get
@@ -190,6 +194,9 @@ namespace CustomRenderPipline.DefferPipeline
             //否则 Persistent 分配的 NativeArray 与 ComputeBuffer 会在运行结束后被报内存泄漏
             if (clusterCore != null)
                 clusterCore.Cleanup();
+            // Cluster GBuffer 的 GPU 缓冲（顶点/索引/剔除）也必须显式释放
+            if (ClusterGBufferRenderer.HasInstance)
+                ClusterGBufferRenderer.Instance.Release();
             lighting?.Dispose();
             spaceReflect?.Dispose();
         }
@@ -229,6 +236,32 @@ namespace CustomRenderPipline.DefferPipeline
 
             GPUDravinSystem.Instance.SetUp(context, buffer, camera, width, height,
                 renderSetting);
+
+            // ===== Cluster 画 GBuffer：准备 + 一次剔除 =====
+            // 剔除结果（可见簇列表 + indirect args）本帧被 GBuffer 和 Feedback 共用，
+            // 所以必须在这里、在 RenderFeedback 之前 dispatch 完。
+            // 触发条件 = 同一个 clusterMode 开关（不允许 GBuffer 和阴影各走一半）。
+            // 只对 Game 摄像机生效：Scene 视图始终走 SRP，天然可作为 A/B 对照。
+            useCluster = false;
+            var gbuf = ClusterGBufferRenderer.HasInstance ? ClusterGBufferRenderer.Instance : null;
+            if (gbuf != null) gbuf.active = false;
+
+            var clusterAsset = ClusterControl.TryGetAssembleAsset();
+            if (camera.cameraType == CameraType.Game && clusterAsset != null
+                && clusterAsset.UseRVT && clusterAsset.clusterMode != ClusterMode.SRP
+                && clusterAsset.clusterGBuffer)
+            {
+                if (gbuf == null) gbuf = ClusterGBufferRenderer.Instance;
+                gbuf.debugForceAll = (clusterAsset.clusterMode == ClusterMode.ClusterDebug
+                    || clusterAsset.clusterForceAll) ? 1 : 0;
+                gbuf.active = true;
+                if (gbuf.Prepare(camera))
+                {
+                    gbuf.Cull(buffer);
+                    ExecuteBuffer();
+                    useCluster = true;
+                }
+            }
 
             if (camera.cameraType == CameraType.Game && ClusterControl.Instance.ClusterAssembleAsset.UseRVT)
             {
@@ -346,10 +379,21 @@ namespace CustomRenderPipline.DefferPipeline
             filteringSettings = new FilteringSettings(
                 RenderQueueRange.opaque, renderingLayerMask: (uint)renderingLayerMask);
 
+            // Cluster 接管 GBuffer 的物体：从 SRP 绘制里剔出去（不 Disable MeshRenderer，
+            // 否则 SRP 阴影那条路会一起失效）。
+            bool clusterDraw = useCluster && ClusterGBufferRenderer.Instance.IsReady;
+            if (clusterDraw)
+                filteringSettings.renderingLayerMask &=
+                    ~(1u << ClusterProverty.ClusterRenderingLayerBit);
+
             //进行渲染的执行方法
             context.DrawRenderers(
                 cullingResults, ref drawingSettings, ref filteringSettings
             );
+
+            // 簇绘制（逐组间接绘制，几何由 GPU 从簇缓冲还原）
+            if (clusterDraw && ClusterGBufferRenderer.Instance.DrawGBuffer(buffer))
+                ExecuteBuffer();
 
             // 几何由上面的 context.DrawRenderers(cullingResults) 走 SRP 绘制；
             // 纹理精度由 RVT / Tile-VT 保证。

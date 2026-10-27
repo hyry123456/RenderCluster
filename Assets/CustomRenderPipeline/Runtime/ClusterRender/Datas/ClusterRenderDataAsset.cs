@@ -117,7 +117,7 @@ namespace Cluster
         {
             get
             {
-                return new TextureMapNode(albedo, normal, pbrData, emission, detail);
+                return new TextureMapNode(albedo, normal, pbrData, emission);
             }
         }
 

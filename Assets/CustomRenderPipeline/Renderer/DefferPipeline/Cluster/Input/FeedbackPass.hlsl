@@ -25,26 +25,24 @@ Varyings_Simple VertexSimple (Attributes_Simple input) {
 	return output;
 }
 
-float4 fragSimple (Varyings_Simple input) : SV_Target
+// 反馈色（= 编码后的 pageId）。
+// 抽成独立函数：MeshRenderer 路径（fragSimple）和簇实例化路径（ClusterGBuffer.shader 的
+// Feedback pass）必须用【同一份】编码，否则请求的页 ≠ 采样的页。
+float4 FeedbackColor (float2 baseUV)
 {
-	// float2 uv = i.uv;
-	UNITY_SETUP_INSTANCE_ID(input);
 	//【必须乘 T】mip 选择按【虚拟贴图总分辨率】算 = CellSize × 每轴 tile 数。
 	//只用 CellSize：T>1 时 texel 密度被低估 T 倍 → 少算 log2(T) 级 mip
 	//（T=4 少算 2 级）→ 每帧都为中远距离像素申请最高分辨率页，
 	//把本就按 T² 缩水的页池打爆 → LRU 抖动 → 整体变糊（"开了 Tile 反而看不清"的真因之一）。
 	//T=1 时本式与旧写法完全等价，零回归。
-	float2 uv = input.baseUV * (_VTFeedbackParam.y * (float)max(1, _TilesPerAxis));
+	float2 uv = baseUV * (_VTFeedbackParam.y * (float)max(1, _TilesPerAxis));
 	float2 dx = ddx(uv);
 	float2 dy = ddy(uv);
 
-	//w是偏差值，用来调整Mips的选择情况，z是mips1的最大等级-1
-	// uint mip = clamp(uint(_VTFeedbackParam.x * log2(max(dot(dx, dx), dot(dy, dy))) + 1.0 - 
-	// 	_VTFeedbackParam.x + _VTFeedbackParam.w), 0, _VTFeedbackParam.z);
 	//w是偏差值（mipsOffset，默认0），z是最大mip等级-1
 	//【已删除原公式的常数项 +1.0 - _VTFeedbackParam.x】——它让 1:1 距离算出 0.873，
 	//使 95% 权重落在半分辨率的 level1（永久糊一级）。详见 ClusterPass.hlsl 的说明。
-	//【必须用短轴(min)】ClusterPass 现在按短轴选 mip 再做长轴多 tap；这里若还用 max，
+	//【必须用短轴(min)】ClusterPass 按短轴选 mip 再做长轴多 tap；这里若还用 max，
 	//就变成「请求粗页、采样细页」→ 采到未分配的页，画面串色/黑块。两处绑定必须完全一致。
 	float lenX = length(dx), lenY = length(dy);
 	float2 minorVec = (lenX < lenY) ? dx : dy;
@@ -67,7 +65,7 @@ float4 fragSimple (Varyings_Simple input) : SV_Target
 	//整片被一张 tile 拉伸铺满（法线尤其明显：整面朝向由这一张 tile 决定，看起来"方向全错"）。
 	//frac 对负数同样返回 [0,1)（x-floor(x)），所以 tiling 偏移也安全。
 	//T=1 时 frac(baseUV)*1 再 frac 与原写法完全等价，零回归。
-	float2 wrappedBaseUV = frac(input.baseUV);
+	float2 wrappedBaseUV = frac(baseUV);
 	float2 tileUV = wrappedBaseUV * (float)T;
 	uint tileX = (uint)clamp(floor(tileUV.x), 0.0, (float)(T - 1u));
 	uint tileY = (uint)clamp(floor(tileUV.y), 0.0, (float)(T - 1u));
@@ -79,7 +77,12 @@ float4 fragSimple (Varyings_Simple input) : SV_Target
 	uint a = (pageId >> 24) & 255u;
 	return float4((float)r / 255.0, (float)g / 255.0, (float)b / 255.0, (float)a / 255.0);
 #endif
-	// return float4(0, 0, 0, 1);
+}
+
+float4 fragSimple (Varyings_Simple input) : SV_Target
+{
+	UNITY_SETUP_INSTANCE_ID(input);
+	return FeedbackColor(input.baseUV);
 }
 
 #endif
