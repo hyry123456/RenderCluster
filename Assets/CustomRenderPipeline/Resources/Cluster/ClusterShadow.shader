@@ -27,14 +27,14 @@
 //
 // 所以本 shader 只管 mul(_ClusterShadowW2C, worldPos)，矩阵正确性与一致性由 C# 侧保证。
 //
-// ❌ 之前踩的坑：手工把 proj*view 的 z 行改写成 0.5*w行 - 0.5*z行（推测性推导，已证错）。
 //
-// ── 数据布局（C# 侧 ClusterShadowRenderer.Rebuild / Gather 摊平）──
-//   _Positions —— float3，世界空间顶点（已经按簇内唯一顶点去重，每簇只存唯一顶点）。
-//   索引绘制下不再需要 _Indices / _Visible / _ClusterBase：索引缓冲（drawIdxBuf）里
-//   存的【就是全局顶点号】，VS 直接用 SV_VertexID（= 索引值 + baseVertex）取 _Positions。
-//   GPU 后变换缓存以【索引值】为键 ⇒ 被多个三角形共享的顶点只跑一次顶点着色器
-//   （每簇顶点负荷从 384 降到 ~唯一顶点数，约 6× 减少）。
+// ── 数据布局（C# 侧 ClusterShadowRenderer.Rebuild 摊平）──
+//   _Positions —— float3 世界空间顶点
+//   索引缓冲是【静态单位缓冲 [0..N]】（drawIdxBuf），SV_VertexID = vid = 0..N；
+//   VS 用 vid/384 取 _Visible 槽位、vid%384 取簇内角点：
+//     cluster = _Visible[_CascadeBase + vid/384]  → 真实簇号
+//     gvid    = _Indices[cluster*384 + vid%384]   → 全局顶点号
+//     pos     = _Positions[gvid]
 Shader "Hidden/ClusterShadowCaster"
 {
     SubShader
@@ -82,15 +82,18 @@ Shader "Hidden/ClusterShadowCaster"
             #define TRIS_PER_CLUSTER 128
 
             StructuredBuffer<float3> _Positions;   // 世界空间顶点（烘焙时乘好世界矩阵）
+            StructuredBuffer<int>   _Indices;      // 全局顶点号（源码），每簇固定 384 个（= 128 三角形×3）
+            StructuredBuffer<uint>  _Visible;      // [cascadeBase + slot] = 可见簇下标（compute 产出的紧凑列表）
             // 自定义 world→clip 矩阵（= proj*view），由 C# 经 MaterialPropertyBlock 逐 draw 显式传入。
             // ⚠️ 不用内建 UNITY_MATRIX_M/V：自定义 HLSLPROGRAM 在 DrawProceduralIndirect 下
             // 内建矩阵不被 worldPose 可靠喂入（会恒为单位/零矩阵 ⇒ 全裁光）。见 shader 顶部注释。
             float4x4 _ClusterShadowW2C;
+            uint     _CascadeBase;                 // = 级联下标 × 簇数，定位 _Visible 里本联的紧凑段
 
             struct Attributes
             {
-                // 索引绘制下 SV_VertexID = 索引值（+baseVertex）= 全局顶点号。
-                // 索引缓冲由 compute 的 Gather 核写入，内容就是 _Positions 的全局下标。
+                // 单位索引导下 SV_VertexID = 0,1,2,...,N（索引缓冲是 [0..N] 的静态单位缓冲）。
+                // 用它推出"第几个可见簇 + 簇内第几个角点"，再查 _Visible + _Indices 得全局顶点号。
                 uint vertexID : SV_VertexID;
             };
 
@@ -101,10 +104,21 @@ Shader "Hidden/ClusterShadowCaster"
 
             Varyings vert(Attributes i)
             {
-                // 直接按索引值取顶点：GPU 后变换缓存以"索引值"为键，
-                // 多个三角形引用同一顶点时只跑一次顶点着色器。
-                // 顶点变换用 _ClusterShadowW2C（= proj*view，由 C# 每级联经 MaterialPropertyBlock 显式传入）。
-                float3 p = _Positions[i.vertexID];
+                // 顶点还原（替代原"索引缓冲预拼全局顶点号"的做法）：
+                //   本方案把"拼索引"从 compute 移到 VS，彻底去掉 Raw→Index 跨类型拷贝这座桥。
+                //   vid     = 0..可见簇数×384-1
+                //   slot    = vid / 384        → 第几个可见簇（_Visible 里的紧凑槽位）
+                //   corner  = vid % 384        → 簇内第几个角点
+                //   cluster = _Visible[cascadeBase + slot]   → 真实簇号
+                //   gvid    = _Indices[cluster*384 + corner]  → 全局顶点号
+                //   pos     = _Positions[gvid]
+                uint perCluster = (uint)TRIS_PER_CLUSTER * 3u;
+                uint vid    = i.vertexID;
+                uint slot   = vid / perCluster;
+                uint corner = vid % perCluster;
+                uint clusterID = _Visible[_CascadeBase + slot];
+                uint gvid   = (uint)_Indices[(int)(clusterID * perCluster + corner)];
+                float3 p = _Positions[gvid];
 
                 Varyings o;
                 o.pos = mul(_ClusterShadowW2C, float4(p, 1.0));

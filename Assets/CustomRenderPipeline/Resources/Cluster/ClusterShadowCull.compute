@@ -1,68 +1,36 @@
-// 【真正的 cluster 管线】阴影用的逐簇 GPU 剔除。
+// 【cluster 管线】阴影用的逐簇 GPU 剔除。
 //
-// ── 为什么需要它 ──
-// 不做剔除时 instanceCount = 全部簇数，Frame Debugger 里是 N 条 Draw Procedural，
-// 顶点着色器要把整个场景的顶点全部跑一遍（哪怕 95% 在视锥外被硬件裁掉）。
-// 剔除之后每级联只提交【真正落在该级联视锥里的簇】，顶点数大幅下降。
+// 一次 dispatch 剔完【所有级联】：
+//   Reset    （1 组，清零计数器）
+//   CullAll  （每簇一线程，内部循环所有级联做球-平面视锥剔除，可见簇原子追加进 _Visible）
+//   BuildArgs（每级联一线程，写 indirect args）
+// ⇒ 整帧 3 个 dispatch + 每级联 1 次间接绘制。级联被压进 shader 内循环，而非每级联一次 dispatch。
 //
-// ── 一次 dispatch 剔完【所有级联】 ──
-//     Reset    （1 个线程组，纯清零）
-//     CullAll  （每线程一个簇，内部循环所有级联，各判一次）
-//     BuildArgs（每线程一个级联，写 indirect args）
-//   ⇒ 整个阴影总共 3 个 dispatch + 每级联 1 次 indirect draw。
-// 为什么必须「每级联判一次」：4 个级联是 4 个不同的正交视锥 + 4 张不同的图，
-// 一个簇在级联 0 可见、在级联 3 可能完全在外面。合并的是 dispatch 次数，不是判定次数。
+// 数据链路：compute 只产出可见簇 ID 列表 _Visible（UAV 可写、无需跨缓冲拷贝）；
+// 绘制时由 shader 在 VS 里查 _Visible + _Indices + _Positions 还原几何；
+// 索引缓冲退化为一次创建、永不再写的静态单位缓冲。
 //
-// ── 平面空间的确定（历史上踩过坑）──
-// 用 GeometryUtility.CalculateFrustumPlanes(viewProj) —— 官方文档保证返回【世界空间】平面。
-// 不要再用 ShadowSplitData.GetCullingPlane：它返回的空间官方没写明，
-// 之前实测把整个世界都剔掉了（可见簇恒为 0）。
-//
-// ⚠️ buffer 绑定是【按 kernel】的：SetComputeBufferParam(cs, kernelIndex, ...)
-//    只对该 kernel 生效。一个 buffer 被多个 kernel 用（下面 _Counter 同时被
-//    Reset / CullAll / BuildArgs 读写，_Visible 被 CullAll 读写），
-//    必须逐个 kernel 绑全 —— 漏绑的那个 dispatch 直接失效，
-//    症状是「间接绘制 instanceCount=0、什么都不画、且不一定有明确报错」。
-
+// 剔除口径：每级联 worldToClip = GL.GetGPUProjectionMatrix(proj,true)*view（与绘制侧逐位一致），
+// 用其 6 个世界空间视锥平面与簇包围球做球-平面测试，不漏不重。
+// 坑：裸 proj*view 在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除；cullingSphere 球-球测试是级联内含球 ⇒ 漏四角。
 #pragma kernel Reset
 #pragma kernel CullAll
 #pragma kernel BuildArgs
-#pragma kernel Gather
-#pragma kernel ProbePositions
 
 StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=半径
 
-// 每级联 _PlanesPerCascade 个平面，按 [cascade * _PlanesPerCascade + i] 排布（世界空间）。
-StructuredBuffer<float4> _Planes;
-// 每级联一个参数：(projScale, targetTexels, planeCount, _MaxLod)
-//   projScale     = 该级联 proj[1][1]（世界→阴影空间 z 的归一化尺度）
-//   targetTexels  <= 0 表示【不做 LOD 判据】（当前只有 LOD0，判了也没得选）
+// 每级联 6 个世界空间视锥平面（来自 GeometryUtility.CalculateFrustumPlanes(worldToClip)）。
+// worldToClip 与绘制侧 GL.GetGPUProjectionMatrix(proj,true)*view 逐位一致。
+StructuredBuffer<float4> _Planes;   // 长度 = maxCascade * 6
+// 每级联一个参数：(projScale, targetTexels, 未用, _MaxLod)
 StructuredBuffer<float4> _CascadeParams;
 
-RWStructuredBuffer<uint> _Visible;                // [cascade * _ClusterCount + slot] = 簇下标
+RWStructuredBuffer<uint> _Visible;                // [cascade * _ClusterCount + slot] = 簇下标（可见簇的紧凑列表）
 RWStructuredBuffer<uint> _Counter;                // [cascade] = 该级联可见簇数
 RWStructuredBuffer<uint> _Args;                   // [cascade * 5 + 0..4] = 索引间接绘制 args
 
-// 索引绘制改造（2026-10-24）：把每级联可见簇拼接成一段【真实索引缓冲】，
-// 交给 DrawProceduralIndirect，让 GPU 后变换缓存按【索引值】做键去重顶点。
-StructuredBuffer<int>   _Indices;                // 全局顶点号（源码），每簇固定 384 个
-// ⚠️ drawIdxBuf 在 C# 侧用 Target.Raw 创建 ⇒ 这里必须声明成 RWByteAddressBuffer（按字节地址写），
-//    不能写成 RWStructuredBuffer<int>（Raw 缓冲在 HLSL 里是 ByteAddressBuffer，类型不匹配会写入静默丢弃→全0）。
-RWByteAddressBuffer     _DrawIndices;            // 逐级联 gather 出的索引，直接写入 drawIdxBuf（Index|Raw 两用缓冲），绘制时当索引缓冲读
-// [诊断探针] 普通 ComputeBuffer（GetData 已被证明可靠），用于确定 Gather 内核是否真正执行：
-//   Reset 清零，Gather 任一写入线程置 1。若回读为 1 说明 Gather 跑了（问题在写入目标/拷贝）；为 0 说明 Gather 没跑（派发/绑定 bug）。
-RWStructuredBuffer<uint> _GatherProbe;
-int _CascadeIndex;                               // Gather 针对的级联下标
-
-// [诊断] 位置探针：验证 GPU 端对 _Positions（float3 StructuredBuffer，stride 12）的读取是否正确。
-// GPU 按【索引值】去 _Positions 取世界坐标并回写，C# 侧用 allPosArray[allIdxArray[t]] 算期望值逐分量比对。
-// 不一致 ⇒ stride / 去重映射 / 缓冲绑定有问题（画面表现：几何整体错位，尤其高度明显偏飞）。
-StructuredBuffer<float3> _Positions;
-RWStructuredBuffer<float4> _PosProbe;
-
 int _CascadeCount;
 int _ClusterCount;
-int _PlanesPerCascade;
 int _MaxLod;                                     // 当前可用 LOD 级数（只有 LOD0 ⇒ 1）
 int _TrisPerCluster;
 int _DebugForceAll;                              // 非 0 = 跳过所有剔除，全可见（排查用）
@@ -72,7 +40,6 @@ int _DebugForceAll;                              // 非 0 = 跳过所有剔除�
 void Reset(uint3 id : SV_DispatchThreadID)
 {
     if ((int)id.x < _CascadeCount) _Counter[id.x] = 0;
-    if (id.x == 0) _GatherProbe[0] = 0;          // [诊断] 每帧清零探针
 }
 
 [numthreads(64, 1, 1)]
@@ -94,29 +61,30 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 
         if (_DebugForceAll == 0)
         {
-            // ---- 1. 视锥剔除：包围球 vs 该级联的 6 个世界空间平面 ----
-            // dot(n, p) + d >= 0 在内侧 ⇒ 球完全在外侧时 dot + d < -radius
-            int pc = (int)cp.z;
-            int baseIdx = k * _PlanesPerCascade;
-            for (int i = 0; i < pc; i++)
+            // 视锥平面剔除（球-平面）：簇包围球 vs 该级联 6 个世界空间平面。
+            // 平面约定（Unity Plane）：xyz=法线(指向视锥内)，w=到原点带符号距离；
+            // 球在视锥内 ⇔ 对全部 6 平面 dot(pl.xyz, center)+pl.w >= -radius。
+            bool outside = false;
+            for (int p = 0; p < 6; p++)
             {
-                float4 pl = _Planes[baseIdx + i];
-                if (dot(pl.xyz, center) + pl.w < -radius) { ok = false; break; }
+                float4 pl = _Planes[k * 6 + p];
+                if (dot(pl.xyz, center) + pl.w < -radius) { outside = true; break; }
             }
+            if (outside) ok = false;
 
-            // ---- 2. LOD 选择（仅当 targetTexels > 0 且有多级 LOD 时才有意义）----
+            // LOD 选择（仅当 targetTexels > 0 且有多级 LOD 时才有意义）
             if (ok && cp.y > 0.0 && _MaxLod > 1)
             {
-                float texelRadius = radius * cp.x;  // 该簇投影到阴影图上的半径（texel）
+                float texelRadius = radius * cp.x;
                 float target = cp.y;
-                if (texelRadius > target)             ok = (lod == 0);
-                else if (texelRadius * 2.0 <= target) ok = (lod == _MaxLod - 1);
+                if (texelRadius > target)              ok = (lod == 0);
+                else if (texelRadius * 2.0 <= target)  ok = (lod == _MaxLod - 1);
             }
         }
 
         if (!ok) continue;
 
-        // ---- 3. 原子追加进该级联的紧凑列表 ----
+        // 原子追加进该级联的紧凑列表
         uint slot;
         InterlockedAdd(_Counter[k], 1u, slot);
         if ((int)slot < _ClusterCount)
@@ -128,6 +96,8 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 //   [0]=indexCount(本级联可见簇 × 每簇 384 索引)
 //   [1]=instanceCount（固定 1：单实例，索引缓冲已内含全部可见簇）
 //   [2]=startIndexLocation  [3]=baseVertexLocation  [4]=startInstanceLocation
+// 注意：索引缓冲是单位缓冲（[0,1,2,...,N]），SV_VertexID = 0..N；shader 用 vid/384 取
+// _Visible 槽位、vid%384 取簇内角点，自行查 _Indices 得全局顶点号。故 indexCount 仍是可见簇数×384。
 [numthreads(8, 1, 1)]
 void BuildArgs(uint3 id : SV_DispatchThreadID)
 {
@@ -137,58 +107,7 @@ void BuildArgs(uint3 id : SV_DispatchThreadID)
     uint perCluster = (uint)_TrisPerCluster * 3u;
     _Args[k * 5 + 0] = (uint)_Counter[k] * perCluster;          // indexCount
     _Args[k * 5 + 1] = 1;                                     // instanceCount
-    _Args[k * 5 + 2] = k * _ClusterCount * perCluster;         // startIndexLocation = 本级联在 _DrawIndices 里的偏移
+    _Args[k * 5 + 2] = 0;                                     // startIndexLocation
     _Args[k * 5 + 3] = 0;                                     // baseVertexLocation
     _Args[k * 5 + 4] = 0;                                     // startInstanceLocation
-}
-
-// 把某个级联的可见簇索引拼接到 _DrawIndices（compute 临时缓冲）的【独立偏移段】：
-//   每线程负责一个可见簇（slot），内部循环把该簇的 384 个全局顶点号
-//   依次写入 _DrawIndices[(cascade*簇数 + slot)*384 + corner]。
-// 每个级联写到自己不重叠的段，绘制时只读自己那段。
-//
-// ⚠️ 为什么每级联独立偏移：让每个 draw 的 startIndexLocation 指向正确段、永不被其他级联数据覆盖。
-//   注：drawIdxBuf 是 Index|Raw 两用缓冲，compute 直接写、绘制直接读（无 CopyBuffer），
-//   偏移段仅用于让各 draw 通过 startIndexLocation 读取各自段，互不重叠。
-//
-// ⚠️ 派发规模按"簇数"：每线程一个簇 ⇒ 线程组数 = 簇数/64，与 CullAll 同量级，不超 GPU 65535 上限。
-[numthreads(64, 1, 1)]
-void Gather(uint3 id : SV_DispatchThreadID)
-{
-    uint slot = id.x;
-    uint count = _Counter[_CascadeIndex];
-    if (slot >= count) return;
-    uint perCluster = (uint)_TrisPerCluster * 3u;
-    uint base = _CascadeIndex * _ClusterCount * perCluster;   // 本级联在 _DrawIndices 里的起始偏移
-    uint c = _Visible[_CascadeIndex * _ClusterCount + slot];
-
-    // [诊断] slot0 把"即将写入 _DrawIndices 的前 7 个索引值"镜像到探针：
-    //   合理值(全局顶点号 < 顶点总数) ⇒ RWByteAddressBuffer.Store 真把数据写进了 drawIdxBuf；
-    //   0/乱码 ⇒ Store 未生效(绑定/格式问题)。
-    if (slot == 0)
-    {
-        _GatherProbe[0] = perCluster;
-        for (uint t = 0; t < 7 && t < perCluster; t++)
-            _GatherProbe[1 + t] = asuint(_Indices[c * perCluster + t]);
-    }
-
-    // Raw 缓冲按【字节】寻址：元素角标 × 4 才是字节偏移；值用 asuint 原样按位写入。
-    for (uint corner = 0; corner < perCluster; corner++)
-        _DrawIndices.Store((base + slot * perCluster + corner) * 4,
-                           asuint(_Indices[c * perCluster + corner]));
-}
-
-// [诊断] 位置探针（1 个线程）：取全量索引缓冲区最前面 4 个索引，
-// 按"索引值 = 全局顶点号"的约定去 _Positions 读世界坐标，回写供 CPU 比对。
-// 这一步把"到底能不能按索引从 _Positions 里取到正确的世界坐标"单独验证出来，
-// 与 SV_VertexID 语义、剔除、Gather 都无关，是全链路里最底层的一环。
-[numthreads(1, 1, 1)]
-void ProbePositions(uint3 id : SV_DispatchThreadID)
-{
-    for (uint q = 0; q < 4; q++)
-    {
-        int gi = _Indices[q];          // 全量索引的前 4 个
-        float3 wp = _Positions[gi];    // 按索引直接寻址，模拟顶点着色器的取值行为
-        _PosProbe[q] = float4(wp, 1.0);
-    }
 }

@@ -1,6 +1,6 @@
 # CustomRenderPipeline 项目说明
 
-> 这是一个 **自定义延迟渲染管线（Custom Deferred Render Pipeline）**，当前开发重点为 **RVT（Runtime Virtual Texturing，运行时虚拟贴图）**。
+> 这是一个 **自定义延迟渲染管线（Custom Deferred Render Pipeline）**，当前两大子系统为 **RVT（Runtime Virtual Texturing，运行时虚拟贴图）** 与 **Cluster 阴影（自定义逐簇 GPU 剔除阴影）**。
 > 非 RVT 子系统（后处理、粒子、水面、地形、渲染特效等）已归档到项目根目录 `_Disabled/`，
 > 归档清单与回退方式见同级 `ARCHIVE_NOTE.md`。
 
@@ -84,3 +84,69 @@
 - 后处理、粒子、水面、地形等已归档，未参与当前 RVT 测试。
 
 > 后续若对 RVT 流程、调参或模块结构做修改，请同步更新本文件的「RVT」小节。
+
+---
+
+## Cluster 阴影（自定义逐簇 GPU 剔除阴影）
+
+> 方向光阴影的三条路径由资产 `clusterShadowMode` 切换：**SRP(0)** / **Cluster(1)** / **ClusterDebug(2)**。
+> 当前场景的 alpha 镂空投射物（草 / 蕨 / 灌木）不烘焙进 Cluster，由 `Shadows.cs` 在 cluster 绘制之后用 SRP 路径单独补画（见下「cutout 分流」）。
+
+### 1. 三条路径的分工
+| 模式 | 走什么 | 说明 |
+|------|--------|------|
+| SRP(0) | `GPUDravinSystem.DrawShadows` + `context.DrawShadows` | Unity 原生 ShadowCaster，逐物体剔除 + SRP Batcher；BRG/RVT 阴影也在此档。 |
+| Cluster(1) | 只跑 `cluster.Draw` | GPU 逐簇剔除 + 每级联一次 `DrawProceduralIndirect`；彻底不跑 `GPUDravinSystem` / `context.DrawShadows`（用户选纯 Cluster 时即丢弃 BRG/RVT 阴影）。 |
+| ClusterDebug(2) | 同 Cluster | 与 Cluster 完全相同的绘制路径（早期版本的 CPU 侧 `VerifyCulling` 已在 debug 清理中移除，当前不做额外 CPU 验证）。 |
+
+### 2. 整体流程（Cluster / ClusterDebug）
+- 每帧 **3 个 compute dispatch** 一次性剔完【所有级联】：
+  1. `Reset`：1 个线程组，清零 `_Counter`。
+  2. `CullAll`：每簇一线程，循环所有级联做球-平面视锥剔除，可见簇原子追加进 `_Visible`。
+  3. `BuildArgs`：每级联一线程，写 indirect args。
+  - ⇒ 4 个级联 = **3 次 dispatch**（不是 4 次），因为级联被压进 `CullAll` 的 shader 内循环里。
+- 每级联一次 `DrawProceduralIndirect`（共 4 次 draw），4 个级联的视口 + 矩阵 + 间接绘制全部累积进【同一个 CommandBuffer】，循环外只 `ExecuteBuffer()` 一次 → 材质 `PrepareKeywords` 从 4× 降到 1×。
+- **LOD**：当前只画 LOD0（`_MaxLod=1` 守卫；4 级 LOD 是同一表面的 4 份几何，叠加会 z-fighting）。
+- **cutout 分流**：`ClusterRenderDataAsset.NeedsSRPShadow = cutoff || clipping` 的物体在 `ScanScene` 里被 `continue` 跳过（不烘焙进 Cluster，这是性能收益来源），并由 `ClusterObject.OnEnable` 给 Renderer 打 `renderingLayerMask` bit29（CutoffRenderingLayerBit）；`Shadows.cs` 在 cluster 绘制之后临时把灯光掩码切成 bit29 单独跑一次 `context.DrawShadows`。无 cutout 物体时 `HasCutoffCasters()` 为 false ⇒ 整段跳过、零开销。
+
+### 3. 数据布局（静态场景，世界空间摊平）
+| 缓冲 | 内容 |
+|------|------|
+| `_Positions` | float3 世界空间顶点 |
+| `_Indices` | int32 全局顶点号，每簇固定 384（= 128 三角形 × 3） |
+| `_Visible` | compute 写出的可见簇紧凑列表 `[cascade * 簇数 + slot] = 簇下标` |
+| `drawIdxBuf` | **静态单位缓冲** `[0..N]`，创建时写入后永不再写 |
+| `argsBuf` | indirect args，必须 `ComputeBufferType.IndirectArguments`（否则运行报 "missing IndirectArguments flag"） |
+
+- 索引缓冲是**静态单位缓冲**：compute 只产出可见簇列表 `_Visible`（RWStructuredBuffer，UAV 可写、无跨缓冲拷贝）；绘制时由 shader 在 VS 里用 `SV_VertexID` 查 `_Visible + _Indices + _Positions` 还原几何。
+- ⚠️ 坑：**D3D11 下 Index 缓冲不能当 compute UAV 写**，故绝不能让 compute 直接写本缓冲（会静默丢弃）；这正是改为「compute 只写 `_Visible`、VS 查表」的原因。
+
+### 4. 矩阵与剔除口径（正确性关键）
+- 自定义 HLSLPROGRAM 在 `DrawProceduralIndirect` 下**不走 `SetViewProjectionMatrices`**，内建矩阵 `UNITY_MATRIX_M / VP` 恒为单位/零矩阵 ⇒ 几何以世界坐标当裁剪坐标，全被裁光 ⇒ 阴影图全空、零报错。
+  - 故 `worldToClip` 由 C# 经 **`MaterialPropertyBlock` 逐 draw** 传自定义属性 `_ClusterShadowW2C`（`drawMat.SetMatrix` / `SetGlobalMatrix` 会因 4 级联共享而全拿到最后一次值，必须避免）。
+- `worldToClip = GL.GetGPUProjectionMatrix(proj, true) * view`（与 SRP `TransformWorldToHClip` 逐位一致）。**裸 `proj*view` 在 D3D reversed-Z 下 NDC z 大量越界 ⇒ 阴影图全空、零报错**。
+- 剔除口径：每级联用与绘制**同一矩阵**提 6 个世界空间平面（`GeometryUtility.CalculateFrustumPlanes(worldToClip)`），对簇世界空间包围球做球-平面测试。
+  - ❌ 裸 `proj*view` 提平面：D3D reversed-Z 下近/远平面算反 ⇒ 过剔除（全图无阴影）。
+  - ❌ `ShadowSplitData.cullingSphere` 球-球测试：该球是级联**内含球**、比真实视锥小 ⇒ 漏四角/边缘簇（大面积缺阴影）。
+  - ✅ 与渲染同一矩阵提的平面：口径完全一致、不漏不重。
+
+### 5. 关键文件
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| 渲染器 | `Runtime/ClusterRender/ClusterShadowRenderer.cs` | 场景登记、`Rebuild` 几何摊平、3 dispatch 剔除、逐级联间接绘制 |
+| 剔除 compute | `Resources/Cluster/ClusterShadowCull.compute` | `Reset` / `CullAll` / `BuildArgs` 三 kernel，逐簇 GPU 剔除 |
+| 阴影 shader | `Resources/Cluster/ClusterShadow.shader` | VS 查 `_Visible+_Indices+_Positions` 还原几何，只写深度（不采任何贴图） |
+| 调度接入 | `Runtime/Core/Shadows.cs` | 按 `clusterShadowMode` 分派；Cluster 模式累积绘制到单 CommandBuffer |
+
+### 6. 调试开关
+- `ClusterAssembleAsset.clusterShadowForceAll`（bool）：true ⇒ compute 跳过剔除、强制全可见（`debugForceAll=1`），用于隔离「剔除错」vs「绘制链坏」。
+- `clusterShadowMode`：0/1/2 切换三条路径（见第 1 节）。
+
+### 7. 如何测试 / 排错
+1. `assemble.asset` 把 `clusterShadowMode` 设 1（Cluster）或 2（ClusterDebug），进 Play。
+2. 预期：方向光阴影正常、级联过渡无镂空缺口；与 SRP 模式（=0）同屏对比应一致（草地等 cutout 走 SRP 补画）。
+3. **整张阴影图空、零报错** → 先查 `worldToClip` 是否套了 `GetGPUProjectionMatrix`；再查 `argsBuf` 是否 `IndirectArguments` 类型、`drawIdxBuf` 是否为 `[0..N]` 单位缓冲。
+4. **大面积缺阴影** → 查剔除口径（是否误用 `proj*view` 提平面，或用了 `cullingSphere` 球-球测试而非世界空间 6 平面）。
+5. **位置探针全绿但阴影仍空** → 典型是矩阵 / 间接绘制链路问题（见第 4 节），不是剔除本身。
+
+> 后续若对 Cluster 阴影的剔除口径、数据布局或调度方式做修改，请同步更新本小节。

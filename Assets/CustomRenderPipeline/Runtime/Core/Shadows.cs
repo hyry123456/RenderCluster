@@ -17,8 +17,6 @@ namespace CustomRenderPipline
 		/// <summary>「自动把 BRG 批次专用 layer 从灯光 Culling Mask 移除」只警告一次。</summary>
 		static bool s_warnedBRGCullLayer;
 
-		static bool s_loggedCasters;
-
 		static string[] directionalFilterKeywords = {
 			"_DIRECTIONAL_PCF3",
 			"_DIRECTIONAL_PCF5",
@@ -116,7 +114,7 @@ namespace CustomRenderPipline
 		/// 所以 BRG 拿到的是【上一帧】的球（静态物体无差别；半径另留 25% 余量）。
 		/// </summary>
 
-		/// <summary>	/// ׼ӰݣһЩ	/// </summary>
+		/// <summary>初始化本帧阴影渲染所需的上下文（渲染上下文 / 剔除结果 / 阴影设置）。</summary>
 		public void Setup(
 			ScriptableRenderContext context, CullingResults cullingResults,
 			ShadowSetting settings
@@ -125,12 +123,6 @@ namespace CustomRenderPipline
 			this.context = context;
 			this.cullingResults = cullingResults;
 			this.settings = settings;
-
-			// 【一次性诊断】放在 Setup 最开头：Setup 每帧必跑且不依赖有没有阴影光源，
-			// 只要 `Shadows` 这个类活着就一定会触发。之前放在 RenderDirectionalShadows 里
-			// 出现过"没有任何输出"的情况，换到这里 + 改成 LogWarning（黄色更好找）+ try/catch
-			// （万一统计里抛异常也不能把渲染打断）。
-			DumpShadowCasterMaterials();
 
 			shadowedDirLightCount = shadowedOtherLightCount = 0;
 			useShadowMask = false;
@@ -146,8 +138,8 @@ namespace CustomRenderPipline
             ExecuteBuffer();
 		}
 
-		/// <summary>	/// עֱӹӰжϸֱӹǷ֧Ӱ	/// </summary>
-		/// <returns>ӰǿȣͼƬʼλãnormalBaisӰͨ(決Ӱ)</returns>
+		/// <summary>为方向光预留阴影图空间，并判断该光源是否支持阴影。</summary>
+		/// <returns>阴影强度、图集瓦片索引（cascadeCount × 已登记数）、normalBias、阴影遮罩通道；不支持时返回 (0,0,0,-1)。</returns>
 		public Vector4 ReserveDirectionalShadows(
 			Light light, int visibleLightIndex
 		)
@@ -239,7 +231,7 @@ namespace CustomRenderPipline
 			return new Vector4(0f, 0f, 0f, -1f);
 		}
 
-		/// <summary>	/// עԴӰ÷ֱӹ	/// </summary>
+		/// <summary>为其他光源（点光 / 聚光）预留阴影图空间，返回其阴影参数。</summary>
 		public Vector4 ReserveOtherShadows(Light light, int visibleLightIndex)
 		{
 			if (light.shadows == LightShadows.None || light.shadowStrength <= 0f)
@@ -342,61 +334,6 @@ namespace CustomRenderPipline
 
 		}
 
-		/// <summary>「阴影投射物材质分布」只打印一次。</summary>
-		static bool s_loggedCasterMaterials;
-
-		/// <summary>一次性统计：场景里【启用中】的 ClusterObject 的 MeshRenderer 挂了哪些材质/shader。
-		/// 用来对比「全开（保留场景原材质）」与「全没开（换成 AssetMat / DefferStandard）」两档
-		/// 的 ShadowCaster pass 到底是哪个 shader。</summary>
-		static void DumpShadowCasterMaterials()
-		{
-			if (s_loggedCasterMaterials) return;
-			s_loggedCasterMaterials = true;
-			try
-			{
-				var mrs = UnityEngine.Object.FindObjectsByType<MeshRenderer>(
-					FindObjectsInactive.Exclude, FindObjectsSortMode.None);
-				var byShader = new System.Collections.Generic.Dictionary<string, int>();
-				var byMat = new System.Collections.Generic.Dictionary<string, int>();
-				int total = 0, objs = 0, disabled = 0;
-				for (int i = 0; i < mrs.Length; i++)
-				{
-					var mr = mrs[i];
-					if (mr == null) continue;
-					if (mr.GetComponent<ClusterObject>() == null) continue;  // 只看本工程接管的物体
-					if (!mr.enabled) { disabled++; continue; }
-					objs++;
-					Material[] mats = mr.sharedMaterials;
-					for (int k = 0; k < mats.Length; k++)
-					{
-						total++;
-						string sh = mats[k] == null ? "<null>" : mats[k].shader.name;
-						byShader[sh] = byShader.TryGetValue(sh, out int c1) ? c1 + 1 : 1;
-						string mn = mats[k] == null ? "<null>" : (sh + " / " + mats[k].name);
-						byMat[mn] = byMat.TryGetValue(mn, out int c2) ? c2 + 1 : 1;
-					}
-				}
-				var sb = new System.Text.StringBuilder();
-				sb.Append("[阴影诊断] 启用中的 MeshRenderer = ").Append(objs)
-				  .Append("（被 BRG 关掉的 = ").Append(disabled)
-				  .Append("）| 材质槽 = ").Append(total).Append(" | 按 shader：");
-				foreach (var kv in byShader)
-					sb.Append("\n  · ").Append(kv.Key).Append(" × ").Append(kv.Value);
-				sb.Append("\n  按材质（最多 12 条）：");
-				int n = 0;
-				foreach (var kv in byMat)
-				{
-					if (n++ >= 12) break;
-					sb.Append("\n  · ").Append(kv.Key).Append(" × ").Append(kv.Value);
-				}
-				Debug.LogWarning(sb.ToString());   // 用 Warning：黄色，控制台里更好找
-			}
-			catch (System.Exception e)
-			{
-				// 统计只是诊断，绝不能把渲染打断
-				Debug.LogWarning("[阴影诊断] 统计材质时抛异常（已忽略）：" + e.Message);
-			}
-		}
 
 		void RenderDirectionalShadows()
 		{
@@ -476,7 +413,7 @@ namespace CustomRenderPipline
 			{
 				cluster.targetTexels = ClusterControl.Instance.ClusterAssembleAsset.clusterTargetTexels;
 				cluster.debugForceAll = ClusterControl.Instance.ClusterAssembleAsset.clusterShadowForceAll
-					? 1 : 0;
+					? 1 : 0;   // 1 = 强制全可见（隔离测试：区分"剔除错" vs "绘制链坏"）；0 = 标准 compute 剔除
 				cluster.BeginLight();
 			}
 
@@ -500,14 +437,6 @@ namespace CustomRenderPipline
 				{
 					SetCascadeData(i, splitData.cullingSphere, tileSize);
 
-					// 【一次性诊断】打印阴影归属与灯光的 Culling Mask。
-					if (!s_loggedCasters)
-					{
-						s_loggedCasters = true;
-						var visibleLight = cullingResults.visibleLights[light.visibleLightIndex];
-						Debug.Log($"[RVT/BRG] 阴影诊断：BRG 排除 layer = {ClusterProverty.BRGShadowExcludeLayer}" +
-							$" | 该光 cullingMask = {visibleLight.light.cullingMask}");
-					}
 				}
 
 				int tileIndex = tileOffset + i;
@@ -516,17 +445,36 @@ namespace CustomRenderPipline
 					projectionMatrix * viewMatrix, offset, tileScale
 				);
 
-				// cluster：登记该级联的世界空间平面 + LOD 参数（纯 CPU，不提交）
+				// cluster：登记该级联的视锥（worldToClip 与下方 Draw 用的逐位一致）+ LOD 参数（纯 CPU，不提交）。
+				// worldToClip = GL.GetGPUProjectionMatrix(proj,true) * view：正是绘制侧实际用的矩阵，
+				// 用它提的 6 个平面口径与渲染完全相同 ⇒ 不漏不重、不出现过剔除。
 				if (useCluster)
-					cluster.AddCascade(projectionMatrix * viewMatrix, projectionMatrix, tileSize);
+				{
+					Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(projectionMatrix, true);
+					Matrix4x4 worldToClip = gpuProj * viewMatrix;
+					cluster.AddCascade(worldToClip, projectionMatrix, splitData.cullingSphere, tileSize);
+				}
 			}
 
-			// ===== 一次性 GPU 剔除：整帧只有 Reset / CullAll / BuildArgs 三个 dispatch =====
-			if (useCluster)
-				cluster.Cull(buffer);
+		// ===== 一次性 GPU 剔除：整帧只有 Reset / CullAll / BuildArgs 三个 dispatch =====
+		if (useCluster)
+		{
+			// compute 剔除（Reset / CullAll / BuildArgs）统一录进独立 CommandBuffer 并立即执行：
+			//   · CullAll 把可见簇 ID 直接原子追加进 _Visible（RWStructuredBuffer，UAV 可写，
+			//     无"Index 缓冲不能当 UAV"的限制，也【不需要任何 Raw→Index 跨类型拷贝】⇒ 不再慢、不再错），
+			//   · BuildArgs 写好 indirect args。
+			// 绘制时 shader 在 VS 里查 _Visible + _Indices + _Positions 还原几何（拼索引从 compute 移到 VS）。
+			// 本方案已彻底删除 CopyForDraw，也不再需要 GetData 强制同步 stall：
+			//   _Args 由 compute 写出、被 DrawProceduralIndirect 的固定功能单元消费；SRP 上下文内
+			//   ExecuteCommandBuffer 已让 compute 先于后续绘制落地，资源屏障由 Unity 处理。
+			var cullCmd = new CommandBuffer { name = "ClusterCull" };
+			cluster.Cull(cullCmd);
+			context.ExecuteCommandBuffer(cullCmd);
+			cullCmd.Release();
+		}
 
-			if (useCluster)
-			{
+		if (useCluster)
+		{
 				// ===== Cluster / ClusterDebug 模式：只画 cluster，彻底不跑 GPUDravinSystem / context.DrawShadows =====
 				// 4 个级联的 viewport + 矩阵 + 间接绘制全部累积进【同一个 buffer】，
 				// 循环外只 ExecuteBuffer 一次，把材质 PrepareKeywords 从 4× 降到 1×（~2.5ms → ~0.6ms）。
@@ -606,9 +554,6 @@ namespace CustomRenderPipline
 				}
 			}
 
-			// Debug：在 Cluster 绘制基础上，CPU 也按相同口径剔除一次并和 GPU 计数比对（裁剪错误检测）
-			if (m_shadowMode == ClusterShadowMode.ClusterDebug)
-				cluster.VerifyCulling();
 		}
 
 
@@ -762,13 +707,14 @@ namespace CustomRenderPipline
 		}
 
 		/// <summary>
-		/// תͶӰʽܹͶӰӰռʱԺܷĺӰƥ䣬
-		/// ҲǼZתxyz0.5ţͶӰֱӾܺӰͼȽ
+		/// 把投影矩阵（clip 空间）转换成【阴影图集（UV [0,1]）空间】的矩阵，使阴影能正确映射到图集瓦片。
+		/// 即把 NDC 的 [-1,1] 映射到 [0,1]（z 做 0.5*xyz + 0.5 的偏移），并按 reversed-Z 做等价 z 取反，
+		/// 这样投影矩阵就能直接把几何画进阴影图。
 		/// </summary>
-		/// <param name="m">ԭVP</param>
-		/// <param name="offset">ƫƴС</param>
-		/// <param name="scale">Ϊٿ</param>
-		/// <returns>תƺľ</returns>
+		/// <param name="m">原始 VP 矩阵</param>
+		/// <param name="offset">瓦片在图集中的偏移（UV）</param>
+		/// <param name="scale">瓦片占图集的比例</param>
+		/// <returns>转换后的图集空间矩阵</returns>
 		Matrix4x4 ConvertToAtlasMatrix(Matrix4x4 m, Vector2 offset, float scale)
 		{
 			if (SystemInfo.usesReversedZBuffer)
