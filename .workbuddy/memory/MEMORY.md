@@ -4,9 +4,10 @@
 > 本文件只放「改代码前必须知道」的部分。
 
 ## 状态（2026-10-27）
-- 开关：`ClusterAssembleAsset.clusterMode` = SRP / Cluster / ClusterDebug，另有子开关 `clusterGBuffer`。
-  - `Cluster` + `clusterGBuffer=true` ⇒ 静态物体 GBuffer / RVT Feedback / 阴影全走簇，动态物体留 SRP。
-  - `clusterGBuffer=false` ⇒ 只有阴影走簇（最稳）。**切开关必须 Play 前设**（RLM 位在 OnEnable 打）。
+- 开关：`ClusterAssembleAsset.clusterMode` = SRP / Cluster / ClusterDebug —— **资产上唯一的开关**
+  （2026-10-28 起 `clusterGBuffer` 等 8 个排查字段已全删，别再往资产上加）。
+  `Cluster` ⇒ 静态物体的 GBuffer / RVT Feedback / 阴影全走簇，动态物体留 SRP。
+  **切开关必须 Play 前设**（RLM 位在 OnEnable 打）。
 - 实测（Viking Village 固定相机）：纯 SRP 337 / 簇阴影+SRP GBuffer 374 / 全簇 350 fps。
   GPU 3.78ms → **2.94ms**，与 CPU 2.96ms 相等 ⇒ **当前已转为 CPU 瓶颈**，继续压 GPU 不再涨帧。
   要继续提速应打 CPU：Batches 87、`RenderLoop.CleanupNodeQueue` 0.5ms、`ExecuteBuffer` 次数。
@@ -20,7 +21,8 @@
   ❌ 已试并回滚：非索引每簇 384 全展开（VS×4，1.77ms）；compute 每帧重排索引（BuildIndices 多烧 1.6ms）。
 - **`Cull Back`**（曾误写 `Cull Off` ⇒ 光栅化翻倍，是阴影慢的真凶）。
 - 阴影用合并 submesh `ClusterMeshCache.Get(mesh,false)`；GBuffer 用 `Get(mesh)`（=splitBySubmesh true）。
-- 小簇剔除 `clusterShadowMinTexels`；只画 LOD0；`argsBuf` 必须 `ComputeBufferType.IndirectArguments`。
+- 只画 LOD0（`_CascadeParams` / `_MaxLod` / 小簇剔除分支已于 2026-10-28 删除）；
+  `argsBuf` 必须 `ComputeBufferType.IndirectArguments`。
 
 ## Cluster GBuffer（2026-10-27 改为索引绘制）
 - **索引间接绘制**：compute `BuildIndices` 每帧只给【可见】簇铺索引，`_DrawIdx` 用
