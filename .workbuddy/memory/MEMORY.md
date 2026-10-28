@@ -7,7 +7,9 @@
 - 开关：`ClusterAssembleAsset.clusterMode` = SRP / Cluster / ClusterDebug，另有子开关 `clusterGBuffer`。
   - `Cluster` + `clusterGBuffer=true` ⇒ 静态物体 GBuffer / RVT Feedback / 阴影全走簇，动态物体留 SRP。
   - `clusterGBuffer=false` ⇒ 只有阴影走簇（最稳）。**切开关必须 Play 前设**（RLM 位在 OnEnable 打）。
-- 实测（Viking Village 固定相机）：纯 SRP 337 / 簇阴影+SRP GBuffer 374 / 全簇 ≈316 fps。
+- 实测（Viking Village 固定相机）：纯 SRP 337 / 簇阴影+SRP GBuffer 374 / 全簇 350 fps。
+  GPU 3.78ms → **2.94ms**，与 CPU 2.96ms 相等 ⇒ **当前已转为 CPU 瓶颈**，继续压 GPU 不再涨帧。
+  要继续提速应打 CPU：Batches 87、`RenderLoop.CleanupNodeQueue` 0.5ms、`ExecuteBuffer` 次数。
 - BRG 与旧管线 `MyRenderPipeline/` 已删；`SceneSH9`+`SH9Project` 保留于 `Runtime/Core/SH9/`。
   链路：GraphicsSettings → RenderPipeAsset → DefferPipeline.asset → DefferPipeline。
 

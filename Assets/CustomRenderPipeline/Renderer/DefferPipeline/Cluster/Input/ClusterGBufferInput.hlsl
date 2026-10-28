@@ -54,22 +54,32 @@ static uint _ClusterMatIndex;
 #include "ClusterInput.hlsl"
 
 // ---------------------------------------------------------------------------
-// 几何数据：顶点按【每簇（每个摆放的每个簇）】去重后烘成【世界空间】，每顶点约 52B。
+// 几何数据：顶点按【每簇（每个摆放的每个簇）】去重后烘成【世界空间】，
+// 每顶点打包成 2 个 uint4 = 32B（此前是 5 个独立缓冲共 52B）：
+//   e0 = (pos.x, pos.y, pos.z, matIndex | sign<<31)   ← 位置用 asuint 原样透传，零精度损失
+//   e1 = (nrmOct, tanOct, uv.x, uv.y)                 ← 法线/切线八面体编码(2×unorm16)，UV 仍是完整 float
+// 好处：两个 uint4 地址连续（同一次缓存行往返就能拿全属性）、VS 里 2 次 load 而不是 5 次，
+//       显存也从 52B/顶点 降到 32B/顶点。
 //
-// 为什么不再「局部空间 + 每簇矩阵」：
-//   · 索引绘制让 GPU 顶点缓存真正复用（VS 调用从 384/簇 降到约 66/簇），代价是
-//     索引值必须能唯一标识「某个摆放的某个顶点」⇒ 顶点必须按摆放展开。
-//   · 既然已经展开了，就顺手把世界变换 / 法线逆转置 / Gram-Schmidt / 切线符号全部烘死，
-//     VS 里只剩 5 次缓冲读取、零矩阵乘。
-//   · 顶点量 = 簇数 × 簇内去重顶点数（约 66），本工程约 20 万级、十几 MB ——
-//     和「按唯一 mesh 一份」同量级，不会像「整份 mesh 按摆放复制」那样爆掉。
+// 为什么顶点要按摆放展开：索引绘制要求「同一顶点用同一个索引值」才能命中 GPU 顶点缓存，
+// 而不同摆放的同名顶点变换不同 ⇒ 只能按摆放（= 簇记录）展开。
+// 展开后每簇只存去重后的约 66 个顶点（不是 384 个角点），总量与「按唯一 mesh 一份」同量级。
+// 既然展开了，就把世界变换 / 法线逆转置 / Gram-Schmidt 一起烘死，VS 里零矩阵运算。
 // ⚠️ 索引值就是这里的全局顶点号：`_CornerGvid[簇 × 384 + corner]`，重建期烘死。
 // ---------------------------------------------------------------------------
-StructuredBuffer<float3> _Positions;      // 世界空间
-StructuredBuffer<float3> _Normals;        // 世界空间、已归一化
-StructuredBuffer<float4> _Tangents;       // xyz=世界切线（已与法线正交、归一化） w=副切线符号
-StructuredBuffer<float2> _UVs;            // 原始 UV（_MainTex_ST 在 VS 里乘）
-StructuredBuffer<uint>   _MatIndex;       // 每顶点所属的材质槽位
+// 存的是 float4，但每个分量都是【按位】塞进去的 uint ⇒ shader 侧 asuint 取回，零精度损失。
+StructuredBuffer<float4> _Vertices;       // 每顶点 2 个 float4（见上）
+
+// 八面体解码：与 C# 的 OctEncode 逐位对应（存 0..65535，这里 *1/65535 再 *2-1）。
+float3 OctDecode(uint u)
+{
+	float2 e = float2(u & 0xFFFFu, u >> 16) * (1.0 / 65535.0);
+	e = e * 2.0 - 1.0;
+	float3 n = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+	if (n.z < 0.0)
+		n.xy = (1.0 - abs(n.yx)) * (n.xy >= 0.0 ? 1.0 : -1.0);
+	return normalize(n);
+}
 
 // 每簇三角形数。改这个值必须同步改 C# 的 ClusterGBufferRenderer.TrisPerCluster 与 compute。
 #define TRIS_PER_CLUSTER 128
@@ -85,17 +95,31 @@ struct ClusterAttributes
 	uint vertexID : SV_VertexID;
 };
 
-// 索引绘制下 vertexID 已经是全局顶点号，五个缓冲各取一次即可 ——
-// 没有任何间接查表和矩阵运算（全部在重建期烘死了）。
+// 索引绘制下 vertexID 已经是全局顶点号：两次 uint4 读取拿全属性，
+// 再解两个八面体。没有任何间接查表，也没有矩阵运算（全部在重建期烘死了）。
 void ClusterFetch(uint vertexID, out uint matIndex,
 	out float3 posW, out float3 nrmW, out float4 tanW, out float2 uv)
 {
-	int gi = (int)vertexID;
-	posW = _Positions[gi];
-	nrmW = _Normals[gi];
-	tanW = _Tangents[gi];
-	uv   = _UVs[gi];
-	matIndex = _MatIndex[gi];
+	uint2 idx = uint2(vertexID * 2u, vertexID * 2u + 1u);
+	uint4 e0 = asuint(_Vertices[idx.x]);
+	uint4 e1 = asuint(_Vertices[idx.y]);
+
+	posW = float3(asfloat(e0.x), asfloat(e0.y), asfloat(e0.z));
+
+	// 材质槽位与副切线符号共用最后一个 uint（matIndex < 2^23，高位留 1 bit 给符号）
+	matIndex = e0.w & 0x7FFFFFFFu;
+	float sign = (e0.w & 0x80000000u) != 0u ? -1.0 : 1.0;
+
+	nrmW = OctDecode(e1.x);
+	// 16 bit 量化后法线/切线不再严格正交，做一次正交化；
+	// 退化时 normalize(0)=NaN ⇒ 整面法线 NaN ⇒ 全黑，故兜底。
+	float3 t = OctDecode(e1.y);
+	t -= nrmW * dot(nrmW, t);
+	float tt = dot(t, t);
+	t = tt > 1e-12 ? t * rsqrt(tt) : normalize(cross(nrmW, float3(0, 1, 0)));
+
+	tanW = float4(t, sign);
+	uv   = float2(asfloat(e1.z), asfloat(e1.w));
 }
 
 #endif

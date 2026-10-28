@@ -16,7 +16,7 @@ MonoBehaviour:
   CellCount: 2
   CellSize: 512
   paddingSize: 2
-  mipsLevel: 3
+  mipsLevel: 5
   mipsOffset: 0.4
   mipsChangeSpeed: 0.616
   FeedbackScale: 1
@@ -32,7 +32,7 @@ MonoBehaviour:
   clusterTargetTexels: 0
   clusterShadowMinTexels: 1
   clusterForceAll: 0
-  useTileVT: 0
-  TilesPerAxis: 4
+  useTileVT: 1
+  TilesPerAxis: 2
   savePath: C:/Study/UnityProjects/RenderCluster/Assets/StreamingAssets/ClusterData/
   MipsDebug: 0

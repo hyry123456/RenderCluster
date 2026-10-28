@@ -80,7 +80,7 @@ namespace Cluster
         MaterialPropertyBlock m_mpb;
         ComputeShader m_cull;
 
-        ComputeBuffer m_posBuf, m_nrmBuf, m_tanBuf, m_uvBuf, m_vertMatBuf, m_cornerBuf;
+        ComputeBuffer m_vertBuf, m_cornerBuf;
         ComputeBuffer m_boundsBuf, m_groupBuf, m_infoBuf;
         ComputeBuffer m_matBuf;
         ComputeBuffer m_planesBuf, m_visibleBuf, m_counterBuf, m_argsBuf;
@@ -267,11 +267,11 @@ namespace Cluster
                 totalVerts += vCount;
             }
 
-            var posArr = new Vector3[totalVerts];
-            var nrmArr = new Vector3[totalVerts];
-            var tanArr = new Vector4[totalVerts];
-            var uvArr = new Vector2[totalVerts];
-            var matArr = new uint[totalVerts];
+            // 每顶点 2 个 uint4 = 32B（原来是 5 个独立缓冲共 52B）：
+            //   e0 = (pos.x, pos.y, pos.z, matIndex | sign<<31)   ← 位置用 asuint 原样透传，零精度损失
+            //   e1 = (nrmOct16x2, tanOct16x2, uv.x, uv.y)         ← 法线/切线八面体编码，UV 仍是完整 float
+            // 两个 uint4 地址连续 ⇒ 一次缓存行往返就能拿全属性；VS 里也从 5 次 load 降到 2 次。
+            var vertArr = new Vector4[totalVerts * 2];
 
             // 第二遍：逐簇烘顶点 + 角点索引表 + 包围球
             for (int i = 0; i < m_clusterCount; i++)
@@ -293,12 +293,11 @@ namespace Cluster
                     Vector4 tL = asset.tangents[vStart + v];
                     int o = vBase + v;
 
-                    posArr[o] = m.MultiplyPoint3x4(pL);
+                    Vector3 pW = m.MultiplyPoint3x4(pL);
 
                     Vector3 nW = nm.MultiplyVector(nL);
                     float nl = nW.magnitude;
                     nW = nl > 1e-8f ? nW / nl : Vector3.up;
-                    nrmArr[o] = nW;
 
                     // 切线只乘线性部分；非均匀缩放下做 Gram-Schmidt 正交化。
                     // 退化时（切线平行法线 / 零切线）normalize(0)=NaN ⇒ 整面法线 NaN ⇒ 全黑，故兜底。
@@ -306,9 +305,13 @@ namespace Cluster
                     Vector3 t = tW - nW * Vector3.Dot(nW, tW);
                     tW = t.sqrMagnitude > 1e-12f ? t.normalized : Vector3.Cross(nW, Vector3.up).normalized;
 
-                    tanArr[o] = new Vector4(tW.x, tW.y, tW.z, tL.w);
-                    uvArr[o] = asset.uvs[vStart + v];
-                    matArr[o] = (uint)r.matIndex;
+                    Vector2 uv = asset.uvs[vStart + v];
+                    uint matSign = (uint)r.matIndex | (tL.w < 0f ? 0x80000000u : 0u);
+
+                    // 全部按【位】存进 float4，shader 侧用 asuint 原样取回（不是数值转换，零误差）
+                    vertArr[o * 2 + 0] = new Vector4(pW.x, pW.y, pW.z, BitsToFloat(matSign));
+                    vertArr[o * 2 + 1] = new Vector4(
+                        BitsToFloat(OctEncode(nW)), BitsToFloat(OctEncode(tW)), uv.x, uv.y);
                 }
 
                 // 角点 → 全局顶点号（静态，绘制时 compute 直接照抄进索引缓冲）
@@ -328,11 +331,7 @@ namespace Cluster
                 bounds[i] = new Vector4(c.x, c.y, c.z, lb.w * Mathf.Max(s, 1e-4f));
             }
 
-            m_posBuf = new ComputeBuffer(totalVerts, 12); m_posBuf.SetData(posArr);
-            m_nrmBuf = new ComputeBuffer(totalVerts, 12); m_nrmBuf.SetData(nrmArr);
-            m_tanBuf = new ComputeBuffer(totalVerts, 16); m_tanBuf.SetData(tanArr);
-            m_uvBuf  = new ComputeBuffer(totalVerts, 8);  m_uvBuf.SetData(uvArr);
-            m_vertMatBuf = new ComputeBuffer(totalVerts, 4); m_vertMatBuf.SetData(matArr);
+            m_vertBuf = new ComputeBuffer(vertArr.Length, 16); m_vertBuf.SetData(vertArr);
             m_cornerBuf = new ComputeBuffer(cornerGvid.Length, 4); m_cornerBuf.SetData(cornerGvid);
             m_boundsBuf = new ComputeBuffer(m_clusterCount, 16); m_boundsBuf.SetData(bounds);
             m_groupBuf = new ComputeBuffer(m_clusterCount, 4); m_groupBuf.SetData(groups);
@@ -375,6 +374,28 @@ namespace Cluster
 
             LoadResources();
             m_built = true;
+        }
+
+        /// <summary>八面体编码：单位向量 → 2 × unorm16（打包进一个 uint）。
+        /// 与 HLSL 侧 OctDecode 必须逐位对应：存的是 0..65535，解码侧乘 1/65535 再 *2-1。
+        /// 16 bit/轴 的角度误差约 1e-5，法线/切线完全够用（图集那边的 EncodeNormal 是另一套，别混）。</summary>
+        static float BitsToFloat(uint bits) => System.BitConverter.Int32BitsToSingle((int)bits);
+
+        static uint OctEncode(Vector3 n)
+        {
+            float l = Mathf.Abs(n.x) + Mathf.Abs(n.y) + Mathf.Abs(n.z);
+            if (l < 1e-8f) { n = Vector3.up; l = 1f; }
+            float ex = n.x / l;
+            float ey = n.y / l;
+            if (n.z < 0f)
+            {
+                float ox = (1f - Mathf.Abs(ey)) * (ex >= 0f ? 1f : -1f);
+                float oy = (1f - Mathf.Abs(ex)) * (ey >= 0f ? 1f : -1f);
+                ex = ox; ey = oy;
+            }
+            uint ux = (uint)Mathf.Clamp(ex * 32767.5f + 32767.5f, 0f, 65535f);
+            uint uy = (uint)Mathf.Clamp(ey * 32767.5f + 32767.5f, 0f, 65535f);
+            return ux | (uy << 16);
         }
 
         /// <summary>法线的变换矩阵 = 世界矩阵左上 3x3 的逆转置（非均匀缩放下才正确）。</summary>
@@ -429,11 +450,7 @@ namespace Cluster
             }
             if (m_mat != null)
             {
-                m_mat.SetBuffer("_Positions", m_posBuf);
-                m_mat.SetBuffer("_Normals", m_nrmBuf);
-                m_mat.SetBuffer("_Tangents", m_tanBuf);
-                m_mat.SetBuffer("_UVs", m_uvBuf);
-                m_mat.SetBuffer("_MatIndex", m_vertMatBuf);
+                m_mat.SetBuffer("_Vertices", m_vertBuf);
                 m_mat.SetBuffer("_ClusterMaterials", m_matBuf);
             }
             // 图集若已存在（先建图集、后建物体），立刻回填
@@ -562,14 +579,13 @@ namespace Cluster
 
         void ReleaseBuffers()
         {
-            m_posBuf?.Release(); m_nrmBuf?.Release(); m_tanBuf?.Release();
-            m_uvBuf?.Release(); m_vertMatBuf?.Release(); m_cornerBuf?.Release();
+            m_vertBuf?.Release(); m_cornerBuf?.Release();
             m_boundsBuf?.Release(); m_groupBuf?.Release(); m_infoBuf?.Release();
             m_matBuf?.Release();
             m_planesBuf?.Release(); m_visibleBuf?.Release();
             m_counterBuf?.Release(); m_argsBuf?.Release();
             m_drawIdxBuf?.Release(); m_drawBaseBuf?.Release(); m_slotBuf?.Release();
-            m_posBuf = m_nrmBuf = m_tanBuf = m_uvBuf = m_vertMatBuf = m_cornerBuf = null;
+            m_vertBuf = m_cornerBuf = null;
             m_boundsBuf = m_groupBuf = m_infoBuf = m_matBuf = null;
             m_planesBuf = m_visibleBuf = m_counterBuf = m_argsBuf = null;
             m_drawIdxBuf = null; m_drawBaseBuf = null; m_slotBuf = null;

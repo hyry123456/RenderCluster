@@ -258,7 +258,9 @@ namespace CustomRenderPipline.DefferPipeline
                 if (gbuf.Prepare(camera))
                 {
                     gbuf.Cull(buffer);
+                    Profiler.BeginSample("Cluster.GBufferCull");
                     ExecuteBuffer();
+                    Profiler.EndSample();
                     useCluster = true;
                 }
             }
@@ -393,7 +395,11 @@ namespace CustomRenderPipline.DefferPipeline
 
             // 簇绘制（逐组间接绘制，几何由 GPU 从簇缓冲还原）
             if (clusterDraw && ClusterGBufferRenderer.Instance.DrawGBuffer(buffer))
+            {
+                Profiler.BeginSample("Cluster.GBufferDraw");
                 ExecuteBuffer();
+                Profiler.EndSample();
+            }
 
             // 几何由上面的 context.DrawRenderers(cullingResults) 走 SRP 绘制；
             // 纹理精度由 RVT / Tile-VT 保证。

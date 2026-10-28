@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Profiling;
 using UnityEngine.Rendering;
 using Cluster;
 
@@ -410,7 +411,10 @@ namespace CustomRenderPipline
 			// ExecuteCommandBuffer 已让 compute 先于后续绘制落地，资源屏障由 Unity 处理。
 			var cullCmd = new CommandBuffer { name = "ClusterCull" };
 			cluster.Cull(cullCmd);
+			// sample 必须在 Execute 时是打开的，GPU 时间才会归到这里而不是父节点
+			Profiler.BeginSample("Cluster.ShadowCull");
 			context.ExecuteCommandBuffer(cullCmd);
+			Profiler.EndSample();
 			cullCmd.Release();
 		}
 
@@ -440,7 +444,9 @@ namespace CustomRenderPipline
 					cluster.Draw(buffer, i, worldToClip);   // 只"添加"到 buffer，不执行
 				}
                 buffer.SetGlobalDepthBias(0f, 0f);
+                Profiler.BeginSample("Cluster.ShadowDraw");
                 ExecuteBuffer();               // 一次执行：compute 剔除 + 4 级联间接绘制
+                Profiler.EndSample();
 
                 // ===== cutout 物体（草/蕨/灌木等需 alpha 镂空的材质）改走 SRP 阴影路径 =====
                 // Cluster 阴影 shader 是纯几何、不采样贴图 ⇒ 这类物体若进 Cluster 会画成

@@ -715,7 +715,9 @@ namespace Cluster
                 // 天然保证「请求的页 = 采样的页」（用两套几何画反馈/GBuffer 时它们是会分叉的）。
                 bool clusterDrawn = ClusterGBufferRenderer.HasInstance
                     && ClusterGBufferRenderer.Instance.DrawFeedback(buffer);
+                Profiler.BeginSample("Cluster.FeedbackDraw");
                 ExecuteBuffer(buffer, context);
+                Profiler.EndSample();
 
                 if (!clusterDrawn)
                 {
