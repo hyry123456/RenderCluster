@@ -347,11 +347,8 @@ namespace CustomRenderPipline
 			ClusterShadowRenderer cluster = ClusterShadowRenderer.Instance;
 			if (useCluster)
 			{
-				var cfg = ClusterControl.Instance.ClusterAssembleAsset;
-				cluster.targetTexels = cfg.clusterTargetTexels;
-				cluster.minTexels = cfg.clusterShadowMinTexels;
 				// ClusterDebug 默认强制全可见：Debug 能画、Cluster 画不出来 ⇒ 剔除问题；两者都空 ⇒ 绘制链问题。
-				cluster.debugForceAll = (m_mode == ClusterMode.ClusterDebug || cfg.clusterForceAll) ? 1 : 0;
+				cluster.debugForceAll = (m_mode == ClusterMode.ClusterDebug) ? 1 : 0;
 				cluster.BeginLight();
 			}
 
@@ -367,6 +364,29 @@ namespace CustomRenderPipline
 				);
 
 				splitData.shadowCascadeBlendCullingFactor = cullingFactor;
+
+				// cluster：把正交投影沿光轴的 z 范围扩开。
+				// 根因：Unity 的级联正交矩阵只按 splitData.cullingSphere 拟合，沿光轴厚度 ≈ 2×球半径，
+				// 它**不看场景里有什么**。我们的投射物是自建的簇集合，Unity 完全不知道，
+				// 所以必须自己把厚度撑到能覆盖全部簇 —— 否则 x/y 在盒内、但沿光轴超出这层"板"的
+				// 投射物会被光栅化器整块裁掉，而它落在盒内的阴影就凭空缺一块。
+				// 症状特征：级联越小越严重 ⇒「贴近就缺、拉远就好、太阳没动」。
+				if (useCluster)
+				{
+					// 每个级联按【簇集合整体包围球】反推需要多厚的 z 范围（详见 ClusterShadowRenderer.PadOrthoDepth）。
+					float pad = 1f;
+					if (cluster.TryGetSceneBounds(out Vector3 sc, out float sr))
+					{
+						// 板中心 = 剔除球心；沿光轴看整个簇集合离它有多远，再加上集合自身半径。
+						Vector3 sphereC = new Vector3(splitData.cullingSphere.x, splitData.cullingSphere.y, splitData.cullingSphere.z);
+						float need = Mathf.Abs(Vector3.Dot(sc - sphereC, light.forward)) + sr;
+						float have = Mathf.Max(splitData.cullingSphere.w, 1e-3f);   // 原板半厚 ≈ 剔除球半径
+						pad = need / have;
+					}
+					pad = Mathf.Clamp(pad, 1f, 64f);
+					projectionMatrix = ClusterShadowRenderer.PadOrthoDepth(projectionMatrix, pad);
+				}
+
 				m_cascadeView[i] = viewMatrix;
 				m_cascadeProj[i] = projectionMatrix;
 				m_cascadeSplit[i] = splitData;
@@ -390,7 +410,7 @@ namespace CustomRenderPipline
 				{
 					Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(projectionMatrix, true);
 					Matrix4x4 worldToClip = gpuProj * viewMatrix;
-					cluster.AddCascade(worldToClip, projectionMatrix, splitData.cullingSphere, tileSize);
+					cluster.AddCascade(worldToClip);
 				}
 			}
 

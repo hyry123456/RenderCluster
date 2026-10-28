@@ -44,6 +44,15 @@
   不会缩小两条路径的差距，只在绝对性能上有收益。
 
 ## 铁律 / 雷区
+- 正交级联的 **x/y 剔除是精确的**（光方向 = 投影方向 ⇒ 盒外投不到盒内）；
+  但**沿光轴的深度范围 Unity 只按 cullingSphere 拟合（≈2R），不看场景** ⇒ 自建簇必须自己撑开，
+  否则「x/y 在盒内、沿光轴出板」的投射物被光栅化器整块裁掉 ⇒ 盒内阴影凭空缺块。
+  症状：**贴近才缺、拉远就好、太阳没动**。已由 `clusterShadowAutoDepth` 自动撑（上限 64 倍）。
+- **镜像实例（det<0）**：Unity 内建渲染器会自动翻 culling，`DrawProceduralIndirect` 不会
+  ⇒ Cull Back 下镜像物体的几何/阴影会整块消失。已在烘焙期翻绕序（阴影 + GBuffer 都做，
+  GBuffer 还要把副切线符号取反）。**任何 Cull Back 的 cluster pass 都必须带这个翻转。**
+- 平行光级联的正交剔除是**精确**的：x/y 外的投射物投不到盒内 ⇒ 盒内缺块不是剔除的锅。
+  reversed-Z 下 `CalculateFrustumPlanes` 的两个 z 平面恒真（深度方向不剔，只是多画）。
 - 自定义 HLSL 经 `DrawProceduralIndirect`：worldToClip 必须自己算 `GL.GetGPUProjectionMatrix(proj,true)*view`
   （漏 ⇒ D3D 上 z 全越界被裁光、阴影全空、**零报错**）。
 - 剔除平面用**同一矩阵** `GeometryUtility.CalculateFrustumPlanes(...)` 对簇包围球做球-平面；

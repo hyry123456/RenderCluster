@@ -30,8 +30,6 @@ StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=
 // 每级联 6 个世界空间视锥平面（来自 GeometryUtility.CalculateFrustumPlanes(worldToClip)）。
 // worldToClip 与绘制侧 GL.GetGPUProjectionMatrix(proj,true)*view 逐位一致。
 StructuredBuffer<float4> _Planes;   // 长度 = maxCascade * 6
-// 每级联一个参数：(projScale, targetTexels(LOD), minTexels(小簇剔除), 未用)
-StructuredBuffer<float4> _CascadeParams;
 // [簇 × 384] = 该角点对应的全局顶点号（重建期烘死，静态）
 StructuredBuffer<int>    _CornerGvid;
 
@@ -48,7 +46,6 @@ RWByteAddressBuffer      _DrawIdx;
 
 int _CascadeCount;
 int _ClusterCount;
-int _MaxLod;                                     // 当前可用 LOD 级数（只有 LOD0 ⇒ 1）
 int _TrisPerCluster;
 int _DebugForceAll;                              // 非 0 = 跳过所有剔除，全可见（排查用）
 int _IdxDimX;                                    // BuildIndices 的 x 维线程数（= 组数 × 64）
@@ -70,13 +67,11 @@ void CullAll(uint3 id : SV_DispatchThreadID)
     float4 bb = _ClusterBounds[c];
     float3 center = bb.xyz;
     float radius = bb.w;
-    int lod = 0;                                  // 只烘了 LOD0
 
     for (int k = 0; k < _CascadeCount; k++)
     {
         _SlotOf[k * _ClusterCount + c] = 0xFFFFFFFFu;   // 先当不可见，顺手清掉上帧残留
 
-        float4 cp = _CascadeParams[k];
         bool ok = true;
 
         if (_DebugForceAll == 0)
@@ -91,21 +86,6 @@ void CullAll(uint3 id : SV_DispatchThreadID)
                 if (dot(pl.xyz, center) + pl.w < -radius) { outside = true; break; }
             }
             if (outside) ok = false;
-
-            // 簇投影到阴影图上的半径（texel）。cp.x = tileSize*0.5*|proj11|。
-            float texelRadius = radius * cp.x;
-
-            // 小簇剔除：投影半径不到 cp.z 个 texel 的簇，它投出来的阴影只有一两个像素、
-            // 经 PCF 模糊后基本不可见，但每簇 384 顶点的开销是实打实的（0 = 关闭）。
-            if (ok && cp.z > 0.0 && texelRadius < cp.z) ok = false;
-
-            // LOD 选择（仅当 targetTexels > 0 且有多级 LOD 时才有意义）
-            if (ok && cp.y > 0.0 && _MaxLod > 1)
-            {
-                float target = cp.y;
-                if (texelRadius > target)              ok = (lod == 0);
-                else if (texelRadius * 2.0 <= target)  ok = (lod == _MaxLod - 1);
-            }
         }
 
         if (!ok) continue;

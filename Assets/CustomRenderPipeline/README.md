@@ -96,33 +96,31 @@
 | ClusterDebug(2) | 同 Cluster + 强制全可见 | 绘制路径与 Cluster 完全相同，只是 compute 跳过剔除（`debugForceAll=1`）。<br>判据：Debug 画得出来而 Cluster 画不出来 ⇒ 剔除口径/包围球问题；两者都空 ⇒ 绘制链问题。 |
 
 ### 2. 整体流程（Cluster / ClusterDebug）
-- 每帧 **3 个 compute dispatch** 一次性剔完【所有级联】：
+- 每帧 **4 个 compute dispatch** 一次性剔完【所有级联】：
   1. `Reset`：1 个线程组，清零 `_Counter`。
-  2. `CullAll`：每簇一线程，循环所有级联做球-平面视锥剔除，可见簇原子追加进 `_Visible`。
-  3. `BuildArgs`：每级联一线程，写 indirect args。
-  - ⇒ 4 个级联 = **3 次 dispatch**（不是 4 次），因为级联被压进 `CullAll` 的 shader 内循环里。
-- 每级联一次 `DrawProceduralIndirect`（共 4 次 draw），4 个级联的视口 + 矩阵 + 间接绘制全部累积进【同一个 CommandBuffer】，循环外只 `ExecuteBuffer()` 一次 → 材质 `PrepareKeywords` 从 4× 降到 1×。
-- **LOD**：当前只画 LOD0（`_MaxLod=1` 守卫；4 级 LOD 是同一表面的 4 份几何，叠加会 z-fighting）。
+  2. `CullAll`：每簇一线程，循环所有级联做球-平面视锥剔除，可见簇原子追加进 `_Visible` 并写 `_SlotOf`。
+  3. `BuildIndices`：每线程一个 (簇, 角点)，只给**可见**簇把全局顶点号铺进索引缓冲 `_DrawIdx`；一维展开，不可见簇靠 `_SlotOf` 早退。
+  4. `BuildArgs`：每级联一线程，写 5 个 uint 的**索引** indirect args。
+  - ⇒ 4 个级联 = **4 次 dispatch**（与级联数无关），因为级联被压进 `CullAll` / `BuildIndices` 的 shader 内循环里。
+- 每级联一次 `DrawProceduralIndirect(indexBuffer, ...)`（共 4 次 draw），4 个级联的视口 + 矩阵 + 间接绘制全部累积进【同一个 CommandBuffer】，循环外只 `ExecuteBuffer()` 一次 → 材质 `PrepareKeywords` 从 4× 降到 1×。
 - **cutout 分流**：`ClusterRenderDataAsset.NeedsSRPShadow = cutoff || clipping` 的物体在 `ScanScene` 里被 `continue` 跳过（不烘焙进 Cluster，这是性能收益来源），并由 `ClusterObject.OnEnable` 给 Renderer 打 `renderingLayerMask` bit29（CutoffRenderingLayerBit）；`Shadows.cs` 在 cluster 绘制之后临时把灯光掩码切成 bit29 单独跑一次 `context.DrawShadows`。无 cutout 物体时 `HasCutoffCasters()` 为 false ⇒ 整段跳过、零开销。
 
 ### 3. 数据布局（静态场景，世界空间摊平）
 | 缓冲 | 内容 |
 |------|------|
-| `_Positions` | float3 世界空间顶点，**按「簇 × 384（角点序）」平铺**（同簇内共用顶点会重复存） |
-| `_Visible` | compute 写出的可见簇紧凑列表 `[cascade * 簇数 + slot] = 簇下标` |
-| `argsBuf` | **非索引** indirect args（4 个 uint），必须 `ComputeBufferType.IndirectArguments`（否则运行报 "missing IndirectArguments flag"） |
+| `_Positions` | float3 世界空间顶点，**按簇去重**（每簇只存实际用到的约 66 个唯一顶点，不按 384 展开） |
+| `_CornerGvid` | `[簇 × 384]` 角点 → 全局顶点号，**重建期烘死、静态** |
+| `_SlotOf` | `[级联 × 簇]` 本帧可见槽位，不可见写 `0xFFFFFFFF`（`BuildIndices` 靠它早退） |
+| `_DrawIdx` | `GraphicsBuffer(Target.Index \| Target.Raw)`，每帧只给可见簇重排索引 |
+| `argsBuf` | **索引** indirect args（5 个 uint），必须 `ComputeBufferType.IndirectArguments`（否则运行报 "missing IndirectArguments flag"） |
 
-- **没有索引缓冲、没有 `_Indices`**：非索引绘制的 `vertexCount = 可见簇数 × 384` 本身就给出 `SV_VertexID` 范围；
-  VS 只需 `_Visible`（小缓冲、同簇 384 个顶点共用）+ 一次顺序的 `_Positions[簇号*384+corner]`。
-- 为什么删掉「静态单位索引缓冲」：单位缓冲每个索引只用一次，GPU 的后变换顶点缓存**零复用**，
-  却还要按 4B/顶点 反复读一遍索引 —— 实测这是阴影 pass 的大头之一（1.72ms → 明显下降）。
-- ⚠️ 坑：**D3D11 下 Index 缓冲不能当 compute UAV 写**（会静默丢弃），这也是当初绕成「单位索引缓冲」的原因；
-  既然现在改成非索引绘制，这条限制就彻底绕开了。
+- **为什么要真索引**：静态单位索引缓冲 `[0,1,2,...]` 每个索引只用一次 ⇒ GPU 顶点缓存**零复用**，一个 128 三角形的簇唯一顶点只有约 66 个却要跑 384 次 VS（约 5.8 倍浪费）。索引绘制下 VS 次数回落到唯一顶点数，与 SRP 同量级。
+- VS 只剩一行：`pos = _Positions[SV_VertexID]`（索引值就是全局顶点号），无查表、无间接依赖。
+- `Target.Index | Target.Raw`：D3D11 不允许索引缓冲同时是 Structured，但允许同时是 Raw ⇒ compute 当 `RWByteAddressBuffer` 写、draw 当索引读，**单缓冲零拷贝**。
+- ⚠️ `BuildIndices` 的 dispatch 必须按【可见簇的实际量】开，别按上界开方阵：`(组数 × 组内簇数上限 × 384)` 会到千万级线程，实测把省下的 draw 全吃回去。也注意 D3D11 单维最多 65535 个线程组，需二维拆分。
 - **阴影用「合并 submesh」的烘焙**（`ClusterMeshCache.Get(mesh, splitBySubmesh:false)`）：
   阴影纯几何、不采材质，合并后不会有「每个 submesh 最后一簇补齐到 128 三角形」的填充簇，
   簇数比 GBuffer 那份少 20~40%，而且不生成 normal/tangent/uv。
-- 可选加速：`clusterShadowMinTexels`（默认 0 = 关）。簇投影到阴影图上的半径小于该 texel 数就跳过 ——
-  这类簇投出来只有一两个像素、再经 PCF 基本不可见，但顶点开销照付。
 
 ### 4. 矩阵与剔除口径（正确性关键）
 - 自定义 HLSLPROGRAM 在 `DrawProceduralIndirect` 下**不走 `SetViewProjectionMatrices`**，内建矩阵 `UNITY_MATRIX_M / VP` 恒为单位/零矩阵 ⇒ 几何以世界坐标当裁剪坐标，全被裁光 ⇒ 阴影图全空、零报错。
@@ -132,25 +130,43 @@
   - ❌ 裸 `proj*view` 提平面：D3D reversed-Z 下近/远平面算反 ⇒ 过剔除（全图无阴影）。
   - ❌ `ShadowSplitData.cullingSphere` 球-球测试：该球是级联**内含球**、比真实视锥小 ⇒ 漏四角/边缘簇（大面积缺阴影）。
   - ✅ 与渲染同一矩阵提的平面：口径完全一致、不漏不重。
+- **沿光轴的深度范围必须自建（2026-10-28 定案，别再踩）**：
+  Unity 的级联正交矩阵只按 `splitData.cullingSphere` 拟合，沿光轴厚度 ≈ 2R，**它不看场景里有什么**。
+  我们的投射物是自建簇集合 ⇒ 若不撑厚度，x/y 在盒内但沿光轴超出这层"板"的簇会被光栅化器**整块裁掉**，
+  而它落下的阴影在盒内 ⇒ **阴影凭空缺一块**。症状：**贴近才缺、拉远就好、太阳没动**（级联越小越严重）。
+  - Unity 自己是靠「剔除体积 ≡ 投影体积（同一个球）」天然自洽，外加 `shadowNearPlane` 给近侧加余量。
+  - 我们做的是 x/y 盒子剔除（对平行光精确、比球更宽）⇒ 必须自己把 z 厚度撑到能覆盖全部簇。
+  - 实现：`ClusterShadowRenderer.PadOrthoDepth(proj, pad)`（`m22`/`m23` 同除 pad ⇒ 中心不变、范围 ×pad），
+    pad 由「簇集合整体包围球沿光轴的展开量 / 级联球半径」推出，上限 64。
+    替换点在 `Shadows.cs` 拿到 `projectionMatrix` 后立刻做 ⇒ 图集采样矩阵 / 渲染矩阵 / `SetViewProjectionMatrices` 三处天然同源。
+  - 代价只有深度精度（D32 撑到几百米仍是亚毫米级），阴影偏置是世界空间、投影前施加的，与 z 范围无关 ⇒ 不会引入 acne。
 
 ### 5. 关键文件
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| 渲染器 | `Runtime/ClusterRender/ClusterShadowRenderer.cs` | 场景登记、`Rebuild` 几何摊平、3 dispatch 剔除、逐级联间接绘制 |
-| 剔除 compute | `Resources/Cluster/ClusterShadowCull.compute` | `Reset` / `CullAll` / `BuildArgs` 三 kernel，逐簇 GPU 剔除 |
-| 阴影 shader | `Resources/Cluster/ClusterShadow.shader` | VS 查 `_Visible+_Indices+_Positions` 还原几何，只写深度（不采任何贴图） |
+| 渲染器 | `Runtime/ClusterRender/ClusterShadowRenderer.cs` | 场景登记、`Rebuild` 几何摊平、4 dispatch 剔除 + 索引重排、逐级联索引间接绘制 |
+| 剔除 compute | `Resources/Cluster/ClusterShadowCull.compute` | `Reset` / `CullAll` / `BuildIndices` / `BuildArgs` 四 kernel |
+| 阴影 shader | `Resources/Cluster/ClusterShadow.shader` | VS 只做 `_Positions[SV_VertexID]`，只写深度（不采任何贴图） |
 | 调度接入 | `Runtime/Core/Shadows.cs` | 按 `clusterMode` 分派；Cluster 模式累积绘制到单 CommandBuffer |
 
 ### 6. 调试开关
-- `ClusterAssembleAsset.clusterForceAll`（bool）：true ⇒ GBuffer 与阴影的 compute 都跳过剔除、强制全可见，用于隔离「剔除错」vs「绘制链坏」（`clusterMode = ClusterDebug` 时自动等效开启）。
-- `clusterMode`：0/1/2 切换三条路径（见第 1 节）。切模式必须在进 Play **之前**设好 —— rendering layer 位是在 `ClusterObject.OnEnable` 里打的。
+**资产上只剩一个开关**（其余排查用字段已全部删除）：
+
+- `clusterMode`：0/1/2 切换三条路径（见第 1 节）。`ClusterDebug(2)` = 同 Cluster 但强制不做剔除，
+  用于隔离「剔除错」vs「绘制链坏」。切模式必须在进 Play **之前**设好 —— rendering layer 位是在 `ClusterObject.OnEnable` 里打的。
+
+排查时若还需要更细的数据，改代码加临时采样即可，不要往资产上重加字段（历史上这一区一度堆了 7 个开关，全是排查期遗留）。
+- `Rebuild` 启动日志会打出「扫描 N 个 MeshRenderer → 登记 M 个 mesh（跳过：disabled / 关投影 / cutout / 无 Mesh）」。
+  阴影缺块的**第一嫌疑**永远是「投射物压根没登记」，先看这行。
 
 ### 7. 如何测试 / 排错
 1. `assemble.asset` 把 `clusterMode` 设 1（Cluster）或 2（ClusterDebug），进 Play。
 2. 预期：方向光阴影正常、级联过渡无镂空缺口；与 SRP 模式（=0）同屏对比应一致（草地等 cutout 走 SRP 补画）。
-3. **整张阴影图空、零报错** → 先查 `worldToClip` 是否套了 `GetGPUProjectionMatrix`；再查 `argsBuf` 是否 `IndirectArguments` 类型、以及 `_Positions` 是否按「簇 × 384 角点序」平铺（旧的按簇去重布局会让 VS 取到错位顶点）。
-4. **大面积缺阴影** → 查剔除口径（是否误用 `proj*view` 提平面，或用了 `cullingSphere` 球-球测试而非世界空间 6 平面）。
-5. **位置探针全绿但阴影仍空** → 典型是矩阵 / 间接绘制链路问题（见第 4 节），不是剔除本身。
+3. **整张阴影图空、零报错** → 先查 `worldToClip` 是否套了 `GetGPUProjectionMatrix`；再查 `argsBuf` 是否 `IndirectArguments` 类型、以及 `_DrawIdx` 是否真的被 `BuildIndices` 写过（索引全 0 ⇒ 全画到同一个顶点 ⇒ 片状/空）。
+4. **某个物体/某段阴影凭空缺一块，且「贴近才缺、拉远就好」** → 是沿光轴深度范围没覆盖，见第 4 节最后一条；不是剔除、也不是 `Cull Back`（剔除模式只和光方向有关，与相机距离无关）。
+5. **镜像实例（负缩放）整块没阴影/没模型** → 烘焙期绕序翻转是否生效（`det < 0` 时索引写 `i0,i2,i1`）。Unity 内建渲染器会自动翻 culling，`DrawProceduralIndirect` 不会。
+6. **大面积缺阴影** → 查剔除口径（是否误用 `proj*view` 提平面，或用了 `cullingSphere` 球-球测试而非世界空间 6 平面）。
+7. **位置探针全绿但阴影仍空** → 典型是矩阵 / 间接绘制链路问题（见第 4 节），不是剔除本身。
 
 > 后续若对 Cluster 阴影的剔除口径、数据布局或调度方式做修改，请同步更新本小节。
 
@@ -174,8 +190,8 @@ Scene 视图始终走 SRP，天然可作为 A/B 对照。
 
 ### 2. 与 SRP 路径共用同一份着色代码
 
-- 顶点来源不同：没有顶点缓冲，VS 用 `SV_VertexID` 推 `slot = vid/384`、`corner = vid%384`，
-  查 `_Visible → _ClusterInfo → _Indices → _Positions/Normals/Tangents/UVs` 还原几何。
+- 顶点来源不同：没有硬件顶点缓冲，几何靠**索引间接绘制** —— compute 每帧只给可见簇铺索引，
+  VS 用 `SV_VertexID` 直接取世界空间顶点（变换在重建期烘死），只剩 2 次 `float4` 读取 + 一次八面体解码。
 - 片元**完全共用**：`ClusterInput.hlsl`（取数/解码）+ `ClusterPass.hlsl` 的 `ClusterGBufferShade`
   + `FeedbackPass.hlsl` 的 `FeedbackColor`。做法是在 `ClusterGBufferInput.hlsl` 里把 `INPUT_PROP`
   重定向到 `_ClusterMaterials[_ClusterMatIndex]`，并用 `CLUSTER_INSTANCED_MATERIAL` 屏蔽
@@ -187,31 +203,35 @@ Scene 视图始终走 SRP，天然可作为 A/B 对照。
 
 | 缓冲 | 内容 |
 |------|------|
-| `_Positions/_Normals/_Tangents/_UVs` | **按唯一 mesh 上传一份**（mesh 局部空间），同 mesh 多实例共享 |
-| `_Indices` | int32 全局顶点号，每簇连续 384 |
-| `_ClusterInfo` | `uint4`：x=索引段起点，y=材质槽位 |
-| `_ClusterToWorld` / `_ClusterNormal` | 每簇 **4 个 float4 行**（不用 `float4x4`：矩阵在 StructuredBuffer 里的行/列主序取决于编译器打包约定，存行 + `dot` 手工乘没有歧义） |
-| `_ClusterMaterials` | 每材质 112 B 参数 |
-| `_Visible` | `[组 * 簇数 + slot] = 簇下标`（compute 产出的紧凑列表） |
+| `_Vertices` | 每顶点 **2 个 float4 = 32B**：`e0=(posWS.xyz, matIndex\|tanSign<<31)`、`e1=(nrmOct, tanOct, uv.xy)` |
+| `_CornerGvid` | `[簇 × 384]` 角点 → 全局顶点号（重建期烘死） |
+| `_Visible` | `uint2`：`[组基址 + slot] = (簇下标, 材质槽位)` —— 材质槽位随可见列表一起写出，省掉查 `_ClusterInfo` 那一级 |
 | `_ClusterGroup` | 每簇所属 detail 贴图组 |
-| `m_argsBuf` | 每组 4 个 uint（**非索引**间接绘制），必须 `IndirectArguments` 类型 |
+| `_DrawBase` | `[组]` 该组在 `_DrawIdx` 里的起点（前缀和，常量 ⇒ `startIndex` 不用回读计数器） |
+| `_SlotOf` | `[簇]` 本帧可见槽位，不可见 `0xFFFFFFFF` |
+| `_DrawIdx` | `GraphicsBuffer(Target.Index \| Target.Raw)`，compute 写、draw 直接当索引读 |
+| `_ClusterMaterials` | 每材质 112 B 参数 |
+| `m_argsBuf` | 每组 5 个 uint（**索引**间接绘制），必须 `IndirectArguments` 类型 |
 
-- 顶点在**局部空间**、每簇带变换矩阵：比「CPU 逐顶点变换到世界空间」省一次 4M 顶点的重算，
-  也让同一 mesh 的多个实例共享顶点缓冲。
-- 索引绘制不需要 GPU 索引缓冲：非索引 `DrawProceduralIndirect` 的 `vertexCount = 可见簇数 × 384`
-  已经给出 `SV_VertexID` 范围，shader 自己查 `_Indices` 即可。
+- **顶点按「每簇（每个摆放的每个簇）」去重后烘成世界空间**，不是按唯一 mesh 一份：
+  索引绘制要求「同一顶点用同一个索引值」才能命中 GPU 顶点缓存，而不同摆放的同名顶点变换不同 ⇒ 只能按摆放展开。
+  展开后每簇只存去重后的约 66 个顶点（不是 384 个角点），总量与「按唯一 mesh 一份」同量级。
+- 既然展开了就把世界变换 / 法线逆转置 / Gram-Schmidt 一起烘死，VS 里零矩阵运算。
+- 法线/切线走**八面体编码**（16 bit/轴），实测重构角度误差 0.0073°；副切线符号塞进 matIndex 最高位（matIndex < 2^23）。
+- ❌ 顶点池 key 掺材质下标会让 N 个 submesh 的 mesh 被整份复制 N 遍（实测 316→297fps）。
+- ❌ 按「每摆放」整份复制 mesh 顶点会爆显存（直接崩溃）。**只复制该簇去重后的那 60~70 个**。
 
-### 4. 调度（每帧 3 dispatch + 每组 1 draw）
+### 4. 调度（每帧 4 dispatch + 每组 1 draw）
 
 ```
 DefferPipeline.Setup
   ├─ gbuf.Prepare(camera)      重建（如脏）+ 由 GL.GetGPUProjectionMatrix(proj,true)*view 提 6 平面
-  ├─ gbuf.Cull(buffer)         Reset / CullAll / BuildArgs
+  ├─ gbuf.Cull(buffer)         Reset / CullAll / BuildIndices / BuildArgs
   └─ clusterCore.RenderFeedback → gbuf.DrawFeedback   ← 与 GBuffer 共用同一份可见簇列表
 DefferPipeline.DrawGBuffer
   ├─ FilteringSettings.renderingLayerMask 清掉位 28（配合下面的「只留 bit28」才真正排掉）
   ├─ context.DrawRenderers(...)   ← 剩余物体（非 RVT / cutout / 透明等）
-  └─ gbuf.DrawGBuffer(buffer)     按组间接绘制
+  └─ gbuf.DrawGBuffer(buffer)     按组索引间接绘制
 ```
 
 - **Feedback 也交给 Cluster 画**：用同一份可见簇列表，天然保证「请求的页 = 采样的页」
@@ -252,7 +272,9 @@ DefferPipeline.DrawGBuffer
    确认 `ClusterObject` 确实注册了（`clusterMode` 是 Play 前设的）。
 2. **画面全白/全黑** → 先查两件事：① `_VirtualAlbedo` 等有没有绑上（`ClusterObject.ApplyAtlasTextures`
    → `ClusterGBufferRenderer.BindAtlas`）；② 片元里的材质下标是不是错写成了**簇号**
-   （必须是 `_ClusterInfo[簇号].y`，写成簇号会越界读 `_ClusterMaterials` ⇒ 参数全 0 ⇒ 整片黑）。
-3. **几何错位/炸开** → 查 `_ClusterToWorld` 行序（C# `Matrix4x4.GetRow`）与 shader `dot` 顺序是否一致。
-4. **部分簇不显示** → 先开 `debugForceAll = 1`（跳过剔除），能全显示说明剔除平面口径有问题。
+   （必须是 `_Visible[slot].y`，写成簇号会越界读 `_ClusterMaterials` ⇒ 参数全 0 ⇒ 整片黑）。
+3. **几何错位/炸开** → 查 `_Vertices` 的打包顺序（C# 填 `Vector4` 的位序 vs shader `asuint` 取值）是否逐字一致。
+   位置用 `BitConverter.Int32BitsToSingle` 按位存、`asfloat` 取回；法线/切线是八面体编码，编码器与 `OctDecode` 必须逐位对应。
+4. **部分簇不显示** → 把 `clusterMode` 切到 `ClusterDebug`（跳过剔除），能全显示说明剔除平面口径有问题；
+   若仍缺，查 `_DrawIdx` 是否被 `BuildIndices` 写过、以及 `_DrawBase` 前缀和。
 

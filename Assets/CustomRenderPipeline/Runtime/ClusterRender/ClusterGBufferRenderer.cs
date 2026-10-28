@@ -285,6 +285,10 @@ namespace Cluster
 
                 Matrix4x4 m = r.localToWorld;
                 Matrix4x4 nm = NormalMatrix(m);
+                // 镜像实例（负缩放）：绕序要在索引里翻，副切线符号也要反过来。
+                // 反射变换 R 满足 cross(Rn,Rt) = -R·cross(n,t)，而真实副切线是 R·b，
+                // 所以 b = -cross(n',t')·sign ⇒ 符号取反才对得上 UV 手性。
+                bool flipWinding = m.determinant < 0f;
 
                 for (int v = 0; v < vCount; v++)
                 {
@@ -306,7 +310,9 @@ namespace Cluster
                     tW = t.sqrMagnitude > 1e-12f ? t.normalized : Vector3.Cross(nW, Vector3.up).normalized;
 
                     Vector2 uv = asset.uvs[vStart + v];
-                    uint matSign = (uint)r.matIndex | (tL.w < 0f ? 0x80000000u : 0u);
+                    bool sign = tL.w < 0f;
+                    if (flipWinding) sign = !sign;      // 镜像实例的副切线手性
+                    uint matSign = (uint)r.matIndex | (sign ? 0x80000000u : 0u);
 
                     // 全部按【位】存进 float4，shader 侧用 asuint 原样取回（不是数值转换，零误差）
                     vertArr[o * 2 + 0] = new Vector4(pW.x, pW.y, pW.z, BitsToFloat(matSign));
@@ -315,9 +321,19 @@ namespace Cluster
                 }
 
                 // 角点 → 全局顶点号（静态，绘制时 compute 直接照抄进索引缓冲）
+                // ⚠️ 镜像实例（负缩放，det < 0）会把三角形绕序整体翻掉。shader 是 Cull Back，
+                //    不翻绕序的话这类物体的**整块几何会被背面剔除**（模型上直接缺一块）。
+                //    烘焙期交换两个角点即可救回来，运行时零成本。
                 int dst = i * VertsPerCluster;
-                for (int k = 0; k < VertsPerCluster; k++)
-                    cornerGvid[dst + k] = vBase + (asset.indices[iStart + k] - vStart);
+                for (int t = 0; t < VertsPerCluster; t += 3)
+                {
+                    int i0 = vBase + (asset.indices[iStart + t + 0] - vStart);
+                    int i1 = vBase + (asset.indices[iStart + t + 1] - vStart);
+                    int i2 = vBase + (asset.indices[iStart + t + 2] - vStart);
+                    cornerGvid[dst + t + 0] = i0;
+                    cornerGvid[dst + t + 1] = flipWinding ? i2 : i1;
+                    cornerGvid[dst + t + 2] = flipWinding ? i1 : i2;
+                }
 
                 info[i * 4 + 0] = (uint)vBase;
                 info[i * 4 + 1] = (uint)r.matIndex;

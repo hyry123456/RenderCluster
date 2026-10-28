@@ -248,12 +248,10 @@ namespace CustomRenderPipline.DefferPipeline
 
             var clusterAsset = ClusterControl.TryGetAssembleAsset();
             if (camera.cameraType == CameraType.Game && clusterAsset != null
-                && clusterAsset.UseRVT && clusterAsset.clusterMode != ClusterMode.SRP
-                && clusterAsset.clusterGBuffer)
+                && clusterAsset.UseRVT && clusterAsset.clusterMode != ClusterMode.SRP)
             {
                 if (gbuf == null) gbuf = ClusterGBufferRenderer.Instance;
-                gbuf.debugForceAll = (clusterAsset.clusterMode == ClusterMode.ClusterDebug
-                    || clusterAsset.clusterForceAll) ? 1 : 0;
+                gbuf.debugForceAll = (clusterAsset.clusterMode == ClusterMode.ClusterDebug) ? 1 : 0;
                 gbuf.active = true;
                 if (gbuf.Prepare(camera))
                 {

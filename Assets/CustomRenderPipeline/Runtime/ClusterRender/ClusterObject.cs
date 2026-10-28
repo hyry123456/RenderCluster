@@ -213,10 +213,10 @@ namespace Cluster
                 if (meshRender != null) meshRender.materials = materials;
 
                 var meshFilter = GetComponent<MeshFilter>();
-                // GBuffer 是否交给 Cluster 由 clusterGBuffer 独立控制（默认 false = GBuffer 仍走 SRP）。
-                // 不开时【不要注册、也不要动 renderingLayerMask】，否则物体被贴上 bit28 后
-                // SRP 的 DrawRenderers 就再也画不到它们了。
-                if (cfg.clusterMode != ClusterMode.SRP && cfg.clusterGBuffer && meshRender != null
+                // clusterMode 非 SRP ⇒ GBuffer / RVT Feedback / 阴影全部由簇画（单一开关，不允许混搭）。
+                // 注册失败时【不要动 renderingLayerMask】，否则物体被贴上 bit28 而 Cluster 没画它，
+                // SRP 的 DrawRenderers 也画不到 ⇒ 直接消失。
+                if (cfg.clusterMode != ClusterMode.SRP && meshRender != null
                     && meshFilter != null && meshFilter.sharedMesh != null
                     && ClusterGBufferRenderer.Instance.Register(this, meshFilter.sharedMesh,
                         transform.localToWorldMatrix, materials, indexs))

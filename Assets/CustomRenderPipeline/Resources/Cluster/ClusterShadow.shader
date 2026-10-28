@@ -47,8 +47,9 @@ Shader "Hidden/ClusterShadowCaster"
             // ⚠️ 必须与 SRP 路径的 ShadowCaster 口径一致：ClusterPBR.shader 的 ShadowCaster
             // pass 没写 Cull 指令 ⇒ 默认 Cull Back。这里若写 Cull Off，等于把每个投射物的
             // 三角形再画一遍背面（光栅化 ×2），而阴影图里背面根本不参与最终深度。
-            // 2026-10-27 实测：这是 Cluster 阴影比 SRP 慢一截的主要原因之一。
-            // 只有场景里出现「必须双面投影」的单面片（旗帜/布/卡片植被）时才需要改回 Cull Off。
+            // 2026-10-28 实测：这是 Cluster 阴影比 SRP 慢一截的主要原因之一。
+            // 镜像实例（负缩放）不需要改成双面：烘焙期已按 det<0 翻过三角形绕序。
+            // 只有场景里出现「必须双面投影的单层薄片」（旗帜/布/卡片植被）才需要改这一行。
             Cull Back
 
             HLSLPROGRAM

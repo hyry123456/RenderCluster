@@ -9,19 +9,22 @@ namespace Cluster
     /// 【cluster 管线】阴影渲染器。资产开关切换三种模式：SRP / Cluster / ClusterDebug。
     ///
     /// 当前流程（Cluster / ClusterDebug）：
-    ///   · 每帧 3 个 compute dispatch（Reset / CullAll / BuildArgs）一次性剔完【所有级联】——
-    ///     CullAll 每线程一个簇、内部循环所有级联做球-平面视锥剔除，可见簇原子追加进 _Visible；
-    ///     BuildArgs 每线程一个级联写 indirect args。故 4 个级联 = 3 次 dispatch，不是 4 次。
-    ///   · 每级联一次 DrawProceduralIndirect（共 4 次 draw）：shader 在 VS 里查
-    ///     _Visible + _Indices + _Positions 还原几何，不依赖任何跨缓冲拷贝。
+    ///   · 每帧 4 个 compute dispatch（Reset / CullAll / BuildIndices / BuildArgs）一次性剔完【所有级联】——
+    ///     CullAll 每线程一个簇、内部循环所有级联做球-平面剔除，写出 _SlotOf（不可见 = 0xFFFFFFFF）；
+    ///     BuildIndices 只给【可见】簇铺索引；BuildArgs 每线程一个级联写 indirect args。
+    ///   · 每级联一次【索引】DrawProceduralIndirect（共 4 次 draw），VS 里只剩 _Positions[SV_VertexID]。
     ///   · LOD：当前只画 LOD0。
     ///
     /// 数据布局（摊平到世界空间，静态场景，运行时不乘实例矩阵）：
-    ///   _Positions —— float3 世界空间顶点
-    ///   _Indices  —— int32 全局顶点号，每簇固定 384（= 128 三角形×3）
-    ///   _Visible  —— compute 写出的可见簇紧凑列表 [cascade*簇数 + slot] = 簇下标
-    ///   索引缓冲是【静态单位缓冲 [0..N]】，VS 用 SV_VertexID 推出 slot=vid/384、corner=vid%384，
-    ///   查 _Visible 得簇号 → _Indices 得全局顶点号 → _Positions。
+    ///   _Positions  —— float3 世界空间顶点
+    ///   _CornerGvid —— int32[簇 × 384] 角点 → 全局顶点号（重建期烘死）
+    ///   _SlotOf     —— [级联 × 簇] 本帧可见槽位
+    ///   _DrawIdx    —— GraphicsBuffer(Index|Raw)，compute 每级联写 [slot*384 + corner]
+    ///
+    /// 剔除口径（2026-10-28 复核）：平行光的级联是正交投影，且投影方向就是光线方向 ⇒
+    /// 「簇包围球在光空间 x/y 盒子外」严格等价于「它投出的阴影也在盒子外」，
+    /// 所以 x/y 平面剔除是**精确**的，不会在盒子内部挖洞。反过来说：盒子内部的阴影缺块
+    /// 一定来自别处（投射物没进簇集合 / 沿光轴的深度范围没覆盖 / 深度偏移把薄几何抹掉）。
     ///
     /// 纯几何链路：不采任何贴图。
     /// </summary>
@@ -60,6 +63,40 @@ namespace Cluster
         readonly List<Matrix4x4> worlds = new List<Matrix4x4>();
         readonly Dictionary<Mesh, ClusterMeshAsset> baked = new Dictionary<Mesh, ClusterMeshAsset>();
 
+        // 全部簇的世界包围球（Rebuild 时算好）——深度范围推导用它反推所需 z 厚度。
+        Vector3 m_sceneCenter;
+        float m_sceneRadius;
+
+        /// <summary>取簇集合的整体包围球（世界空间）。没建好时返回 false。</summary>
+        public bool TryGetSceneBounds(out Vector3 center, out float radius)
+        {
+            center = m_sceneCenter;
+            radius = m_sceneRadius;
+            return built && m_sceneRadius > 0f;
+        }
+
+        /// <summary>
+        /// 把正交投影的 z 范围按 pad 倍**围绕中心**扩张（pad &lt;= 1 原样返回）。
+        ///
+        /// 正交下 z_ndc = m22 · z_view + m23，范围中心 = -m23/m22。
+        /// 让 m22、m23 同除 pad ⇒ 中心不变、斜率变小 ⇒ 可视 z 范围扩大 pad 倍。
+        ///
+        /// ⚠️ 必须对「渲染矩阵、图集采样矩阵、SetViewProjectionMatrices」用同一个结果，
+        /// 否则两侧深度约定不一致 ⇒ 阴影整体错位。Shadows.cs 里在拿到 projectionMatrix 后
+        /// 立刻替换，下游三处自然就一致了。
+        /// </summary>
+        public static Matrix4x4 PadOrthoDepth(Matrix4x4 proj, float pad)
+        {
+            if (pad <= 1.0001f) return proj;
+            proj.m22 /= pad;
+            proj.m23 /= pad;
+            return proj;
+        }
+
+        // 最近一次场景扫描的统计：用来确认「该投影的物体是不是全部进了簇集合」。
+        // 阴影缺块的第一嫌疑永远是「投射物压根没登记」，所以这几个数要在 Rebuild 日志里能看到。
+        int m_scanTotal, m_scanSkipDisabled, m_scanSkipOff, m_scanSkipCutout, m_scanSkipNoMesh;
+
         // ---------------- GPU 资源 ----------------
         Material drawMat;
         MaterialPropertyBlock m_mpb;     // [绘制] 逐 draw 显式传入 world→clip 矩阵（per-draw，互不污染）
@@ -68,7 +105,7 @@ namespace Cluster
         // 索引缓冲由 compute 每帧按【可见】簇重排（Target.Index | Raw ⇒ 可当 UAV 写、也可当索引读）。
         // 这样 GPU 顶点缓存能真正复用（每簇 384 角点 → 约 66 次 VS），VS 里只剩 _Positions[SV_VertexID]。
         GraphicsBuffer drawIdxBuf;
-        ComputeBuffer planesBuf, cascadeParamBuf, visibleBuf, counterBuf, argsBuf;
+        ComputeBuffer planesBuf, visibleBuf, counterBuf, argsBuf;
         ComputeBuffer slotBuf;
 
         int clusterCount;
@@ -80,14 +117,6 @@ namespace Cluster
         // ---------------- 每帧级联数据 ----------------
         int cascadeCount;
         readonly Vector4[] cpuPlanes = new Vector4[MaxCascades * PlanesPerCascade];
-        readonly Vector4[] cpuCascadeParams = new Vector4[MaxCascades];
-
-        /// <summary>LOD 判据的目标 texel 数。<= 0 = 不做 LOD 判据（当前只有 LOD0）。</summary>
-        public float targetTexels = 0f;
-
-        /// <summary>投影半径小于这个 texel 数的簇直接跳过（0 = 关闭）。见资产同名字段说明。
-        /// 这是「不改几何、不改绘制方式」就能再省一批顶点开销的唯一旋钮。</summary>
-        public float minTexels = 0f;
 
         /// <summary>调试开关：非 0 时 compute 跳过所有剔除、强制全可见（隔离测试用）。</summary>
         public int debugForceAll = 0;
@@ -123,21 +152,28 @@ namespace Cluster
         void ScanScene()
         {
             m_hasCutoffCasters = false;
+            m_scanTotal = m_scanSkipDisabled = m_scanSkipOff = m_scanSkipCutout = m_scanSkipNoMesh = 0;
             var mrs = UnityEngine.Object.FindObjectsByType<MeshRenderer>(
                 FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+            m_scanTotal = mrs.Length;
             for (int i = 0; i < mrs.Length; i++)
             {
                 var mr = mrs[i];
-                if (mr == null || !mr.enabled) continue;
-                if (mr.shadowCastingMode == ShadowCastingMode.Off) continue;
+                if (mr == null) { m_scanSkipDisabled++; continue; }
+                // 跳过 disabled 的 renderer：LODGroup 会把「非当前级」的 renderer 置为 disabled，
+                // 全部登记会让多个 LOD 同时投影（重影 + 几何翻倍）。这里保持「只烘当前级」的老行为，
+                // 但把数量记下来 —— 如果这个数很大，说明场景里 LODGroup 很多，
+                // 阴影用的是「扫描那一刻恰好在看的 LOD」，远处会偏粗（不是缺块，但会不一致）。
+                if (!mr.enabled) { m_scanSkipDisabled++; continue; }
+                if (mr.shadowCastingMode == ShadowCastingMode.Off) { m_scanSkipOff++; continue; }
                 // 需 alpha 镂空的物体（草/蕨/灌木）走 SRP 阴影路径：Cluster 纯几何 shader 不采样贴图，
                 // 进 Cluster 会画成实心方块 + 巨量簇（浪费且形状不对），故跳过它们、不烘焙进 Cluster，
                 // 并记下"有 cutout 投射物"供 Shadows.cs 单独用 SRP 路径画
                 // （用物体自身材质投阴影即可；几何体本身即外壳卡片，无需额外镂空处理）。
                 var co = mr.GetComponent<ClusterObject>();
-                if (co != null && co.UsesCutoff()) { m_hasCutoffCasters = true; continue; }
+                if (co != null && co.UsesCutoff()) { m_hasCutoffCasters = true; m_scanSkipCutout++; continue; }
                 var mf = mr.GetComponent<MeshFilter>();
-                if (mf == null || mf.sharedMesh == null) continue;
+                if (mf == null || mf.sharedMesh == null) { m_scanSkipNoMesh++; continue; }
                 Register(mf.sharedMesh, mr.transform.localToWorldMatrix);
             }
             dirty = true;
@@ -210,8 +246,19 @@ namespace Cluster
 
                     // ⚠️ 索引里写【新数组的全局顶点号】（vBase + 簇内编号）。
                     //    历史上 shader 又额外加了一次簇顶点基址 ⇒ 双重偏移、必然越界。
-                    for (int k = 0; k < triCount * 3; k++)
-                        allIdx.Add(vBase + (li[iStart + k] - vStart));
+                    // ⚠️ 镜像实例（负缩放，det < 0）会把三角形绕序整体翻掉；阴影 shader 是 Cull Back，
+                    //    不翻绕序的话这类物体的阴影会**整块消失**（Cull Off 时代完全看不出来）。
+                    //    烘焙期交换两个角点即可，运行时零成本。
+                    bool flipWinding = m.determinant < 0f;
+                    for (int t = 0; t < triCount * 3; t += 3)
+                    {
+                        int i0 = vBase + (li[iStart + t + 0] - vStart);
+                        int i1 = vBase + (li[iStart + t + 1] - vStart);
+                        int i2 = vBase + (li[iStart + t + 2] - vStart);
+                        allIdx.Add(i0);
+                        allIdx.Add(flipWinding ? i2 : i1);
+                        allIdx.Add(flipWinding ? i1 : i2);
+                    }
 
                     // 包围球：世界空间（剔除在 world space 判，必须是世界空间）
                     Vector3 ctr = (bmin + bmax) * 0.5f;
@@ -221,6 +268,20 @@ namespace Cluster
             }
 
             clusterCount = allIdx.Count / VertsPerCluster;
+            // 全部簇的整体包围球：靠它反推每个级联需要多厚的 z 范围。
+            {
+                Vector3 sMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+                Vector3 sMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+                for (int i = 0; i < allBounds.Count; i++)
+                {
+                    Vector4 b = allBounds[i];
+                    Vector3 ext = new Vector3(b.w, b.w, b.w);
+                    sMin = Vector3.Min(sMin, new Vector3(b.x, b.y, b.z) - ext);
+                    sMax = Vector3.Max(sMax, new Vector3(b.x, b.y, b.z) + ext);
+                }
+                m_sceneCenter = (sMin + sMax) * 0.5f;
+                m_sceneRadius = (sMax - sMin).magnitude * 0.5f;
+            }
             if (clusterCount == 0)
             {
                 Debug.LogWarning("[Cluster阴影] 场景里没找到任何可投影的 MeshRenderer，" +
@@ -249,7 +310,6 @@ namespace Cluster
             // [级联 × 簇] = 该簇在本级联的可见槽位（不可见 = 0xFFFFFFFF），BuildIndices 靠它早退。
             slotBuf = new ComputeBuffer(maxC * clusterCount, 4, ComputeBufferType.Default);
             planesBuf = new ComputeBuffer(maxC * PlanesPerCascade, 16, ComputeBufferType.Default);
-            cascadeParamBuf = new ComputeBuffer(maxC, 16, ComputeBufferType.Default);
             visibleBuf = new ComputeBuffer(maxC * clusterCount, 4, ComputeBufferType.Default);
             counterBuf = new ComputeBuffer(maxC, 4, ComputeBufferType.Default);
             // ⚠️ 必须是 IndirectArguments 类型：DrawProceduralIndirect 要求参数 buffer 创建时带这个 flag，
@@ -265,8 +325,12 @@ namespace Cluster
 #if UNITY_EDITOR
             // 排查/对比用：阴影 pass 的几何量就是「簇数 × 每簇顶点」。
             // 和 SRP 对比时看 Profiler 里 Shadows 的顶点数，这两个数直接决定光栅化开销。
+            // 扫描统计是「阴影缺块」的第一现场：如果 m_scanSkip* 里有大批物体，缺的就是它们的阴影。
             Debug.Log($"[Cluster阴影] 重建：{clusterCount} 簇 / {allPos.Count} 顶点 / {allIdx.Count} 索引" +
-                      $"/ {clusterCount * TrisPerCluster} 三角形（合并切簇，仅 LOD0，Cull Back）");
+                      $"/ {clusterCount * TrisPerCluster} 三角形（合并切簇，仅 LOD0，Cull Back）\n" +
+                      $"           扫描 {m_scanTotal} 个 MeshRenderer → 登记 {meshes.Count} 个 mesh" +
+                      $"（跳过：disabled {m_scanSkipDisabled} / 关投影 {m_scanSkipOff}" +
+                      $" / cutout {m_scanSkipCutout} / 无 Mesh {m_scanSkipNoMesh}）");
 #endif
         }
 
@@ -290,12 +354,8 @@ namespace Cluster
             }
             // 每次 Rebuild 都会 Release 旧 buffer，drawMat 若留着已释放 buffer 的引用，画出去就是未定义行为
             // （典型症状：什么都不画）。故重新绑定。三者皆为稳定 buffer（仅 GPU 内容每帧变，对象不变）。
-            if (drawMat != null)
-            {
-                drawMat.SetBuffer("_Positions", posBuf);
-                drawMat.SetBuffer("_Indices", idxBuf);
-                drawMat.SetBuffer("_Visible", visibleBuf);
-            }
+            // 绘制侧只需要 _Positions：索引由 compute 写成真索引缓冲，VS 里不再查 _Visible / _Indices。
+            if (drawMat != null) drawMat.SetBuffer("_Positions", posBuf);
         }
 
         // ---------------- 每帧：登记级联 → 剔除 → 逐级联画 ----------------
@@ -307,14 +367,11 @@ namespace Cluster
         }
 
         /// <summary>
-        /// 登记一个级联。只做 CPU 计算（世界空间平面 + LOD 参数），不往 CommandBuffer 塞东西。
+        /// 登记一个级联：只做 CPU 计算（6 个世界空间视锥平面），不往 CommandBuffer 塞任何东西。
         /// </summary>
         /// <param name="worldToClip">该级联的世界→裁剪矩阵，= GL.GetGPUProjectionMatrix(proj,true)*view，
         ///   与绘制侧逐位一致。用它的 6 个平面做簇包围球的球-平面剔除（口径与渲染完全相同，不漏不重）。</param>
-        /// <param name="proj">引擎给的 projectionMatrix（取 projScale 用）。</param>
-        /// <param name="cullSphere">Unity ShadowSplitData.cullingSphere（仅留作诊断参考，不参与剔除）。</param>
-        /// <param name="tileSize">该级联在图集里占多少像素（算 projScale 用）。</param>
-        public void AddCascade(Matrix4x4 worldToClip, Matrix4x4 proj, Vector4 cullSphere, float tileSize)
+        public void AddCascade(Matrix4x4 worldToClip)
         {
             if (!built || cascadeCount >= MaxCascades) return;
             int k = cascadeCount++;
@@ -329,18 +386,12 @@ namespace Cluster
                 cpuPlanes[k * PlanesPerCascade + p] = new Vector4(pl.normal.x, pl.normal.y, pl.normal.z, pl.distance);
             }
 
-            // projScale：把世界半径换算成阴影图 texel 半径（LOD 判据用，当前 _MaxLod=1 时恒不生效）。
-            // 正交投影下 proj[1][1] = 2/(top-bottom)，世界半径 r 对应 NDC y = r*proj11，再乘 tileSize/2 得 texel。
-            float projScale = 0f;
-            if (Mathf.Abs(proj.m11) > 1e-6f) projScale = tileSize * 0.5f * Mathf.Abs(proj.m11);
-            cpuCascadeParams[k] = new Vector4(projScale, targetTexels, minTexels, 0f);
         }
 
         /// <summary>
-        /// 一次 GPU 剔除，产出每个级联的可见簇列表(_Visible) + indirect args(_Args)。
+        /// 一次 GPU 剔除 + 索引重排，产出每个级联的可见簇槽位(_SlotOf)、索引缓冲(_DrawIdx)、args(_Args)。
         /// 必须在【所有级联都 AddCascade 完】之后、任何 draw 之前调用。
-        /// 整帧只有 3 个 dispatch（Reset / CullAll / BuildArgs）。
-        /// compute 只写 _Visible（可见簇紧凑列表，UAV 可写，无拷贝）；绘制时 shader 在 VS 自行查表还原几何。
+        /// 整帧只有 4 个 dispatch（Reset / CullAll / BuildIndices / BuildArgs），与级联数无关。
         /// </summary>
         public void Cull(CommandBuffer cmd)
         {
@@ -351,7 +402,6 @@ namespace Cluster
             int dbg = (debugForceAll == 0) ? 0 : 1;
 
             planesBuf.SetData(cpuPlanes);
-            cascadeParamBuf.SetData(cpuCascadeParams);
 
             int groups = Mathf.CeilToInt(clusterCount / (float)ThreadGroupSize);
             int cGroups = Mathf.Max(1, Mathf.CeilToInt(cascadeCount / 8f));
@@ -367,7 +417,6 @@ namespace Cluster
             {
                 cullShader.SetInt("_CascadeCount", cascadeCount);
                 cullShader.SetInt("_ClusterCount", clusterCount);
-                cullShader.SetInt("_MaxLod", 1);          // 只画 LOD0
                 cullShader.SetInt("_TrisPerCluster", TrisPerCluster);
                 cullShader.SetInt("_DebugForceAll", dbg);
 
@@ -375,7 +424,6 @@ namespace Cluster
                 cullShader.SetBuffer(k, "_Args", argsBuf);
                 cullShader.SetBuffer(k, "_Visible", visibleBuf);
                 cullShader.SetBuffer(k, "_Planes", planesBuf);
-                cullShader.SetBuffer(k, "_CascadeParams", cascadeParamBuf);
                 cullShader.SetBuffer(k, "_ClusterBounds", boundsBuf);
                 cullShader.SetBuffer(k, "_SlotOf", slotBuf);
             }
@@ -426,12 +474,12 @@ namespace Cluster
         public void Release()
         {
             posBuf?.Release(); idxBuf?.Release(); boundsBuf?.Release();
-            planesBuf?.Release(); cascadeParamBuf?.Release();
+            planesBuf?.Release();
             visibleBuf?.Release(); counterBuf?.Release(); argsBuf?.Release();
             drawIdxBuf?.Release(); drawIdxBuf = null;
             slotBuf?.Release(); slotBuf = null;
             posBuf = idxBuf = boundsBuf = null;
-            planesBuf = cascadeParamBuf = visibleBuf = counterBuf = argsBuf = null;
+            planesBuf = visibleBuf = counterBuf = argsBuf = null;
             built = false;
         }
     }
