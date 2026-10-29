@@ -39,6 +39,13 @@ UNITY_INSTANCING_BUFFER_START(UnityPerMaterial)
 	UNITY_DEFINE_INSTANCED_PROP(float, _NormalScale)
 
 	UNITY_DEFINE_INSTANCED_PROP(float, _CullOff)
+
+	// 植被风（只有 CustomRP/Defferer/Vegetation 这个 shader 用；
+	// 放在同一个 UnityPerMaterial cbuffer 里，SRP Batcher 才会把这个材质也纳入合批）。
+	UNITY_DEFINE_INSTANCED_PROP(float, _WindHeight)
+	UNITY_DEFINE_INSTANCED_PROP(float, _WindScale)
+	UNITY_DEFINE_INSTANCED_PROP(float, _WindBendMax)
+	UNITY_DEFINE_INSTANCED_PROP(float, _WindPhaseScale)
 UNITY_INSTANCING_BUFFER_END(UnityPerMaterial)
 
 

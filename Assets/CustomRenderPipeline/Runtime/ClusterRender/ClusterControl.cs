@@ -93,11 +93,25 @@ namespace Cluster
 #if UNITY_EDITOR
                 if (instance.assembleAsset == null)
                 {
+                    // 导入/预览渲染期间（AssetPreviewUpdater、out-of-process import worker）禁止落盘建资产，
+                    // 否则会抛 UnityException 并每帧刷错。此时只给一个【内存临时实例】，
+                    // 其 clusterMode 默认 SRP ⇒ Shadows.Render 不会触发 Cluster 重建，渲染链不崩、转化也关着。
+                    // 真正落盘只发生在「可写」上下文（Play 模式首次、或正常编辑器操作）。
                     instance.assembleAsset = ScriptableObject.CreateInstance<ClusterAssembleAsset>();
-                    AssetDatabase.CreateAsset(instance.assembleAsset,
-                        @"Assets/Resources/Cluster/assemble.asset");//在传入的路径中创建资源
-                    AssetDatabase.SaveAssets(); //存储资源
-                    AssetDatabase.Refresh(); //刷新
+                    try
+                    {
+                        if (!EditorApplication.isUpdating)
+                        {
+                            AssetDatabase.CreateAsset(instance.assembleAsset,
+                                @"Assets/Resources/Cluster/assemble.asset");//在传入的路径中创建资源
+                            AssetDatabase.SaveAssets(); //存储资源
+                            AssetDatabase.Refresh(); //刷新
+                        }
+                    }
+                    catch (UnityException)
+                    {
+                        // 导入/预览上下文里 CreateAsset 被禁：已有内存实例可用，忽略即可。
+                    }
                 }
 #endif
                 return instance;

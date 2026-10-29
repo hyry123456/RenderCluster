@@ -100,6 +100,7 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 // 一维展开：idx = 簇下标 × 384 + 角点。不可见的簇靠 _SlotOf 直接退出（不写索引）。
 // 规模 = 总簇数 × 384，与组数、每组簇数上限都无关。
 // ⚠️ 别改成「y = 组内簇数上限、z = 组」的方阵：那是上千万线程，实测把省下的 draw 全吃回去。
+// ⚠️【试过并回退】每簇一个 384 线程组：occupancy 下降，ClusterCull 反而变慢。
 // ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 必须二维拆开，所以用 _IdxDimX 把 (x,y) 拼回一维。
 [numthreads(64, 1, 1)]
 void BuildIndices(uint3 id : SV_DispatchThreadID)

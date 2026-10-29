@@ -30,7 +30,11 @@ namespace Cluster
     /// </summary>
     public class ClusterShadowRenderer
     {
-        public const int MaxCascades = 8;          // 方向光级联上限（Unity 最多 4，留余量）
+        // 方向光级联上限。必须与 ShadowSetting.Directional.cascadeCount 的 [Range(1,4)] 一致：
+        // 它直接决定阴影侧所有缓冲的分配规模（`_DrawIdx` = 级联数 × 簇数 × 384 × 4B）。
+        // 31854 簇时 8 → 391MB，4 → 196MB，白占的那一倍没有任何用处。
+        // ⚠️ 若以后把 cascadeCount 的上限改大，这里必须同步，否则 AddCascade 会静默丢弃新增级联。
+        public const int MaxCascades = 4;
 
         /// <summary>
         /// 每簇三角形数。改这个值必须同步改 shader 里的 TRIS_PER_CLUSTER
@@ -41,14 +45,27 @@ namespace Cluster
         /// <summary>每簇索引数 = TrisPerCluster × 3。shader 不再硬编码顶点数。</summary>
         public const int VertsPerCluster = TrisPerCluster * 3;
 
-        const int PlanesPerCascade = 6;          // 标准视锥 6 平面（与 compute 内 _Planes[c*6+p] 口径一致）
+        /// <summary>6 个视锥平面 + 2 个光轴 z 边界平面（补 reversed-Z 下 CalculateFrustumPlanes 不剔深度的问题）。
+        /// ⚠️ 改这个值必须同步改 compute 里的 `p &lt; 8` 循环。</summary>
+        const int PlanesPerCascade = 8;
         const int ThreadGroupSize = 64;
+
+        /// <summary>
+        /// 可见率阈值（百分比）：某级联可见簇 ≥ 总簇数 × 该值% ⇒ 直接画【静态全量段】，跳过索引重排。
+        /// 依据：被视锥剔掉的簇 x/y 落不进本级联盒内 ⇒ 其影子也落不进 ⇒ 多画它们视觉无害，
+        /// 只是多走几何；换掉的是整整 48.9MB/级的索引写入 + 同量读回。
+        /// 调到 101 可完全禁用这条捷径（每级都重排，回到老行为）。
+        /// 场景可见率低时（比如大部分簇看不到）自动落回重排，因为那时重排是真的在省几何。
+        /// </summary>
+        const int FullSkipPercent = 90;
 
         // Resources.Load 的路径 = 相对任意 Resources 文件夹、不带扩展名
         const string DrawShaderName = "Cluster/ClusterShadow";
         const string CullShaderName = "Cluster/ClusterShadowCull";
 
         static ClusterShadowRenderer s_instance;
+        /// <summary>是否已经创建过（Dispose 时用来避免「为了释放反而 new 一个」）。</summary>
+        public static bool HasInstance => s_instance != null;
         public static ClusterShadowRenderer Instance
         {
             get
@@ -63,23 +80,22 @@ namespace Cluster
         readonly List<Matrix4x4> worlds = new List<Matrix4x4>();
         readonly Dictionary<Mesh, ClusterMeshAsset> baked = new Dictionary<Mesh, ClusterMeshAsset>();
 
-        // 全部簇的世界包围球（Rebuild 时算好）——深度范围推导用它反推所需 z 厚度。
-        Vector3 m_sceneCenter;
-        float m_sceneRadius;
-
-        /// <summary>取簇集合的整体包围球（世界空间）。没建好时返回 false。</summary>
-        public bool TryGetSceneBounds(out Vector3 center, out float radius)
-        {
-            center = m_sceneCenter;
-            radius = m_sceneRadius;
-            return built && m_sceneRadius > 0f;
-        }
+        // ⚠️ 曾经的「全场景包围球」（m_sceneCenter / m_sceneRadius）已删除：
+        //    它被用来给每个级联算 pad，等于要求每级联覆盖整场景沿光轴跨度（级联 0 要 56×）。
+        //    现在改成逐级联只统计 x/y 相交的簇（见 ComputeDepthPad），不再需要全场景球。
 
         /// <summary>
-        /// 把正交投影的 z 范围按 pad 倍**围绕中心**扩张（pad &lt;= 1 原样返回）。
+        /// 把正交投影的 z 范围按 pad 倍**围绕板中心**扩张（pad &lt;= 1 原样返回）。
         ///
-        /// 正交下 z_ndc = m22 · z_view + m23，范围中心 = -m23/m22。
-        /// 让 m22、m23 同除 pad ⇒ 中心不变、斜率变小 ⇒ 可视 z 范围扩大 pad 倍。
+        /// 正交下 ndc = m22 · z_view + m23。簇集合是沿光轴双侧都超出原板的球，
+        /// 必须把"板中心(ndc=0.5 处)"两侧一起拓宽，否则只扩远侧、朝光近侧仍被裁 ⇒ 近级联阴影缺块。
+        ///
+        /// 做法（与旧实现的关键区别）：
+        ///   · m22 /= pad            → 斜率变小，可视 z 范围变宽 pad 倍（旧实现也是这个）。
+        ///   · m23 同步平移，使板中心(0.5 处)不动 ⇒ 近/远两侧都扩，而不是只扩一侧。
+        /// 旧实现把 m22/m23 同除 pad，等价于"围绕 ndc=0 边"展开（只扩远侧），
+        /// 朝光一侧(更靠近光、对应近处级联的物体)超出原板的部分照样被裁光 ⇒ 阴影缺块/全错。
+        /// 新公式：中心 z_c=(0.5-m23)/m22 在变换后仍为 ndc=0.5，且新 z 范围 = pad× 原范围（对称）。
         ///
         /// ⚠️ 必须对「渲染矩阵、图集采样矩阵、SetViewProjectionMatrices」用同一个结果，
         /// 否则两侧深度约定不一致 ⇒ 阴影整体错位。Shadows.cs 里在拿到 projectionMatrix 后
@@ -88,14 +104,142 @@ namespace Cluster
         public static Matrix4x4 PadOrthoDepth(Matrix4x4 proj, float pad)
         {
             if (pad <= 1.0001f) return proj;
+            float newM23 = (proj.m23 + 0.5f * (pad - 1f)) / pad;   // 平移到板中心，近/远对称扩
             proj.m22 /= pad;
-            proj.m23 /= pad;
+            proj.m23 = newM23;
             return proj;
         }
 
         // 最近一次场景扫描的统计：用来确认「该投影的物体是不是全部进了簇集合」。
         // 阴影缺块的第一嫌疑永远是「投射物压根没登记」，所以这几个数要在 Rebuild 日志里能看到。
         int m_scanTotal, m_scanSkipDisabled, m_scanSkipOff, m_scanSkipCutout, m_scanSkipNoMesh;
+
+        // ---------------- 级联深度范围：按「真正会投进该级联的簇」精确推导 ----------------
+        // CPU 侧簇包围球副本（与 GPU 的 _ClusterBounds 同序、同内容）。
+        // 只用于逐级联推导「沿光轴需要多厚」，不参与任何绘制。
+        Vector4[] m_cpuBounds;
+
+        // pad 缓存：静止场景下这段是「数千簇 × 级联数」的 CPU 遍历，绝不能每帧跑。
+        // key = 该级联的剔除球 + 光方向；两者任一变化才重算。
+        readonly Vector4[] m_padSphereKey = new Vector4[MaxCascades];
+        readonly Vector3[] m_padLightKey = new Vector3[MaxCascades];
+        readonly bool[] m_padHasKey = new bool[MaxCascades];
+        readonly float[] m_padCache = new float[MaxCascades];
+
+        /// <summary>
+        /// 该级联沿光轴需要多厚的 pad（1 = 原样不撑）。
+        ///
+        /// 【为什么不能用全场景包围球】旧实现是
+        ///     need = |投影(全场景球心 − 级联球心)| + 全场景半径  ⇒  pad = need / 级联球半径
+        /// 这等于要求每个级联都覆盖【整个场景沿光轴的跨度】。实测级联 0 要 56.8×、
+        /// 级联 1 要 16.8× —— 光栅化器彻底不再裁近侧，整场景的三角形都要走完 setup + raster
+        /// 才被深度测试丢掉。阴影 pass 本来就是 fill-rate bound，这是纯浪费，而且
+        /// 「场景里物体越多越大 ⇒ 全场景半径越大 ⇒ pad 越大 ⇒ 阴影越慢」，正是内容变多拖慢阴影的通道。
+        ///
+        /// 【正确口径】平行光级联是正交投影且投影方向 = 光线方向 ⇒ 沿光轴不改变光空间 x/y。
+        /// 所以一个簇的阴影只可能落进「光空间 x/y 与其相交」的那个级联；
+        /// 其余簇沿光轴再远也与本盒无关，不需要覆盖。
+        /// ⇒ 只统计 x/y 相交的簇，取它们沿光轴的 [minZ, maxZ]，pad 就是「刚好盖住这段」的倍数。
+        ///
+        /// 数学：
+        ///   正交下 ndc = m22·z + m23，原可视范围 ndc∈[-1,1] ⇒ z∈[z0,z1]，中心 zc、半厚 h。
+        ///   要让扩张后的范围（围绕 zc 对称、半厚 h·pad）盖住 [minZ,maxZ]：
+        ///       pad = max(zc − minZ, maxZ − zc) / h
+        /// </summary>
+        public float ComputeDepthPad(int cascade, Vector3 lightDir, Matrix4x4 lightView,
+                                     Vector4 cullingSphere, Matrix4x4 proj, float tileSize)
+        {
+            if (!built || m_cpuBounds == null || m_cpuBounds.Length == 0) return 1f;
+            if (Mathf.Abs(proj.m22) < 1e-6f) return 1f;
+            if (cascade < 0 || cascade >= MaxCascades) return 1f;
+
+            // ---- 缓存判定：球没动、光没转 ⇒ 直接返回上次数值 ----
+            bool valid = m_padHasKey[cascade]
+                && (cullingSphere - m_padSphereKey[cascade]).sqrMagnitude <= 1f
+                && Vector3.Angle(lightDir, m_padLightKey[cascade]) <= 1f;
+            if (valid) return m_padCache[cascade];
+
+            float R = Mathf.Max(cullingSphere.w, 1e-3f);
+
+            // 原 z 范围（view space）：正交下 ndc = m22·z + m23。
+            // ⚠️ 深度约定必须是 [0,1]（D3D 风格），依据：
+            //    PadOrthoDepth 的平移式 newM23 = (m23 + 0.5(pad-1))/pad
+            //    只在 [0,1] 下等价于「围绕板中心(ndc=0.5)对称扩张 pad 倍」——
+            //    而这正是实测修好缺块的那一版。若按 [-1,1] 反解，厚度会算成 2 倍 ⇒ pad 偏小 ⇒ 缺块。
+            float za = (0f - proj.m23) / proj.m22;
+            float zb = (1f - proj.m23) / proj.m22;
+            float z0 = Mathf.Min(za, zb), z1 = Mathf.Max(za, zb);
+            float zc = (z0 + z1) * 0.5f;
+            float half = Mathf.Max((z1 - z0) * 0.5f, 1e-3f);
+
+            // 级联球心在光空间的位置：只用来算 x/y 偏移（不依赖 view 原点在哪）
+            Vector3 sLight = lightView.MultiplyPoint3x4(
+                new Vector3(cullingSphere.x, cullingSphere.y, cullingSphere.z));
+
+            float minZ = float.MaxValue, maxZ = float.MinValue;
+            int hit = 0;
+            // 诊断：记录「最撑大板」的那个簇，用来定位到底是哪个物体逼得 pad 变大。
+            float worstNeed = 0f, worstR = 0f;
+            Vector3 worstC = Vector3.zero;
+            var bounds = m_cpuBounds;
+            for (int i = 0; i < bounds.Length; i++)
+            {
+                Vector4 b = bounds[i];
+                float r = b.w;
+                Vector3 c = lightView.MultiplyPoint3x4(new Vector3(b.x, b.y, b.z));
+
+                // x/y 与该级联方块（光空间半宽 = R）相交？这是「阴影可能落进本盒」的充要条件。
+                // 用「绝对值 − 半径 > R」判外，等价于把方块按簇半径外扩（保守方向，不会漏）。
+                float dx = c.x - sLight.x;
+                if (dx < 0f) dx = -dx;
+                if (dx - r > R) continue;
+                float dy = c.y - sLight.y;
+                if (dy < 0f) dy = -dy;
+                if (dy - r > R) continue;
+
+                hit++;
+                float zn = c.z - r, zf = c.z + r;
+                if (zn < minZ) minZ = zn;
+                if (zf > maxZ) maxZ = zf;
+
+                float needHere = Mathf.Max(zc - zn, zf - zc);
+                if (needHere > worstNeed)
+                {
+                    worstNeed = needHere;
+                    worstR = r;
+                    worstC = new Vector3(b.x, b.y, b.z);
+                }
+            }
+
+            float pad = 1f;
+            if (hit > 0 && minZ <= maxZ)
+            {
+                float need = Mathf.Max(zc - minZ, maxZ - zc);
+                pad = need / half;
+                pad *= 1.10f;                // 10% 余量：缓存不保证每帧精确，留一点防缺块
+            }
+            pad = Mathf.Clamp(pad, 1f, 16f);
+
+            m_padCache[cascade] = pad;
+            m_padSphereKey[cascade] = cullingSphere;
+            m_padLightKey[cascade] = lightDir;
+            m_padHasKey[cascade] = true;
+
+#if UNITY_EDITOR
+            // 本帧该级联的 pad 有多少是「真需要」、覆盖了多少簇，
+            // 以及【是谁在撑大板】—— 定位到具体物体才能判断该不该排除它。
+            // 只在 ClusterDebug 模式下输出（debugStats），平时全静默。
+            if (debugStats && Time.frameCount % 240 == 0)
+            {
+                float texelPerMeter = tileSize / Mathf.Max(2f * R, 1e-3f);
+                Debug.Log($"[Cluster阴影] 级联 {cascade} pad={pad:F2}×（x/y 命中 {hit} 簇 / 共 {bounds.Length}）" +
+                          $"\n            最撑板的簇：世界中心 ({worstC.x:F1},{worstC.y:F1},{worstC.z:F1})，半径 {worstR:F2}m" +
+                          $"，需深 {worstNeed:F1}m（原板半厚 {half:F1}m ⇒ {worstNeed / half:F1}×）" +
+                          $"，投影约 {worstR * texelPerMeter:F1} texel");
+            }
+#endif
+            return pad;
+        }
 
         // ---------------- GPU 资源 ----------------
         Material drawMat;
@@ -114,12 +258,27 @@ namespace Cluster
         /// 有则 Shadows.cs 需用 SRP 路径单独画它们的阴影（Cluster 纯几何 shader 无法镂空）。</summary>
         bool m_hasCutoffCasters = false;
 
+        /// <summary>诊断用：可见簇数读回是否还在飞行中（防止每帧重复请求）。</summary>
+        bool m_statsPending;
+
+        /// <summary>_DrawIdx 的段 0（静态全量副本）还没填 ⇒ 下次 Cull 时跑一次 CopyStatic。</summary>
+        bool m_needStaticCopy;
+
         // ---------------- 每帧级联数据 ----------------
         int cascadeCount;
         readonly Vector4[] cpuPlanes = new Vector4[MaxCascades * PlanesPerCascade];
 
         /// <summary>调试开关：非 0 时 compute 跳过所有剔除、强制全可见（隔离测试用）。</summary>
         public int debugForceAll = 0;
+
+        /// <summary>
+        /// 诊断输出开关：由 Shadows.cs 按 `clusterMode == ClusterDebug` 置位（平时全静默）。
+        /// 打开后每 240 帧打 pad 推导明细，每 120 帧异步读回 _Counter 打「可见簇 ⇒ 倍数」。
+        ///
+        /// ⚠️ ClusterDebug 同时会把 debugForceAll 置 1（强制全可见）⇒ 此时「倍数」恒等于级联数（4.00×），
+        /// 不是真实值。要复测真实倍数，临时注释掉 Shadows.cs 里 debugForceAll 那一行即可。
+        /// </summary>
+        public bool debugStats = false;
 
         public bool IsReady => built && !dirty;
         public int ClusterCount => clusterCount;
@@ -149,29 +308,117 @@ namespace Cluster
 
         /// <summary>扫描场景，把会投影的静态 MeshRenderer 全收进来。
         /// cluster 路径覆盖的是【整个场景】，SRP 路径也是，这样两条路才可比。</summary>
+        // ---------------- cutout 投射物的 SRP 阴影分流 ----------------
+        // 草 / 蕨 / 灌木这类 alpha 镂空物体不进 Cluster：纯几何 shader 没法镂空，
+        // 烘进簇只会得到一堆实心方块阴影（还白烧几十万个顶点）。
+        // 它们改由 Shadows.cs 在 cluster 绘制之后，用 SRP 的 ShadowCaster 单独画一次；
+        // 那条路按 renderingLayerMask 的 bit29 过滤 ⇒ 这里必须给它们打上这一位。
+        //
+        // 为什么判定看【材质 keyword】而不是看 ClusterObject 组件：
+        // 场景里的草是几百份 prefab 实例，绝大多数没挂 ClusterObject（挂了反而会被
+        // ApplyStandardMaterials 换成空白的 DefferStandard 材质）。组件可以漏，材质不会。
+        readonly List<MeshRenderer> m_markedCutout = new List<MeshRenderer>();
+        readonly List<uint> m_markedCutoutMask = new List<uint>();
+
+        static bool MaterialNeedsClip(MeshRenderer mr)
+        {
+            var mats = mr.sharedMaterials;
+            if (mats == null) return false;
+            for (int i = 0; i < mats.Length; i++)
+                if (mats[i] != null && mats[i].IsKeywordEnabled("_CLIPPING")) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 镂空投射物的 renderingLayerMask：打上 bit29（SRP 阴影通道用它过滤），
+        /// 并【清掉 bit28】——bit28 是「这个物体由 Cluster 画 GBuffer」的标记，
+        /// SRP 的 DrawRenderers 是按「排除 bit28」来过滤的；草没注册进 Cluster，
+        /// 而新建 MeshRenderer 的 mask 默认是 0xFFFFFFFF（含 bit28）⇒ 不清掉就会被排除，直接不画。
+        /// </summary>
+        /// <remarks>不看 enabled：LODGroup 会随相机来回切子 renderer 的 enabled，
+        /// 只给"扫描那一刻恰好在看的那级"处理，切 LOD 后草就没阴影了。</remarks>
+        void MarkCutoutCasters(MeshRenderer[] mrs)
+        {
+            if (!Application.isPlaying) return;
+            const uint cutoffBit = 1u << ClusterProverty.CutoffRenderingLayerBit;
+            const uint clusterBit = 1u << ClusterProverty.ClusterRenderingLayerBit;
+            for (int i = 0; i < mrs.Length; i++)
+            {
+                var mr = mrs[i];
+                if (mr == null) continue;
+
+                // cutout（草/蕨/灌木）：打 bit29、清 bit28 ⇒ 进 SRP 阴影、不进 Cluster。
+                // 其余物体：必须【清掉 bit29】。渲染器 renderingLayerMask 默认是 0xFFFFFFFF，
+                // 本来就含 bit29；Cluster 阴影后的「cutout SRP 阴影 pass」按 light.mask=1<<29 过滤，
+                // 不清的话【所有非 cutout 物体】都会被它再投一遍阴影（实测多出 0.4~0.5ms）。
+                // 簇物体此时已是「只留 bit28」（ClusterObject.OnEnable 设好），& ~bit29 对它是 no-op，
+                // 所以这里统一处理不会破坏簇物体的掩码。
+                uint want = MaterialNeedsClip(mr)
+                    ? (mr.renderingLayerMask | cutoffBit) & ~clusterBit
+                    : mr.renderingLayerMask & ~cutoffBit;
+                if (want == mr.renderingLayerMask) continue;        // 已经是想要的值，不必记录
+                m_markedCutout.Add(mr);
+                m_markedCutoutMask.Add(mr.renderingLayerMask);
+                mr.renderingLayerMask = want;
+            }
+        }
+
+        /// <summary>还原本渲染器打过的位（退出 Play / 重建前调用），避免脏化场景。</summary>
+        void RestoreCutoutMarks()
+        {
+            for (int i = 0; i < m_markedCutout.Count; i++)
+                if (m_markedCutout[i] != null)
+                    m_markedCutout[i].renderingLayerMask = m_markedCutoutMask[i];
+            m_markedCutout.Clear();
+            m_markedCutoutMask.Clear();
+        }
+
         void ScanScene()
         {
             m_hasCutoffCasters = false;
             m_scanTotal = m_scanSkipDisabled = m_scanSkipOff = m_scanSkipCutout = m_scanSkipNoMesh = 0;
+            // 必须 Include（含 disabled）：草 prefab 是 LODGroup，扫描那一刻只有「当前那级」的
+            // renderer 是 enabled 的。若只扫 enabled，bit29 只打在当前级 ⇒ 相机切 LOD 后新启用的
+            // 那级还带着默认 mask 0xFFFFFFFF（含 bit28）⇒ 既被 SRP GBuffer 的 ~bit28 过滤掉（整片消失），
+            // 又没 bit29（不投影）。所以所有 LOD 级（含 disabled）都要先打上 bit29 + 清 bit28。
             var mrs = UnityEngine.Object.FindObjectsByType<MeshRenderer>(
-                FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
             m_scanTotal = mrs.Length;
+
+            // 先把所有镂空投射物（含 LODGroup 当前没启用的那几级）的 bit29 打上、bit28 清掉
+            MarkCutoutCasters(mrs);
+
             for (int i = 0; i < mrs.Length; i++)
             {
                 var mr = mrs[i];
                 if (mr == null) { m_scanSkipDisabled++; continue; }
-                // 跳过 disabled 的 renderer：LODGroup 会把「非当前级」的 renderer 置为 disabled，
-                // 全部登记会让多个 LOD 同时投影（重影 + 几何翻倍）。这里保持「只烘当前级」的老行为，
-                // 但把数量记下来 —— 如果这个数很大，说明场景里 LODGroup 很多，
-                // 阴影用的是「扫描那一刻恰好在看的 LOD」，远处会偏粗（不是缺块，但会不一致）。
+                // ① 跳过「整条 hierarchy 被禁用」的物体（例如用户把父级 Terrain 关掉，
+                //    子物体 terrain_far_01 / terrain_near_01 的 MeshRenderer.enabled 仍是 true，
+                //    但 activeInHierarchy == false ⇒ 场景里根本不可见，SRP 剔除也按这个判）。
+                //    只查 mr.enabled 会漏掉它，导致它钻进 cluster 阴影 buffer、凭空投出一道山影
+                //    （几何体本身不被画，于是「有山影却看不到山」）。所以必须先按 activeInHierarchy 排。
+                if (!mr.gameObject.activeInHierarchy) { m_scanSkipDisabled++; continue; }
+                // ② 跳过 LODGroup 当前没启用的级：LODGroup 会把「非当前级」的 renderer 置为 disabled，
+                //    全部登记会让多个 LOD 同时投影（重影 + 几何翻倍）。这里保持「只烘当前级」的老行为，
+                //    但把数量记下来 —— 如果这个数很大，说明场景里 LODGroup 很多，
+                //    阴影用的是「扫描那一刻恰好在看的 LOD」，远处会偏粗（不是缺块，但会不一致）。
                 if (!mr.enabled) { m_scanSkipDisabled++; continue; }
                 if (mr.shadowCastingMode == ShadowCastingMode.Off) { m_scanSkipOff++; continue; }
+                // 注：曾经试过按包围盒半径自动排除「超大投射物」（地形 plane 之类），
+                // 实测没必要 —— 这类物体本来就不该投阴影，直接在场景里把它的
+                // ShadowCastingMode 设成 Off 更直接、更可控（也更容易在 Inspector 里看见）。
+                // 判断口径保持只有一条：shadowCastingMode != Off 才进簇集合。
                 // 需 alpha 镂空的物体（草/蕨/灌木）走 SRP 阴影路径：Cluster 纯几何 shader 不采样贴图，
                 // 进 Cluster 会画成实心方块 + 巨量簇（浪费且形状不对），故跳过它们、不烘焙进 Cluster，
                 // 并记下"有 cutout 投射物"供 Shadows.cs 单独用 SRP 路径画
                 // （用物体自身材质投阴影即可；几何体本身即外壳卡片，无需额外镂空处理）。
+                // 判定「是否需要 SRP 阴影」：挂了 ClusterObject 的看它的资产标记，
+                // 没挂的（草/蕨这类 prefab 实例）直接看材质的 _CLIPPING keyword。
                 var co = mr.GetComponent<ClusterObject>();
-                if (co != null && co.UsesCutoff()) { m_hasCutoffCasters = true; m_scanSkipCutout++; continue; }
+                if ((co != null && co.UsesCutoff()) || MaterialNeedsClip(mr))
+                {
+                    m_hasCutoffCasters = true; m_scanSkipCutout++; continue;
+                }
                 var mf = mr.GetComponent<MeshFilter>();
                 if (mf == null || mf.sharedMesh == null) { m_scanSkipNoMesh++; continue; }
                 Register(mf.sharedMesh, mr.transform.localToWorldMatrix);
@@ -267,21 +514,13 @@ namespace Cluster
                 }
             }
 
-            clusterCount = allIdx.Count / VertsPerCluster;
-            // 全部簇的整体包围球：靠它反推每个级联需要多厚的 z 范围。
-            {
-                Vector3 sMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-                Vector3 sMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-                for (int i = 0; i < allBounds.Count; i++)
-                {
-                    Vector4 b = allBounds[i];
-                    Vector3 ext = new Vector3(b.w, b.w, b.w);
-                    sMin = Vector3.Min(sMin, new Vector3(b.x, b.y, b.z) - ext);
-                    sMax = Vector3.Max(sMax, new Vector3(b.x, b.y, b.z) + ext);
-                }
-                m_sceneCenter = (sMin + sMax) * 0.5f;
-                m_sceneRadius = (sMax - sMin).magnitude * 0.5f;
-            }
+            // ⚠️ 簇数必须按 allBounds 算，不能用 allIdx/384：
+            //    合并切簇时最后一个簇可能不满 128 三角形，allIdx 不是 384 的整数倍，
+            //    向下取整会让 clusterCount < 簇数 ⇒ boundsBuf 分配偏小、SetData 失败/截断，
+            //    且 compute 会漏掉尾簇（不剔除也不画）。这里补齐索引到 簇数×384：
+            //    补 0 只是退化三角形（面积 0），不产生深度，安全。
+            clusterCount = allBounds.Count;
+            while (allIdx.Count < clusterCount * VertsPerCluster) allIdx.Add(0);
             if (clusterCount == 0)
             {
                 Debug.LogWarning("[Cluster阴影] 场景里没找到任何可投影的 MeshRenderer，" +
@@ -297,15 +536,23 @@ namespace Cluster
             posBuf.SetData(fullPos);
             idxBuf.SetData(fullIdx);
             boundsBuf.SetData(allBounds.ToArray());
+            // CPU 副本：逐级联推导 pad 要在 CPU 上遍历它（见 ComputeDepthPad）。
+            // 只存一份 float4/簇，几千簇 ≈ 几十 KB，可忽略；rebuild 时同步更新、Release 时清空。
+            m_cpuBounds = allBounds.ToArray();
+            for (int i = 0; i < MaxCascades; i++) m_padHasKey[i] = false;
 
             // 剔除用的 buffer 大小都按"级联数 × 簇数"来，宁可多 alloc 也不要重分配
             int maxC = Mathf.Max(1, MaxCascades);
 
-            // 真索引缓冲：每级联一段（起点 = 级联 × 簇数 × 384），由 compute 每帧只给【可见】簇写。
+            // 真索引缓冲：(级联数 + 1) 段，每段一份全量索引（簇数 × 384）。
+            //   段 0        = 静态全量副本（Rebuild 后由 CopyStatic 填一次，永不改变）
+            //   段 (k+1)    = 级联 k 的压实段（compute 每帧只给【可见】簇写）
+            // 可见率高的级联直接画段 0 ⇒ 完全跳过每帧重排（等价于 Unity 用 mesh 自带静态索引）。
             // Target.Index | Target.Raw：D3D11 不允许索引缓冲同时是 Structured，但允许同时是 Raw
             // ⇒ compute 用 RWByteAddressBuffer 写、draw 直接当索引读，单缓冲零拷贝。
             drawIdxBuf = new GraphicsBuffer(GraphicsBuffer.Target.Index | GraphicsBuffer.Target.Raw,
-                maxC * clusterCount * VertsPerCluster, 4);
+                (maxC + 1) * clusterCount * VertsPerCluster, 4);
+            m_needStaticCopy = true;      // 段 0 尚未填，首次 Cull 时用 CopyStatic 补
 
             // [级联 × 簇] = 该簇在本级联的可见槽位（不可见 = 0xFFFFFFFF），BuildIndices 靠它早退。
             slotBuf = new ComputeBuffer(maxC * clusterCount, 4, ComputeBufferType.Default);
@@ -371,7 +618,27 @@ namespace Cluster
         /// </summary>
         /// <param name="worldToClip">该级联的世界→裁剪矩阵，= GL.GetGPUProjectionMatrix(proj,true)*view，
         ///   与绘制侧逐位一致。用它的 6 个平面做簇包围球的球-平面剔除（口径与渲染完全相同，不漏不重）。</param>
-        public void AddCascade(Matrix4x4 worldToClip)
+        public void AddCascade(Matrix4x4 worldToClip) => AddCascade(worldToClip, default(Matrix4x4), 0f, 0f, false);
+
+        /// <summary>
+        /// 登记一个级联（带【光轴 z 范围】剔除）。
+        ///
+        /// 为什么要额外剔 z：`GeometryUtility.CalculateFrustumPlanes` 在 reversed-Z 下给出的
+        /// 近/远两个平面几乎恒真（深度方向不剔）⇒ 沿光轴远在板外的簇也会被提交。
+        /// 而它们**根本写不进阴影图**（光栅化器按投影矩阵的 z 范围整块裁掉），
+        /// 提交它们纯属白付顶点+三角形 setup。实测阴影 pass 是 setup bound（atlas 仅 4×512²，
+        /// 填充 ≈0.01ms），所以这批"必被裁掉"的簇就是 DrawProcedural 那 1ms 的大头。
+        ///
+        /// 正确性：只剔「整个簇都在 z 板之外」的，它们对阴影图零贡献 ⇒ 剔掉无任何视觉变化。
+        /// 压住跨板的簇（部分在内）一律保留，所以不会缺块。
+        ///
+        /// 这也正是 Unity 的口径：它按级联包容球（半径 R）剔除，球外的物体本来就不画——
+        /// 而球外的物体恰好也在 ±R 的 z 板之外，所以两者等价。
+        /// </summary>
+        /// <param name="view">光空间的 view 矩阵（z 范围就定义在它的空间里）。</param>
+        /// <param name="zMin">该级联在光空间的近端 z（含 pad 后的真实裁剪范围）。</param>
+        /// <param name="zMax">该级联在光空间的远端 z。</param>
+        public void AddCascade(Matrix4x4 worldToClip, Matrix4x4 view, float zMin, float zMax, bool cullZ)
         {
             if (!built || cascadeCount >= MaxCascades) return;
             int k = cascadeCount++;
@@ -380,12 +647,28 @@ namespace Cluster
             // 关键：必须用 GL.GetGPUProjectionMatrix(proj,true)*view（即渲染时实际用的矩阵），
             // 不能用裸 proj*view —— 后者在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除。
             var planes = GeometryUtility.CalculateFrustumPlanes(worldToClip);
-            for (int p = 0; p < PlanesPerCascade; p++)
+            for (int p = 0; p < 6; p++)
             {
                 var pl = planes[p];
                 cpuPlanes[k * PlanesPerCascade + p] = new Vector4(pl.normal.x, pl.normal.y, pl.normal.z, pl.distance);
             }
 
+            // 第 6/7 个平面 = 光轴 z 的两个边界，写成「dot(n,p)+w >= -r 即在内部」的统一形式：
+            //   z_view = view.row2 · (p,1)  ⇒  z_view >= zMin  ⟺  dot(row2.xyz, p) + (row2.w - zMin) >= 0
+            //                                  z_view <= zMax  ⟺  dot(-row2.xyz, p) + (zMax - row2.w) >= 0
+            // cullZ=false（或退化范围）时把这俩写成恒真平面（w=+∞ 的等效：法线 0、w 取大值），
+            // 保持 buffer 长度一致、kernel 不必分支。
+            if (cullZ && zMax > zMin)
+            {
+                Vector4 r2 = new Vector4(view.m20, view.m21, view.m22, view.m23);
+                cpuPlanes[k * PlanesPerCascade + 6] = new Vector4(r2.x, r2.y, r2.z, r2.w - zMin);
+                cpuPlanes[k * PlanesPerCascade + 7] = new Vector4(-r2.x, -r2.y, -r2.z, zMax - r2.w);
+            }
+            else
+            {
+                cpuPlanes[k * PlanesPerCascade + 6] = new Vector4(0f, 0f, 0f, 1e9f);
+                cpuPlanes[k * PlanesPerCascade + 7] = new Vector4(0f, 0f, 0f, 1e9f);
+            }
         }
 
         /// <summary>
@@ -412,13 +695,15 @@ namespace Cluster
             int kCull = cullShader.FindKernel("CullAll");
             int kIdx = cullShader.FindKernel("BuildIndices");
             int kArgs = cullShader.FindKernel("BuildArgs");
+            int kCopy = cullShader.FindKernel("CopyStatic");
 
-            foreach (int k in new[] { kReset, kCull, kIdx, kArgs })
+            foreach (int k in new[] { kReset, kCull, kIdx, kArgs, kCopy })
             {
                 cullShader.SetInt("_CascadeCount", cascadeCount);
                 cullShader.SetInt("_ClusterCount", clusterCount);
                 cullShader.SetInt("_TrisPerCluster", TrisPerCluster);
                 cullShader.SetInt("_DebugForceAll", dbg);
+                cullShader.SetInt("_FullSkipPercent", FullSkipPercent);
 
                 cullShader.SetBuffer(k, "_Counter", counterBuf);
                 cullShader.SetBuffer(k, "_Args", argsBuf);
@@ -427,24 +712,87 @@ namespace Cluster
                 cullShader.SetBuffer(k, "_ClusterBounds", boundsBuf);
                 cullShader.SetBuffer(k, "_SlotOf", slotBuf);
             }
-            // 只有 BuildIndices 用到这两份
+            // BuildIndices / CopyStatic 用到这两份（一个读源、一个写目标）
             cullShader.SetBuffer(kIdx, "_CornerGvid", idxBuf);
             cullShader.SetBuffer(kIdx, "_DrawIdx", drawIdxBuf);
+            cullShader.SetBuffer(kCopy, "_CornerGvid", idxBuf);
+            cullShader.SetBuffer(kCopy, "_DrawIdx", drawIdxBuf);
 
-            cmd.DispatchCompute(cullShader, kReset, 1, 1, 1);
-            cmd.DispatchCompute(cullShader, kCull, groups, 1, 1);
-
-            // 索引重排：总簇数 × 384 个角点，每线程一个，内部循环所有级联
-            // （_CornerGvid 对 4 个级联是同一个值，只读一次）。
-            // ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 二维拆开，kernel 用 _IdxDimX 拼回一维。
+            // 一维展开的 x 维长度（CopyStatic 与 BuildIndices 共用）
             int totalGroups = Mathf.Max(1,
                 Mathf.CeilToInt(clusterCount * (float)VertsPerCluster / ThreadGroupSize));
             int gx = Mathf.Min(65535, totalGroups);
             int gy = Mathf.Max(1, Mathf.CeilToInt(totalGroups / (float)gx));
             cullShader.SetInt("_IdxDimX", gx * ThreadGroupSize);
-            cmd.DispatchCompute(cullShader, kIdx, gx, gy, 1);
 
+            // ===== 段 0：静态全量索引副本（只在 Rebuild 后跑一次，之后永不变）=====
+            // 有了它，可见率高的级联不用每帧重排索引 —— 等价于「Unity 用 mesh 自带静态索引」。
+            if (m_needStaticCopy)
+            {
+                cmd.BeginSample("CCull.CopyStatic");
+                cmd.DispatchCompute(cullShader, kCopy, gx, gy, 1);
+                cmd.EndSample("CCull.CopyStatic");
+                m_needStaticCopy = false;
+            }
+
+            // 逐 dispatch 打 sample：ClusterCull 是 4 个 dispatch 的合计，
+            // 不拆开就只能知道总量、不知道谁是主要耗时（BuildIndices 的索引写入 vs CullAll 的原子追加）。
+            cmd.BeginSample("CCull.Reset");
+            cmd.DispatchCompute(cullShader, kReset, 1, 1, 1);
+            cmd.EndSample("CCull.Reset");
+
+            cmd.BeginSample("CCull.CullAll");
+            cmd.DispatchCompute(cullShader, kCull, groups, 1, 1);
+            cmd.EndSample("CCull.CullAll");
+
+            // ⚠️ BuildArgs 必须在 BuildIndices【之前】：BuildIndices 读 _Args[k*5+2]（本段起点）
+            //    判断该级联走静态段（=0，跳过重排）还是压实段（写索引）。
+            cmd.BeginSample("CCull.BuildArgs");
             cmd.DispatchCompute(cullShader, kArgs, cGroups, 1, 1);
+            cmd.EndSample("CCull.BuildArgs");
+
+            // 索引重排：总簇数 × 384 个角点，每线程一个，内部循环所有级联
+            // （_CornerGvid 对 4 个级联是同一个值，只读一次）。
+            // ⚠️【试过并回退】dispatch 加 z 维=级联（线程数 ×4、无循环）：ClusterCull 0.490 → 0.879。
+            //    4892 万线程的调度开销远超串行循环延迟。保持循环 + 单层 dispatch。
+            cmd.BeginSample("CCull.BuildIndices");
+            cmd.DispatchCompute(cullShader, kIdx, gx, gy, 1);
+            cmd.EndSample("CCull.BuildIndices");
+        }
+
+        /// <summary>
+        /// 【诊断】异步读回逐级联的可见簇数，算出「同一批簇被画了几遍」的倍数。
+        /// 这个倍数就是 _DrawIdx 每帧写入量的直接乘数（写入 = 总角点 × 倍数 × 4B），
+        /// 也是阴影 draw 的几何倍数。异步读回不 stall，每 120 帧一次。
+        /// </summary>
+        public void RequestVisibilityStats()
+        {
+            if (!debugStats) return;
+            if (!built || counterBuf == null || m_statsPending) return;
+            if (Time.frameCount % 120 != 0) return;
+            m_statsPending = true;
+            UnityEngine.Rendering.AsyncGPUReadback.Request(counterBuf, req =>
+            {
+                m_statsPending = false;
+                if (req.hasError || !built) return;
+                var data = req.GetData<uint>();
+                int n = Mathf.Min(cascadeCount, data == null ? 0 : data.Length);
+                if (n <= 0) return;
+
+                long sum = 0;
+                var sb = new System.Text.StringBuilder();
+                for (int k = 0; k < n; k++)
+                {
+                    sum += data[k];
+                    sb.Append($" 级联{k}={data[k]}({100f * data[k] / Mathf.Max(1, clusterCount):F0}%)");
+                }
+                float mult = sum / (float)Mathf.Max(1, clusterCount);
+                double writeMB = clusterCount * (double)VertsPerCluster * 4.0 / (1024 * 1024) * mult;
+                // ClusterDebug 会强制全可见（debugForceAll=1）⇒ 此时倍数是假值，必须提示，否则误导。
+                string warn = (debugForceAll != 0) ? "  ⚠️debugForceAll=1（强制全可见）⇒ 倍数非真实值" : "";
+                Debug.Log($"[Cluster阴影] 可见簇{sb} ⇒ 倍数 {mult:F2}×" +
+                          $"（索引每帧写 {writeMB:F0}MB，读同量）{warn}");
+            });
         }
 
         /// <summary>画一个级联：索引缓冲由 compute 每帧按【可见】簇重排，索引值就是全局顶点号
@@ -480,6 +828,10 @@ namespace Cluster
             slotBuf?.Release(); slotBuf = null;
             posBuf = idxBuf = boundsBuf = null;
             planesBuf = visibleBuf = counterBuf = argsBuf = null;
+            m_cpuBounds = null;
+            m_needStaticCopy = false;
+            for (int i = 0; i < MaxCascades; i++) m_padHasKey[i] = false;
+            RestoreCutoutMarks();
             built = false;
         }
     }

@@ -27,7 +27,8 @@ MonoBehaviour:
   debugMode: 0
   rvtTrilinearBlend: 0
   UseRVT: 1
-  clusterMode: 1
+  clusterMode: 0
+  clusterShadowMaxDepthPad: 2
   useTileVT: 1
   TilesPerAxis: 2
   savePath: C:/Study/UnityProjects/RenderCluster/Assets/StreamingAssets/ClusterData/

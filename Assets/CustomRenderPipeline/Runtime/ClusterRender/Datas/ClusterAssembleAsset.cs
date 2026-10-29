@@ -117,6 +117,20 @@ namespace Cluster
         /// </summary>
         public ClusterMode clusterMode = ClusterMode.SRP;
 
+        /// <summary>
+        /// Cluster 阴影正交投影 z 范围的扩张倍数上限（1 = 不扩张，等于 Unity 原生 z 范围）。
+        ///
+        /// 【2026-10-29 实测：默认 2；实测 1 会缺块，所以不要设 1】
+        /// · 当年"缺块"有一部分是 `PadOrthoDepth` 第一版 `m22/=pad; m23/=pad` 的 bug ——
+        ///   那等于把 z 板整体往一侧平移半个板，而不是对称扩张。已改成围绕板中心对称。
+        /// · 但即使修好，pad=1（= Unity 原生 z 范围）**仍然缺块** ⇒ 级联 z 板确实需要比原生略宽，
+        ///   这是几何决定的（高处物体沿光轴离板中心比 R 更远），不是 bug。
+        /// · pad 的代价现在可控：compute 里有 z 边界剔除（PlanesPerCascade = 8），
+        ///   「整簇落在 z 板外、必被光栅化器裁掉」的簇会在剔除阶段就排掉，不会白付 setup。
+        /// </summary>
+        [Range(1, 64)]
+        public float clusterShadowMaxDepthPad = 2f;
+
         /// <summary>Tile 粒度虚拟贴图开关。默认关：RVT 走「整图一格」(T=1) 旧路径，与历史行为完全等价。
         /// 开启后，每张贴图按 TilesPerAxis×TilesPerAxis 切块，反馈编码 32-bit pageId=(texId,mip,tileX,tileY)，
         /// LevelCache 以「页(cell)」为分配/淘汰单元，实现按页流式驻留（近清远糊、按需载入）。

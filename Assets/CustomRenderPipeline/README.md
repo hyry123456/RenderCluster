@@ -103,7 +103,9 @@
   4. `BuildArgs`：每级联一线程，写 5 个 uint 的**索引** indirect args。
   - ⇒ 4 个级联 = **4 次 dispatch**（与级联数无关），因为级联被压进 `CullAll` / `BuildIndices` 的 shader 内循环里。
 - 每级联一次 `DrawProceduralIndirect(indexBuffer, ...)`（共 4 次 draw），4 个级联的视口 + 矩阵 + 间接绘制全部累积进【同一个 CommandBuffer】，循环外只 `ExecuteBuffer()` 一次 → 材质 `PrepareKeywords` 从 4× 降到 1×。
-- **cutout 分流**：`ClusterRenderDataAsset.NeedsSRPShadow = cutoff || clipping` 的物体在 `ScanScene` 里被 `continue` 跳过（不烘焙进 Cluster，这是性能收益来源），并由 `ClusterObject.OnEnable` 给 Renderer 打 `renderingLayerMask` bit29（CutoffRenderingLayerBit）；`Shadows.cs` 在 cluster 绘制之后临时把灯光掩码切成 bit29 单独跑一次 `context.DrawShadows`。无 cutout 物体时 `HasCutoffCasters()` 为 false ⇒ 整段跳过、零开销。
+- **cutout 分流**：`ClusterRenderDataAsset.NeedsSRPShadow = cutoff || clipping` 的物体在 `ScanScene` 里被 `continue` 跳过（不烘焙进 Cluster，这是性能收益来源），并由
+  `ClusterObject.OnEnable`（带 `ClusterObject` 的镂空物）**或** `ClusterShadowRenderer.MarkCutoutCasters`（草/蕨这类无 `ClusterObject` 的 prefab，按材质 `_CLIPPING` keyword 判定）给 Renderer 打 `renderingLayerMask` bit29（CutoffRenderingLayerBit）；`Shadows.cs` 在 cluster 绘制之后临时把灯光掩码切成 bit29 单独跑一次 `context.DrawShadows`。无 cutout 物体时 `HasCutoffCasters()` 为 false ⇒ 整段跳过、零开销。
+  - ⚠️ **bit29 必须打到「所有 LOD 级」（含当前 disabled 的那几级）**：`ScanScene` 用 `FindObjectsInactive.Include` 取 MeshRenderer，否则切 LOD 后新启用的那级还带着默认 `0xFFFFFFFF`（含 bit28）→ 既被 SRP GBuffer 的 `~bit28` 过滤掉（整片消失）、又没 bit29（不投影）。`MarkCutoutCasters` 的写法是 `(mask | bit29) & ~bit28`，同时还原记录在 `m_markedCutoutMask`（Play 退出 / 重建前由 `RestoreCutoutMarks()` 还原，不脏化场景）。
 
 ### 3. 数据布局（静态场景，世界空间摊平）
 | 缓冲 | 内容 |
@@ -136,9 +138,10 @@
   而它落下的阴影在盒内 ⇒ **阴影凭空缺一块**。症状：**贴近才缺、拉远就好、太阳没动**（级联越小越严重）。
   - Unity 自己是靠「剔除体积 ≡ 投影体积（同一个球）」天然自洽，外加 `shadowNearPlane` 给近侧加余量。
   - 我们做的是 x/y 盒子剔除（对平行光精确、比球更宽）⇒ 必须自己把 z 厚度撑到能覆盖全部簇。
-  - 实现：`ClusterShadowRenderer.PadOrthoDepth(proj, pad)`（`m22`/`m23` 同除 pad ⇒ 中心不变、范围 ×pad），
+  - 实现：`ClusterShadowRenderer.PadOrthoDepth(proj, pad)`（`m22 /= pad` 把 z 范围拓宽 pad 倍；`m23` 同步平移使**板中心(ndc=0.5)不动**，近/远两侧对称扩），
     pad 由「簇集合整体包围球沿光轴的展开量 / 级联球半径」推出，上限 64。
-    替换点在 `Shadows.cs` 拿到 `projectionMatrix` 后立刻做 ⇒ 图集采样矩阵 / 渲染矩阵 / `SetViewProjectionMatrices` 三处天然同源。
+    ⚠️ 旧实现把 `m22`/`m23` **同除** pad，等价于"围绕 ndc=0 边"展开 ⇒ 只扩远侧、朝光近侧仍被裁（近级联阴影缺块/全错）；
+    现改为围绕板中心对称扩，覆盖簇球双侧。替换点在 `Shadows.cs` 拿到 `projectionMatrix` 后立刻做 ⇒ 图集采样矩阵 / 渲染矩阵 / `SetViewProjectionMatrices` 三处天然同源。
   - 代价只有深度精度（D32 撑到几百米仍是亚毫米级），阴影偏置是世界空间、投影前施加的，与 z 范围无关 ⇒ 不会引入 acne。
 
 ### 5. 关键文件
@@ -243,7 +246,9 @@ DefferPipeline.DrawGBuffer
   必须让被接管的物体 **只保留 bit28**（丢掉原掩码），filter 再清掉 bit28，两边才都不匹配。
   cutout 相反：它要留在 SRP 阴影里，所以是「原掩码 | bit29」。
 - cutout 物体（草/蕨/灌木）**不进 Cluster**（`_CLIPPING` 需要采样贴图，Cluster 分两轮不划算），
-  继续走 `DefferStandard` 直采。
+  继续走 SRP，但**不是** `DefferStandard` 直采 —— 而是用专用 `Vegetation.shader`
+  （`CustomRP/Defferer/Vegetation`）：它在 `DefferStandard` 的 GBuffer 输出之上多了
+  **顶点风位移** + **双面法线翻转**（`Cull Off` 下背面不发黑），详见下一节。
 
 ### 5. 关键文件
 
@@ -277,4 +282,62 @@ DefferPipeline.DrawGBuffer
    位置用 `BitConverter.Int32BitsToSingle` 按位存、`asfloat` 取回；法线/切线是八面体编码，编码器与 `OctDecode` 必须逐位对应。
 4. **部分簇不显示** → 把 `clusterMode` 切到 `ClusterDebug`（跳过剔除），能全显示说明剔除平面口径有问题；
    若仍缺，查 `_DrawIdx` 是否被 `BuildIndices` 写过、以及 `_DrawBase` 前缀和。
+
+---
+
+## 植被渲染（草 / 蕨 / 灌木，SRP 路径）
+
+> 一句话：场景里的草/蕨/灌木是 **alpha 镂空 + 双面卡片 + 每帧在动** 的物体，走 **SRP 路径**（不进 Cluster），
+> 用专用 `Vegetation.shader`，由 `VegetationWind.cs` 把 Unity `WindZone` 的参数推到全局属性做顶点风位移，
+> 借 **SRP Batcher** 合批 + prefab 自带的 **LODGroup** 做多级细节。
+
+### 1. 为什么单独做一个 shader（而不是复用 DefferStandard）
+- `DefferStandard` 是纯静态几何，顶点阶段不做任何位移；草要飘就必须自己改 VS。
+- 草是单层卡片、`Cull Off` ⇒ 背面法线朝里，不做处理会整片发黑（`SV_IsFrontFace` 把背面法线翻过来）。
+- 风参数必须进 `UnityPerMaterial` cbuffer（`PBRInput.hlsl` 里 `_WindHeight / _WindScale / _WindBendMax / _WindPhaseScale`），
+  这样不同草（高矮/摆幅不同）还能被 SRP Batcher 合批，否则每个材质一份 draw。
+
+### 2. 文件清单
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| 植被 shader | `Renderer/DefferPipeline/PBR/Shaders/Vegetation.shader` | GBuffer pass（含顶点风位移 + 双面法线翻转）+ ShadowCaster pass（含风位移，影子跟着草动） |
+| 风系统 | `Runtime/Core/VegetationWind.cs` | 每帧读场景 `WindZone` → 推 `_VegetationWind` / `_VegetationWindParams` 两个全局属性 |
+| 材质 | `Assets/Viking Village/.../Vegetation/**/*.mat` ×7 | `Meadow_Grass_01`（高/低 LOD）、`Ferns`、`GreenBush`、`Broadleaf_Shrub`、`Plant_Perennials`、`mat_foliage_01`，全部 `CustomRP/Defferer/Vegetation` |
+| 草 prefab | `Assets/Viking Village/Book of the Dead/Vegetation/MeadowGrass_01/Meadow_Grass_01_Var1..6_Prefab.prefab` | 带 `LODGroup`（3 级），无 `ClusterObject` |
+
+### 3. 风位移怎么做
+- `VegetationWind.Update()` 在 `DefferPipeline.Render` 里**任何绘制之前**每帧调用一次；
+  从场景 `FindObjectsByType<WindZone>`（缓存 120 帧扫一次）拿 `windMain / windTurbulence / windPulseMagnitude / windPulseFrequency`，
+  连同 `transform.forward` 当风向，归一成强度推到 `_VegetationWind`（xyz=方向, w=强度 0~1.5）。
+  - 注意 `WindZone` 继承 `Component`（不是 `Behaviour`），没有 `isActiveAndEnabled`，判定启用与否只能用 `gameObject.activeInHierarchy`。
+- shader 侧 `VegetationWindOffset()`：按**局部 Y / 植株高度** 加权（平方 ⇒ 根部锁死、梢部摆幅最大），
+  相位用**世界 xz** 打散（否则整片像一块板子在动），叠加 主摆 + 高频小抖 + 慢速阵风包络。
+  强度为 0（场景无 WindZone 且默认风极轻）时直接返回 0，草静止但不报错。
+
+### 4. 渲染 / 阴影分流
+- **GBuffer**：草在 SRP 的 `context.DrawRenderers` 里走 `OutGBuffer` LightMode；`DrawGBuffer` 的 `FilteringSettings`
+  清掉了 bit28 ⇒ 只有「bit28 被清、其他位保留」的物体才过，`MarkCutoutCasters` 恰好把草设成 `(mask | bit29) & ~bit28`，所以草被 SRP 正常画、且**不**进 Cluster。
+- **阴影**：草材质开 `_SHADOWS_CLIP` ⇒ ShadowCaster pass 也按 alpha 镂空；`Shadows.cs` 把灯光掩码临时切成 bit29
+  单独跑一次 `context.DrawShadows`（`HasCutoffCasters()` 为 false 时整段跳过）。ShadowCaster 的 VS 也加了同样的
+  风位移 ⇒ 影子跟着草动；用 `_ShadowPancaking` 做近平面贴地，避免悬浮。
+
+### 5. 调参（材质上）
+| 参数 | 含义 | 草典型值 |
+|------|------|----------|
+| `_WindHeight` | 植株高度（m），只用于把局部 Y 归一化到 0~1 | 0.5（草）/ 1.0~1.2（灌木） |
+| `_WindScale` | 风强倍率 | 1 |
+| `_WindBendMax` | 最大弯曲（m），绝对摆幅上限 | 0.08~0.14 |
+| `_WindPhaseScale` | 相位打散倍率 | 0.6~1.0 |
+| `_Roughness` | 粗糙度（草别太亮，HDRP 旧值常偏高） | 0.48~0.9 |
+| `_CullOff`（Alpha Cutoff） | 镂空阈值 | 0.5 |
+
+### 6. 如何测试 / 排错
+1. 进 Play（任意 `clusterMode`，草都走 SRP）：草/蕨/灌木应正常显示、alpha 镂空边缘干净、有正确阴影。
+2. **草完全不显示 / 切 LOD 后消失** → 看草的 `renderingLayerMask` 是否被 `MarkCutoutCasters` 改过（清了 bit28）；若被打回 `0xFFFFFFFF` 就是没改到（常因 `ScanScene` 没用 `FindObjectsInactive.Include`，漏掉 disabled 的 LOD 级）。
+3. **草不动** → 看 `_VegetationWind.w` 是否 >0：场景无 `WindZone` 时只有极轻默认风；有 `WindZone` 但 `gameObject` 被关也会拿不到（判定走 `activeInHierarchy`）。
+4. **草背面发黑** → 确认 shader 是 `Vegetation.shader`（`Cull Off` + `SV_IsFrontFace` 翻法线），不是别的 shader 套了草的贴图。
+5. **影子比草「慢半拍」或分离** → ShadowCaster pass 没加风位移（两者必须同一份 `VegetationWindOffset`）。
+6. **草像塑料发光** → `_Roughness` 太低（HDRP 旧标量常偏高），调高到 0.6~0.9。
+
+> 后续若对植被的风位移、双面处理或 cutout 分流做修改，请同步更新本小节。
 

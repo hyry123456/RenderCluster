@@ -536,6 +536,7 @@ namespace Cluster
             cmd.DispatchCompute(m_cull, kCull, groups, 1, 1);
             // 一维展开：总簇数 × 384 个角点，每线程一个角点。不可见的簇在 kernel 里
             // 靠 _SlotOf 直接退出 ⇒ 规模只和「场景簇数」有关，与组数无关。
+            // ⚠️【试过并回退】每簇一个 384 线程组（组数 ÷6）：occupancy 下降，反而变慢。
             // ⚠️ D3D11 单维最多 65535 个线程组，簇数上万会超 ⇒ 二维拆开，kernel 用 _IdxDimX 拼回。
             int totalThreads = m_clusterCount * VertsPerCluster;
             int totalGroups = Mathf.Max(1, Mathf.CeilToInt(totalThreads / (float)ThreadGroupSize));
@@ -559,12 +560,20 @@ namespace Cluster
 
             // 阴影路径的同款坑：DrawProceduralIndirect 不喂内建矩阵，w2c 必须逐 draw 显式传。
             m_mpb.SetMatrix("_ClusterGBufferW2C", m_w2c);
+
+            // Feedback(pass 1) 只写页表：fragment(FeedbackColor) 只用 _MapId(每簇材质缓冲) + baseUV，
+            // 从不采样 _DetailMap / _DetailNormalMap。这两张【每材质】贴图是 GBuffer(pass 0) 才需要的，
+            // 故 Feedback 绝不为它们按组拆分/绑定 —— 否则就是 GBuffer 路径的死工作遗物。
+            bool needsDetail = (pass == 0);
             for (int g = 0; g < m_groupCount; g++)
             {
-                m_mpb.SetTexture("_DetailMap",
-                    m_groupDetail[g] != null ? m_groupDetail[g] : (Texture)Texture2D.grayTexture);
-                m_mpb.SetTexture("_DetailNormalMap",
-                    m_groupDetailNormal[g] != null ? m_groupDetailNormal[g] : (Texture)Texture2D.normalTexture);
+                if (needsDetail)
+                {
+                    m_mpb.SetTexture("_DetailMap",
+                        m_groupDetail[g] != null ? m_groupDetail[g] : (Texture)Texture2D.grayTexture);
+                    m_mpb.SetTexture("_DetailNormalMap",
+                        m_groupDetailNormal[g] != null ? m_groupDetailNormal[g] : (Texture)Texture2D.normalTexture);
+                }
                 // 索引间接绘制：indexBuffer = m_drawIdxBuf（compute 只给【可见】簇写索引），
                 // args 每组 5 个 uint，startIndex 由 BuildArgs 写成 group × stride。
                 cmd.DrawProceduralIndirect(m_drawIdxBuf, Matrix4x4.identity, m_mat, pass,

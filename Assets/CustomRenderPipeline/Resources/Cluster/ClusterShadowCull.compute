@@ -22,8 +22,9 @@
 // 坑：裸 proj*view 在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除；cullingSphere 球-球测试是级联内含球 ⇒ 漏四角。
 #pragma kernel Reset
 #pragma kernel CullAll
-#pragma kernel BuildIndices
 #pragma kernel BuildArgs
+#pragma kernel BuildIndices
+#pragma kernel CopyStatic
 
 StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=半径
 
@@ -49,6 +50,10 @@ int _ClusterCount;
 int _TrisPerCluster;
 int _DebugForceAll;                              // 非 0 = 跳过所有剔除，全可见（排查用）
 int _IdxDimX;                                    // BuildIndices 的 x 维线程数（= 组数 × 64）
+// 可见率阈值（百分比）：某级联可见簇数 ≥ 总簇数 × 该值% 时，直接画【静态全量段】，
+// 完全跳过 BuildIndices 的重排。多画的那几个不可见簇已被视锥剔过 ⇒ 影子落不进本级联盒内
+// ⇒ 视觉上无害，只是多走点几何；换掉的是整整 49MB/级的索引写入。
+int _FullSkipPercent;
 
 // 纯清零：dispatch 1 组即可
 [numthreads(64, 1, 1)]
@@ -76,13 +81,15 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 
         if (_DebugForceAll == 0)
         {
-            // 视锥平面剔除（球-平面）：簇包围球 vs 该级联 6 个世界空间平面。
+            // 视锥平面剔除（球-平面）：簇包围球 vs 该级联 8 个世界空间平面
+            // （前 6 个 = 视锥；后 2 个 = 光轴 z 的两个边界，补 CalculateFrustumPlanes
+            //   在 reversed-Z 下"深度方向不剔"的漏洞 ⇒ 剔掉必然被光栅化器整块裁掉的簇）。
             // 平面约定（Unity Plane）：xyz=法线(指向视锥内)，w=到原点带符号距离；
-            // 球在视锥内 ⇔ 对全部 6 平面 dot(pl.xyz, center)+pl.w >= -radius。
+            // 球在视锥内 ⇔ 对全部平面 dot(pl.xyz, center)+pl.w >= -radius。
             bool outside = false;
-            for (int p = 0; p < 6; p++)
+            for (int p = 0; p < 8; p++)
             {
-                float4 pl = _Planes[k * 6 + p];
+                float4 pl = _Planes[k * 8 + p];
                 if (dot(pl.xyz, center) + pl.w < -radius) { outside = true; break; }
             }
             if (outside) ok = false;
@@ -102,8 +109,14 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 }
 
 // 每线程一个 (簇, 角点)，线程内循环所有级联 ——
-// _CornerGvid[idx] 对 4 个级联是同一个值，读一次就够，比「每级联开一份 dispatch」省 4 倍读取。
+// _CornerGvid[idx] 对 4 个级联是同一个值，读一次就够。
 // dispatch = ceil(总簇数 × 384 / 64)，与级联数无关。
+// 【静态段直通】某级联被 BuildArgs 判定为「可见率足够高」（_Args[k*5+2] == 0）时直接跳过：
+//   那一级联的 draw 会去画 _DrawIdx 的【段 0 = 静态全量副本】，不需要任何重排。
+//   这是目前省掉的最大一笔写入（实测每级 48.9MB，4 级合计 195MB）。
+// ⚠️【试过并回退】dispatch 加 z 维=级联（线程数 ×4，无循环）：实测 ClusterCull 0.490 → 0.879ms。
+//    4892 万线程的调度开销远超串行循环的延迟 ⇒ "多派线程早退出"在这里不成立。保持循环。
+// ⚠️【试过并回退】numthreads(384)（每簇一组，组数 ÷6）：12 warp/组压垮 occupancy，0.475 → 0.547。
 // ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 二维拆开，用 _IdxDimX 把 (x,y) 拼回一维。
 [numthreads(64, 1, 1)]
 void BuildIndices(uint3 id : SV_DispatchThreadID)
@@ -118,13 +131,29 @@ void BuildIndices(uint3 id : SV_DispatchThreadID)
 
     for (int k = 0; k < _CascadeCount; k++)
     {
+        // 本段起点由 BuildArgs 决定：0 = 走静态全量段（无需重排），否则是压实段的起点。
+        // 所以 BuildArgs 必须排在本 kernel 之前 dispatch。
+        uint base = _Args[k * 5 + 2];
+        if (base == 0u) continue;
+
         uint slot = _SlotOf[k * _ClusterCount + c];
         if (slot == 0xFFFFFFFFu) continue;
 
-        // 每级联在 _DrawIdx 里分一段（起点 = 级联 × 簇数 × 384），startIndex 是纯常量
-        uint dst = ((uint)k * (uint)_ClusterCount * perCluster + slot * perCluster + corner) * 4u;
+        uint dst = (base + slot * perCluster + corner) * 4u;
         _DrawIdx.Store(dst, gvid);
     }
+}
+
+// 把全量索引 [_CornerGvid] 复制到 _DrawIdx 的【段 0】。
+// 只在 Rebuild 后跑一次（静态数据，之后永远不变）——可见率高的级联每帧直接画这一段，
+// 等价于「Unity 用 mesh 自带静态索引」：一次都不用重排。
+// 段布局：段 0 = 静态全量；段 (k+1) = 级联 k 的压实段。总长 = (级联上限+1) × 一份全量。
+[numthreads(64, 1, 1)]
+void CopyStatic(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.y * (uint)_IdxDimX + id.x;
+    if ((int)i >= _ClusterCount * (int)(_TrisPerCluster * 3)) return;
+    _DrawIdx.Store(i * 4u, (uint)_CornerGvid[i]);
 }
 
 // 每线程一个级联：把计数翻译成【索引间接绘制】的 indirect args（5 个 uint）。
@@ -139,9 +168,16 @@ void BuildArgs(uint3 id : SV_DispatchThreadID)
     if ((int)k >= _CascadeCount) return;
 
     uint perCluster = (uint)_TrisPerCluster * 3u;
-    _Args[k * 5 + 0] = (uint)_Counter[k] * perCluster;          // indexCount
+    uint oneCopy    = (uint)_ClusterCount * perCluster;   // 一份全量索引（= 静态段长度）
+    uint cnt        = _Counter[k];
+
+    // 可见率够高 ⇒ 直接画静态全量段（段 0），跳过本级的索引重排。
+    // 正确性：被剔掉的簇 x/y 落不到本级联盒内 ⇒ 其影子也落不进盒内 ⇒ 多画它们视觉无害。
+    bool full = (cnt * 100u >= (uint)_ClusterCount * (uint)_FullSkipPercent);
+
+    _Args[k * 5 + 0] = full ? oneCopy : cnt * perCluster;      // indexCount
     _Args[k * 5 + 1] = 1;                                     // instanceCount
-    _Args[k * 5 + 2] = k * (uint)_ClusterCount * perCluster;   // startIndexLocation = 本级联在 _DrawIdx 的起点
+    _Args[k * 5 + 2] = full ? 0u : oneCopy * (k + 1u);         // startIndexLocation
     _Args[k * 5 + 3] = 0;                                     // baseVertexLocation
     _Args[k * 5 + 4] = 0;                                     // startInstanceLocation
 }

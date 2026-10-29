@@ -1,0 +1,72 @@
+// 【B 方案】草（cutout）阴影的逐实例 GPU 剔除。
+//
+// 与 ClusterShadowCull 的区别：那边按「簇」剔（静态世界空间顶点），这边按「实例」剔
+// （每株草一个世界矩阵 + 一个世界包围球）。目的是让草阴影不再走 SRP 的 context.DrawShadows
+// （那条要 SRPBatcher 恢复 + 41 次 batch 提交，实测 0.3ms），而是和簇阴影一样用
+// DrawProceduralIndirect 一次画完。
+//
+// 每帧 3 个 dispatch（与级联数无关，级联压进 shader 内循环）：
+//   ResetGrass     （1 组，清零每级联计数器）
+//   CullGrass      （每实例一线程，内部循环所有级联做球-平面剔除，可见则原子追加）
+//   BuildGrassArgs （每级联一线程，写【索引】间接绘制 5 个 uint）
+#pragma kernel ResetGrass
+#pragma kernel CullGrass
+#pragma kernel BuildGrassArgs
+
+StructuredBuffer<float4> _InstanceBounds;   // xyz = 世界包围球中心，w = 半径
+StructuredBuffer<float4> _Planes;           // [cascade * 6] 世界空间视锥平面（与绘制侧同源）
+
+// [cascade * _InstanceCount + slot] = 实例下标（该级联的紧凑可见列表）
+RWStructuredBuffer<uint> _Visible;
+RWStructuredBuffer<uint> _Counter;          // [cascade] = 该级联可见实例数
+// 索引间接绘制 args：5 个 uint
+//   [0] indexCount  [1] instanceCount  [2] startIndex  [3] baseVertex  [4] startInstance
+RWStructuredBuffer<uint> _Args;
+
+int _CascadeCount;
+int _InstanceCount;
+int _IndexCount;
+
+[numthreads(64, 1, 1)]
+void ResetGrass(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x < _CascadeCount) _Counter[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void CullGrass(uint3 id : SV_DispatchThreadID)
+{
+    uint inst = id.x;
+    if ((int)inst >= _InstanceCount) return;
+
+    float4 bb = _InstanceBounds[inst];
+
+    for (int k = 0; k < _CascadeCount; k++)
+    {
+        bool outside = false;
+        for (int p = 0; p < 6; p++)
+        {
+            float4 pl = _Planes[k * 6 + p];
+            if (dot(pl.xyz, bb.xyz) + pl.w < -bb.w) { outside = true; break; }
+        }
+        if (outside) continue;
+
+        uint slot;
+        InterlockedAdd(_Counter[k], 1u, slot);
+        if ((int)slot < _InstanceCount)
+            _Visible[k * _InstanceCount + (int)slot] = inst;
+    }
+}
+
+[numthreads(8, 1, 1)]
+void BuildGrassArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint k = id.x;
+    if ((int)k >= _CascadeCount) return;
+
+    _Args[k * 5 + 0] = (uint)_IndexCount;   // indexCount（每实例共享同一份索引）
+    _Args[k * 5 + 1] = _Counter[k];         // instanceCount = 本级联可见实例数
+    _Args[k * 5 + 2] = 0;                   // startIndex
+    _Args[k * 5 + 3] = 0;                   // baseVertex
+    _Args[k * 5 + 4] = 0;                   // startInstance
+}

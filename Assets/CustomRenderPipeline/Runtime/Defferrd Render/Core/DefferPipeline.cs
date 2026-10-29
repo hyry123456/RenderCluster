@@ -101,6 +101,10 @@ namespace CustomRenderPipline.DefferPipeline
             PrepareBuffer();
             PrepareForSceneWindow();        //准备UI数据
 
+            // 植被风：把场景 WindZone 的参数推到全局属性（草的顶点位移在 Vegetation.shader 里做）。
+            // 放在任何绘制之前、每帧一次即可。
+            VegetationWind.Update();
+
             int renderLayerMask = renderSetting.RenderLayer;
 
             //准备剔除数据
@@ -197,6 +201,9 @@ namespace CustomRenderPipline.DefferPipeline
             // Cluster GBuffer 的 GPU 缓冲（顶点/索引/剔除）也必须显式释放
             if (ClusterGBufferRenderer.HasInstance)
                 ClusterGBufferRenderer.Instance.Release();
+            // 阴影侧的 GPU 缓冲 + 镂空物体被打上的 renderingLayerMask（打位/还原成对，别留脏数据）
+            if (ClusterShadowRenderer.HasInstance)
+                ClusterShadowRenderer.Instance.Release();
             lighting?.Dispose();
             spaceReflect?.Dispose();
         }

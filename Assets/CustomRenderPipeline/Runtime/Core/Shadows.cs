@@ -349,6 +349,8 @@ namespace CustomRenderPipline
 			{
 				// ClusterDebug 默认强制全可见：Debug 能画、Cluster 画不出来 ⇒ 剔除问题；两者都空 ⇒ 绘制链问题。
 				cluster.debugForceAll = (m_mode == ClusterMode.ClusterDebug) ? 1 : 0;
+				// 诊断输出只在 ClusterDebug 模式下打（平时全静默，不刷 Console）。
+				cluster.debugStats = (m_mode == ClusterMode.ClusterDebug);
 				cluster.BeginLight();
 			}
 
@@ -365,26 +367,26 @@ namespace CustomRenderPipline
 
 				splitData.shadowCascadeBlendCullingFactor = cullingFactor;
 
-				// cluster：把正交投影沿光轴的 z 范围扩开。
-				// 根因：Unity 的级联正交矩阵只按 splitData.cullingSphere 拟合，沿光轴厚度 ≈ 2×球半径，
-				// 它**不看场景里有什么**。我们的投射物是自建的簇集合，Unity 完全不知道，
-				// 所以必须自己把厚度撑到能覆盖全部簇 —— 否则 x/y 在盒内、但沿光轴超出这层"板"的
-				// 投射物会被光栅化器整块裁掉，而它落在盒内的阴影就凭空缺一块。
-				// 症状特征：级联越小越严重 ⇒「贴近就缺、拉远就好、太阳没动」。
+				// cluster：是否需要把正交投影沿光轴的 z 范围扩开（pad）。
+				// 【2026-10-29 结论】实测 pad = 1（= Unity 原生 z 范围）阴影完全正常 ⇒
+				//   当年"缺块"的真凶是 PadOrthoDepth 第一版的公式 `m22/=pad; m23/=pad`：
+				//   那等于把 z 板整体往一侧平移了半个板，而不是对称扩张。
+				//   改成 `newM23=(m23+0.5(pad-1))/pad`（围绕板中心对称）后，pad=1 自动退化成原矩阵。
+				// ⇒ 默认不再撑。pad>1 只会让更多"整簇在板外、必然被光栅化器裁掉"的簇进入剔除集合，
+				//   纯属白付三角形 setup（阴影 pass 是 setup bound，atlas 仅 4×512²）。
+				// 保留这个开关只为极端场景（例如确需超高层物体的远距投影）。
 				if (useCluster)
 				{
-					// 每个级联按【簇集合整体包围球】反推需要多厚的 z 范围（详见 ClusterShadowRenderer.PadOrthoDepth）。
-					float pad = 1f;
-					if (cluster.TryGetSceneBounds(out Vector3 sc, out float sr))
+					float maxPad = Mathf.Clamp(
+						ClusterControl.Instance.ClusterAssembleAsset.clusterShadowMaxDepthPad, 1f, 64f);
+					if (maxPad > 1f)
 					{
-						// 板中心 = 剔除球心；沿光轴看整个簇集合离它有多远，再加上集合自身半径。
-						Vector3 sphereC = new Vector3(splitData.cullingSphere.x, splitData.cullingSphere.y, splitData.cullingSphere.z);
-						float need = Mathf.Abs(Vector3.Dot(sc - sphereC, light.forward)) + sr;
-						float have = Mathf.Max(splitData.cullingSphere.w, 1e-3f);   // 原板半厚 ≈ 剔除球半径
-						pad = need / have;
+						float pad = Mathf.Min(
+							cluster.ComputeDepthPad(i, light.forward, viewMatrix,
+								splitData.cullingSphere, projectionMatrix, tileSize), maxPad);
+						if (pad > 1.0001f)
+							projectionMatrix = ClusterShadowRenderer.PadOrthoDepth(projectionMatrix, pad);
 					}
-					pad = Mathf.Clamp(pad, 1f, 64f);
-					projectionMatrix = ClusterShadowRenderer.PadOrthoDepth(projectionMatrix, pad);
 				}
 
 				m_cascadeView[i] = viewMatrix;
@@ -410,7 +412,27 @@ namespace CustomRenderPipline
 				{
 					Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(projectionMatrix, true);
 					Matrix4x4 worldToClip = gpuProj * viewMatrix;
-					cluster.AddCascade(worldToClip);
+
+					// 光栅化器的真实裁剪体：裁剪条件是 ndc z ∈ [0,1]，而
+					//   ndc_z = gpuProj.m22 · z_view + gpuProj.m23
+					// ⇒ 反解出 z_view 的 [zMin, zMax]。这就是「整个簇落在外面就一个像素都写不进阴影图」
+					// 的那个范围 —— 用它剔掉整簇在板外的簇，purely 白付的顶点/三角形 setup 就没了。
+					// 判据取 gpuProj（而非裸 projectionMatrix）：只有它才是光栅化器实际用的约定
+					//（裸矩阵是 OpenGL [-1,1]，直接反解会得到一半的厚度）。
+					float zMin = 0f, zMax = 0f;
+					bool cullZ = Mathf.Abs(gpuProj.m22) > 1e-6f;
+					if (cullZ)
+					{
+						float za = (0f - gpuProj.m23) / gpuProj.m22;
+						float zb = (1f - gpuProj.m23) / gpuProj.m22;
+						zMin = Mathf.Min(za, zb);
+						zMax = Mathf.Max(za, zb);
+						// 保守余量：板厚 1%（防止浮点边界把「刚好跨板」的簇误判整簇在外）。
+						float margin = (zMax - zMin) * 0.01f;
+						zMin -= margin;
+						zMax += margin;
+					}
+					cluster.AddCascade(worldToClip, viewMatrix, zMin, zMax, cullZ);
 				}
 			}
 
@@ -436,11 +458,17 @@ namespace CustomRenderPipline
 			context.ExecuteCommandBuffer(cullCmd);
 			Profiler.EndSample();
 			cullCmd.Release();
+
+#if UNITY_EDITOR
+			// 诊断：读回逐级联可见簇数（异步、每 120 帧一次），算出「同一批簇被画了几遍」的倍数。
+			// 该倍数同时是索引写入量和阴影几何量的乘数，是 ClusterCull / ShadowDraw 的共同根因。
+			cluster.RequestVisibilityStats();
+#endif
 		}
 
 		if (useCluster)
 		{
-				// ===== Cluster / ClusterDebug 模式：只画 cluster（cutout 另行走 SRP 阴影）=====
+				// ===== Cluster / ClusterDebug 模式：簇阴影 + 草 cutout 阴影都在这里画（同一 buffer）=====
 				// 4 个级联的 viewport + 矩阵 + 间接绘制全部累积进【同一个 buffer】，
 				// 循环外只 ExecuteBuffer 一次，把材质 PrepareKeywords 从 4× 降到 1×（~2.5ms → ~0.6ms）。
 				buffer.SetGlobalDepthBias(0f, light.slopeScaleBias);
@@ -449,7 +477,7 @@ namespace CustomRenderPipline
 					int tileIndex = tileOffset + i;
 					// viewport 决定画到 atlas 的哪个 tile（4 级联共用同一张图）
 					SetTileViewport(tileIndex, split, tileSize);
-				// SetViewProjectionMatrices 供下方 cutout 的 context.DrawShadows 使用（SRP 路径同源）。
+				// SetViewProjectionMatrices 保留（内建相机矩阵；本路径的 DIPS 用 _ClusterShadowW2C，不依赖它）。
 				buffer.SetViewProjectionMatrices(m_cascadeView[i], m_cascadeProj[i]);
 				// cluster 阴影矩阵：worldToClip = GetGPUProjectionMatrix(proj) * view。
 				// ⚠️【关键修复 2026-10-26】绝不能用裸 proj*view：自定义 HLSLPROGRAM 在
@@ -479,6 +507,12 @@ namespace CustomRenderPipline
                 // 掩码只能来自"投射阴影的灯光自身"：useRenderingLayerMaskTest=true 时 Unity 按
                 //   (Renderer.renderingLayerMask & Light.renderingLayerMask) != 0
                 // 过滤投射物。所以这里临时把该灯光的掩码切成"只含 cutoff 位"，画完立刻还原。
+                //
+                // 【B 方案已回滚 2026-10-28】曾把这段改成「实例化间接绘制 + FS 采样 albedo 做 clip」
+                // （ClusterGrassShadowRenderer），试图省掉这条 SRP pass 的 SRPBatcher 开销。
+                // 实测无效且更慢：那条 0.325ms 不是"切换成本"，而是 SRP 用硬件顶点缓冲画草几何的
+                // 实际工作量；改成 SV_VertexID 查表的过程式顶点后，每顶点多 4 次缓冲读 + 丢掉了
+                // 顶点后变换缓存，反而更贵。结论：切换次数不是瓶颈，别再往这个方向优化。
                 if (ClusterShadowRenderer.Instance.HasCutoffCasters())
                 {
                     var cutoffLight = cullingResults.visibleLights[light.visibleLightIndex].light;
