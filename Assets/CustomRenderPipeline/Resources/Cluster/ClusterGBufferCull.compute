@@ -25,6 +25,10 @@
 #pragma kernel CullAll
 #pragma kernel BuildIndices
 #pragma kernel BuildArgs
+#pragma kernel BuildOccluder0
+#pragma kernel BuildOccluder1
+#pragma kernel BuildOccluder2
+#pragma kernel BuildOccluder3
 
 StructuredBuffer<float4> _ClusterBounds;          // xyz=世界包围球中心 w=半径
 StructuredBuffer<uint>   _ClusterGroup;           // 每簇属于哪个 detail 贴图组
@@ -60,6 +64,167 @@ int _TrisPerCluster;
 int _DebugForceAll;                               // 非 0 = 跳过剔除，全可见（排查用）
 int _IdxDimX;                                     // BuildIndices 的 x 维线程数（= 组数 × 64）
 
+// ===== Hi-Z 遮挡剔除 =====
+// 数据流：本帧 GBuffer 画完 → BuildOccluder0/1 用【本帧深度】建金字塔 →
+//         【下一帧】的 CullAll 拿它做遮挡测试。所以是"上一帧深度"，不需要跨帧保存深度图。
+// 深度方向由 _ZReversed 决定（C# 侧从 SystemInfo.usesReversedZBuffer 传，D3D 恒为 1）：
+//   reversed-Z（1=近, 0=远）：最远 = min，最近 = max
+//   普通 Z    （0=近, 1=远）：最远 = max，最近 = min
+// 金字塔每个 texel 存「这一块里【最远】的深度」⇒ 判据「这块最远的东西都比簇最近点更近」才剔除，
+// 天然保守，只会漏剔不会误剔。
+int _ZReversed;                    // 1 = reversed-Z（D3D）
+#define ZFAR(a, b)  (_ZReversed ? min(a, b) : max(a, b))    // 更远的一个
+#define ZNEAR(a, b) (_ZReversed ? max(a, b) : min(a, b))    // 更近的一个
+
+Texture2D<float>   _SrcDepth;      // 相机深度（1/1 屏幕，必须非 MSAA）
+// ⚠️【只能 4 级】CullAll 同时要绑 _HiZ0..3 + _HiZStat + _SlotOf + _Visible + _Counter = 8 个 UAV，
+// 正好是 D3D11.0（feature level 11.0）的上限。再加一级就是 9 个 ⇒
+// "There are more UAVs (9) than the maximum supported (8) ... Skipping dispatch"，整个剔除直接不跑。
+// 想覆盖更大屏幕跨度的簇，只能调 CullAll 里的 texel 预算（见下方 budget）。
+RWTexture2D<float> _HiZ0;          // 1/2  屏
+RWTexture2D<float> _HiZ1;          // 1/4  屏
+RWTexture2D<float> _HiZ2;          // 1/8  屏
+RWTexture2D<float> _HiZ3;          // 1/16 屏
+int _DepthW;
+int _DepthH;
+int _HiZ0SizeX;
+int _HiZ0SizeY;
+int _HiZ1SizeX;
+int _HiZ1SizeY;
+int _HiZ2SizeX;
+int _HiZ2SizeY;
+int _HiZ3SizeX;
+int _HiZ3SizeY;
+float4x4 _ViewProj;                // 当前相机 world→clip（投影簇 AABB 用）
+float4 _PicSize;                   // xy = 屏幕像素尺寸
+int _HiZEnable;                    // 0 = 关闭遮挡测试
+float _HiZBias;                    // 绝对余量（深度空间）
+float _HiZRelBias;                 // 相对余量（乘 nearestZ）：远处深度趋 0，绝对 bias 不够用
+float _HiZMinSize;                 // 簇屏幕跨度(像素)小于它就不测 —— 防止小簇被 4×4 块里的邻居误剔
+
+// 调试统计（只在 ClusterDebug 模式累加）：0=通过并测了 1=被判遮挡剔除 2=太小跳过 3=太大跳过
+RWStructuredBuffer<uint> _HiZStat;
+int _HiZDebug;
+
+// 四级 HZB，每级 2×2 归约取「最远」：1/2 → 1/4 → 1/8 → 1/16。
+// 选级规则见 CullAll：从最细一级往上找，直到「簇的屏幕矩形在该级上的 texel 数不超过预算」。
+// 预算 4×4 ⇒ 块大小 ≈ 簇尺寸的 1/4，块内几乎全是簇自己 ⇒ 不会被邻居误剔；
+// 最粗一级（1/16）给到 8×8，让屏幕跨度 64~128px 的大簇也能测（而不是整类跳过）。
+// 每簇最多采 64 个 texel，成本可控（CullAll 原本只要 0.004ms，预算充足）。
+[numthreads(8, 8, 1)]
+void BuildOccluder0(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ0SizeX || (int)id.y >= _HiZ0SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_DepthW - 1, _DepthH - 1);
+    float m = _SrcDepth.Load(int3(clamp(base, int2(0, 0), dmax), 0));
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR(m, _SrcDepth.Load(int3(q, 0)));
+    }
+    _HiZ0[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder1(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ1SizeX || (int)id.y >= _HiZ1SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ0SizeX - 1, _HiZ0SizeY - 1);
+    float m = _HiZ0[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR(m, _HiZ0[q]);
+    }
+    _HiZ1[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder2(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ2SizeX || (int)id.y >= _HiZ2SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ1SizeX - 1, _HiZ1SizeY - 1);
+    float m = _HiZ1[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR(m, _HiZ1[q]);
+    }
+    _HiZ2[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder3(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ3SizeX || (int)id.y >= _HiZ3SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ2SizeX - 1, _HiZ2SizeY - 1);
+    float m = _HiZ2[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR(m, _HiZ2[q]);
+    }
+    _HiZ3[id.xy] = m;
+}
+
+// 按「级」取尺寸 / 取 texel。不能把 RWTexture2D 当形参传（HLSL 对象类型作形参不保险），
+// 所以用这两个小函数内部 if 链选纹理。级号是循环变量 ⇒ 分支在 warp 内基本一致。
+int2 HiZSize(int lvl)
+{
+    if (lvl == 0) return int2(_HiZ0SizeX, _HiZ0SizeY);
+    if (lvl == 1) return int2(_HiZ1SizeX, _HiZ1SizeY);
+    if (lvl == 2) return int2(_HiZ2SizeX, _HiZ2SizeY);
+    return int2(_HiZ3SizeX, _HiZ3SizeY);
+}
+
+float HiZSample(int lvl, int2 p)
+{
+    if (lvl == 0) return _HiZ0[p];
+    if (lvl == 1) return _HiZ1[p];
+    if (lvl == 2) return _HiZ2[p];
+    return _HiZ3[p];
+}
+
+/// 簇包围盒（球 → AABB 更像包围盒，保守方向）在屏幕上的 AABB + 最近深度。
+/// 返回 false = 不可靠（有角点在相机后方），调用方应跳过遮挡测试（保守）。
+bool ClusterScreenRect(float4 bb, out float2 smin, out float2 smax, out float nearestZ)
+{
+    smin = 1e30; smax = -1e30;
+    float nz = (_ZReversed != 0) ? -1e30 : 1e30;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        float3 w = bb.xyz + float3((i & 1) ? bb.w : -bb.w,
+                                   (i & 2) ? bb.w : -bb.w,
+                                   (i & 4) ? bb.w : -bb.w);
+        float4 cp = mul(_ViewProj, float4(w, 1.0));
+        if (cp.w <= 1e-4) { nearestZ = nz; return false; }   // 有角点在相机后方 ⇒ 投影不可靠
+        float2 ndc = cp.xy / cp.w;
+        nz = ZNEAR(nz, cp.z / cp.w);                         // 八个角点里【最近】的那个
+        // ⚠️【必须翻 Y】_ViewProj = GL.GetGPUProjectionMatrix(proj, true)，D3D 上 y 已被翻转
+        // （Unity 自己也是靠 _ProjectionParams.x = -1 把那一下翻回来的，见 ComputeScreenPos）。
+        // 深度拷贝纹理的行序是「屏幕自上而下」。这里少翻一次 ⇒ 整屏上下镜像：
+        //   · 近处物体 → 镜像落到天空（深度 0，永不判遮挡）⇒ 看起来"近的都是对的"
+        //   · 远处小物体 → 镜像落到脚下近处地面（深度 ≈1）⇒ 整簇误剔 ⇒ "远处一堆缺块"
+        float2 s = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * _PicSize.xy;
+        smin = min(smin, s);
+        smax = max(smax, s);
+    }
+    // 角点被近平面切到时会算出 <0 或 >1 的 z（近平面外），夹回 [0,1] 才不会把 tol 算成负数。
+    nearestZ = saturate(nz);
+    return true;
+}
+
+/// 在金字塔某一级上取屏幕矩形覆盖范围的 min（最远深度）。
+/// ⚠️ 不把 RWTexture2D 当参数传（HLSL 对象类型作形参不保险），所以 CullAll 里直接内联两级。
+
 // 纯清零：dispatch 1 组即可
 [numthreads(64, 1, 1)]
 void Reset(uint3 id : SV_DispatchThreadID)
@@ -85,6 +250,59 @@ void CullAll(uint3 id : SV_DispatchThreadID)
             float4 pl = _Planes[p];
             if (dot(pl.xyz, bb.xyz) + pl.w < -bb.w) return;
         }
+    }
+
+    // ===== Hi-Z 遮挡剔除（用【上一帧】深度金字塔）=====
+    // 判据：屏幕矩形内「最远的像素」都比簇「最近的点」更近 ⇒ 整簇被挡住 ⇒ 别画。
+    // 金字塔存的是「每块里最远」，比较时再用最远的一方 ⇒ 只会漏剔不会误剔。
+    // ⚠️ 故意【不受 _DebugForceAll 影响】：Debug 模式的本意是"排除视锥剔除的干扰、
+    //    单独看遮挡剔除对不对"，如果连它也跳过，就没法在 Debug 下调 Hi-Z 了。
+    if (_HiZEnable != 0)
+    {
+        float2 smin, smax; float nearestZ;
+        if (ClusterScreenRect(bb, smin, smax, nearestZ))
+        {
+            float2 span = smax - smin;
+            float maxSpan = max(span.x, span.y);
+            float tileFar = 0;
+            bool tested = false;
+            // 选级：从最细（1/2）往上找，直到「簇矩形在该级上的 texel 数不超过预算」。
+            // 预算 16（4×4）：块大小 ≈ 簇尺寸的 1/4 ⇒ 块内几乎全是簇自己，不会被邻居误剔。
+            // 最粗一级（1/16）给 64（8×8）：屏幕跨度 64~128px 的大簇（院子里的主屋、长屋）
+            // 以前会整类"太大跳过"= 永远画出来，靠这个预算就能测到。
+            // ⚠️ 预算靠「多采 texel」而不是「多一级金字塔」换来：UAV 只有 8 个额度（见文件头）。
+            if (maxSpan >= _HiZMinSize && span.x > 0 && span.y > 0)
+            {
+                [loop] for (int lvl = 0; lvl < 4; lvl++)
+                {
+                    float inv = 0.5 * exp2(-(float)lvl);      // lvl0=0.5, lvl1=0.25, lvl2=1/8, lvl3=1/16
+                    int budget = (lvl == 3) ? 64 : 16;
+                    int2 sz = HiZSize(lvl) - 1;
+                    int2 a = clamp((int2)floor(smin * inv), int2(0, 0), sz);
+                    int2 b = clamp((int2)ceil (smax * inv), int2(0, 0), sz);
+                    int2 n = b - a + 1;
+                    if (n.x * n.y <= budget)
+                    {
+                        tileFar = HiZSample(lvl, a); tested = true;
+                        for (int y = 0; y < n.y; y++)
+                            for (int x = 0; x < n.x; x++)
+                                tileFar = ZFAR(tileFar, HiZSample(lvl, a + int2(x, y)));
+                        break;
+                    }
+                }
+            }
+            if (tested)
+            {
+                // 远处深度值趋近 0（reversed-Z）⇒ 绝对 bias 等于没加，用相对量把判定往【不剔】方向拉。
+                float tol = max(_HiZBias, nearestZ * _HiZRelBias);
+                bool occluded = (_ZReversed != 0) ? (tileFar > nearestZ + tol)
+                                                  : (tileFar < nearestZ - tol);
+                if (_HiZDebug != 0) InterlockedAdd(_HiZStat[occluded ? 1u : 0u], 1u);
+                if (occluded) return;
+            }
+            else if (_HiZDebug != 0) InterlockedAdd(_HiZStat[3], 1u);   // 太小或太大，跳过
+        }
+        else if (_HiZDebug != 0) InterlockedAdd(_HiZStat[4], 1u);       // 矩形不可靠（角点在相机后）
     }
 
     uint g = _ClusterGroup[c];

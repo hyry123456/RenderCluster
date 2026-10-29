@@ -351,6 +351,10 @@ namespace CustomRenderPipline
 				cluster.debugForceAll = (m_mode == ClusterMode.ClusterDebug) ? 1 : 0;
 				// 诊断输出只在 ClusterDebug 模式下打（平时全静默，不刷 Console）。
 				cluster.debugStats = (m_mode == ClusterMode.ClusterDebug);
+				// 阴影侧 Hi-Z：与 GBuffer 共用资产上的同一个开关（clusterHiZOcclusion），
+				// 但【只在 Game 相机】生效（Scene 视图不做遮挡剔除，由 DefferPipeline 每相机置位）。
+				cluster.hiZEnable = ClusterControl.Instance.ClusterAssembleAsset.clusterHiZOcclusion
+					&& ClusterShadowRenderer.HiZGameCamera;
 				cluster.BeginLight();
 			}
 
@@ -404,6 +408,12 @@ namespace CustomRenderPipline
 				dirShadowMatrices[tileIndex] = ConvertToAtlasMatrix(
 					projectionMatrix * viewMatrix, offset, tileScale
 				);
+
+				// Hi-Z：把该级联的「世界 → 阴影图集 UV」矩阵登记给剔除器。
+				// 这个矩阵就是采样侧 SAMPLE_TEXTURE2D_SHADOW 用的那个（口径逐位一致），
+				// CullAll 用它把簇的 8 个角点投到图集上算 texel 矩形。
+				if (useCluster)
+					cluster.SetCascadeAtlasMatrix(i, dirShadowMatrices[tileIndex]);
 
 				// cluster：登记该级联的视锥（worldToClip 与下方 Draw 用的逐位一致）+ LOD 参数（纯 CPU，不提交）。
 				// worldToClip = GL.GetGPUProjectionMatrix(proj,true) * view：正是绘制侧实际用的矩阵，
@@ -553,6 +563,17 @@ namespace CustomRenderPipline
 					context.DrawShadows(ref shadowSettings);
 					buffer.SetGlobalDepthBias(0f, 0f);
 				}
+			}
+
+			// ===== Hi-Z：用【刚画完】的阴影图集深度重建遮挡金字塔，供【下一帧】的簇剔除 =====
+			// 位置必须在：所有级联 + cutout 的 SRP pass 都画完之后、图集被 ReleaseTemporaryRT 之前。
+			// 只在 cluster 路径 + Game 相机做（Scene 视图 hiZEnable 恒 false）。
+			if (useCluster && cluster.hiZEnable)
+			{
+				cluster.BuildHiZ(buffer, dirShadowAtlasId, (int)settings.directional.atlasSize);
+				Profiler.BeginSample("Cluster.ShadowHiZBuild");
+				ExecuteBuffer();
+				Profiler.EndSample();
 			}
 
 		}

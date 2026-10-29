@@ -131,6 +131,51 @@ namespace Cluster
         [Range(1, 64)]
         public float clusterShadowMaxDepthPad = 2f;
 
+        /// <summary>
+        /// Scene 视图要不要走 Cluster（Game 相机恒按 ClusterMode 走，不受这个影响）。
+        ///
+        /// · 开（默认）：Scene 视图用 Cluster 画，但【不自己剔除】——直接复用主相机已经算好的
+        ///   可见簇 + indirect args，只换 world→clip 矩阵。所以 Scene 里看到的就是
+        ///   「主相机剔除之后剩下的那批簇」，转到主相机看不到的方向，那些物体也就不会画出来。
+        ///   这是"看剔除结果"的正确方式，而且 Scene 不跑 Cull，没有额外开销。
+        ///   为什么不自己剔：Scene 视锥远大于游戏相机，独立剔除几乎什么都剔不掉，
+        ///   只会白跑一遍几万簇的 dispatch，还看不出任何效果。
+        /// · 关：Scene 视图完全不碰 cluster，退回 SRP 画全部 —— 这是【对照组】，
+        ///   看到的每一簇都在，方便和开启后对比"少画了哪些"。
+        ///
+        /// 如果 Scene 里材质发黑 / 贴图糊（RVT 页是按主相机请求的，Scene 视角缺页），关掉即可。
+        /// </summary>
+        public bool sceneViewCluster = true;
+
+        /// <summary>
+        /// Hi-Z 遮挡剔除（默认关，验证后再开）。
+        /// 用【上一帧】的相机深度金字塔，把「被挡住整块」的簇剔除掉 —— 密集场景（村庄/室内）收益最大。
+        /// 判据取每级金字塔的「最远深度」⇒ 只会漏剔、不会误剔。
+        /// 数据流：本帧末用深度拷贝建金字塔 → 下一帧剔除用（配的是上一帧的 VP 矩阵，保证同源）。
+        ///
+        /// ⚠️ 依赖 `RenderSetting.CopyDepth` 打开：金字塔读的是管线为后处理/粒子准备的那份
+        /// `_CameraDepthTexture` 拷贝。不能直接读 `_GBufferDepthTex` —— 它带 MSAA，
+        /// 未 resolve 的样本读出来是乱的（实测：近的被剔、远的还在，一堆穿孔）。
+        /// CopyDepth 关掉 ⇒ 不建金字塔 ⇒ 本开关自动失效（安全失败，画面不变）。
+        ///
+        /// ⚠️ 这一个开关同时管【相机 GBuffer/Feedback】和【方向光阴影】两条剔除：
+        ///   · 相机侧：用上一帧的相机深度金字塔（判据 = 屏幕矩形内最远深度比簇最近点更近）。
+        ///   · 阴影侧：用上一帧的阴影图集深度金字塔，在【灯光空间】判（沿光轴被更近的投影体
+        ///     完全挡住的簇，写进阴影图也会被覆盖 ⇒ 零贡献 ⇒ 剔掉不画）。远级联收益最大。
+        ///     阴影侧只在 Game 相机生效（Scene 视图只做视锥剔除）。
+        ///   · 都允许「当前帧建、下一帧用」，所以物体/相机剧变时有一帧滞后；缺块就调大
+        ///     ClusterGBufferRenderer / ClusterShadowRenderer 里的 HiZRelBias。
+        ///
+        /// ⚠️ 相机侧依赖 `RenderSetting.CopyDepth` 打开：金字塔读的是管线为后处理/粒子准备的那份
+        /// `_CameraDepthTexture` 拷贝。不能直接读 `_GBufferDepthTex` —— 它带 MSAA，
+        /// 未 resolve 的样本读出来是乱的（实测：近的被剔、远的还在，一堆穿孔）。
+        /// CopyDepth 关掉 ⇒ 不建金字塔 ⇒ 开关自动失效（安全失败，画面不变）。
+        ///
+        /// ⚠️ 金字塔级数被 D3D11.0 的「每 kernel 最多 8 个 UAV」锁死在 4 级（1/2…1/16），
+        /// 不要试图加第 5 级 —— 超了 dispatch 会被静默跳过、剔除整个失效。
+        /// </summary>
+        public bool clusterHiZOcclusion = false;
+
         /// <summary>Tile 粒度虚拟贴图开关。默认关：RVT 走「整图一格」(T=1) 旧路径，与历史行为完全等价。
         /// 开启后，每张贴图按 TilesPerAxis×TilesPerAxis 切块，反馈编码 32-bit pageId=(texId,mip,tileX,tileY)，
         /// LevelCache 以「页(cell)」为分配/淘汰单元，实现按页流式驻留（近清远糊、按需载入）。

@@ -280,6 +280,26 @@ namespace Cluster
         /// </summary>
         public bool debugStats = false;
 
+        // ================= Hi-Z 遮挡剔除（灯光空间）=================
+        // 由 Shadows.cs 每帧按「资产的 clusterHiZOcclusion && 当前是 Game 相机」置位。
+        // 和 GBuffer 那套同一个开关、同一套判据；Scene 相机恒 false（Scene 不做遮挡剔除）。
+        public bool hiZEnable = false;
+        /// <summary>当前渲染的相机是不是 Game 相机。由 DefferPipeline 每相机在渲染阴影【之前】置位；
+        /// Scene 视图恒 false ⇒ 阴影不做遮挡剔除（用户要求：只有 Game 视图做）。</summary>
+        public static bool HiZGameCamera = true;
+        // 四级金字塔：1/2 → 1/4 → 1/8 → 1/16 图集（1024 图集 → 512/256/128/64）。
+        // ⚠️ 不能加级：CullAll 的 UAV 是 _SlotOf/_Visible/_Counter + _HiZ0..3 = 7，再加就撞
+        // D3D11.0 的 8 上限（超了 dispatch 会被静默跳过）。大簇靠最粗一级 8×8 texel 的预算覆盖。
+        RenderTexture m_hiz0, m_hiz1, m_hiz2, m_hiz3;
+        RenderTexture m_hizDummy;
+        bool m_hizValid;
+        int m_hizAtlasSize;
+        const float HiZRelBias = 0.01f;
+        const float HiZMinScreenSize = 4f;
+        readonly Matrix4x4[] m_clipMtx = new Matrix4x4[MaxCascades];
+        readonly Matrix4x4[] m_atlasMtx = new Matrix4x4[MaxCascades];
+        readonly Matrix4x4[] m_atlasMtxZero = new Matrix4x4[MaxCascades];
+
         public bool IsReady => built && !dirty;
         public int ClusterCount => clusterCount;
         public int CascadeCount => cascadeCount;
@@ -573,11 +593,14 @@ namespace Cluster
             // 排查/对比用：阴影 pass 的几何量就是「簇数 × 每簇顶点」。
             // 和 SRP 对比时看 Profiler 里 Shadows 的顶点数，这两个数直接决定光栅化开销。
             // 扫描统计是「阴影缺块」的第一现场：如果 m_scanSkip* 里有大批物体，缺的就是它们的阴影。
-            Debug.Log($"[Cluster阴影] 重建：{clusterCount} 簇 / {allPos.Count} 顶点 / {allIdx.Count} 索引" +
-                      $"/ {clusterCount * TrisPerCluster} 三角形（合并切簇，仅 LOD0，Cull Back）\n" +
-                      $"           扫描 {m_scanTotal} 个 MeshRenderer → 登记 {meshes.Count} 个 mesh" +
-                      $"（跳过：disabled {m_scanSkipDisabled} / 关投影 {m_scanSkipOff}" +
-                      $" / cutout {m_scanSkipCutout} / 无 Mesh {m_scanSkipNoMesh}）");
+            // 只在 ClusterDebug 模式输出（debugStats 由 Shadows.cs 按 clusterMode 置位），
+            // 平时静默——每次 Rebuild 都刷这条太吵。
+            if (debugStats)
+                Debug.Log($"[Cluster阴影] 重建：{clusterCount} 簇 / {allPos.Count} 顶点 / {allIdx.Count} 索引" +
+                          $"/ {clusterCount * TrisPerCluster} 三角形（合并切簇，仅 LOD0，Cull Back）\n" +
+                          $"           扫描 {m_scanTotal} 个 MeshRenderer → 登记 {meshes.Count} 个 mesh" +
+                          $"（跳过：disabled {m_scanSkipDisabled} / 关投影 {m_scanSkipOff}" +
+                          $" / cutout {m_scanSkipCutout} / 无 Mesh {m_scanSkipNoMesh}）");
 #endif
         }
 
@@ -643,6 +666,10 @@ namespace Cluster
             if (!built || cascadeCount >= MaxCascades) return;
             int k = cascadeCount++;
 
+            // Hi-Z 遮挡测试要用：clip 矩阵算深度（ndc.z 就是阴影图里存的值），
+            // atlas 矩阵算图集 texel 矩形（由 SetCascadeAtlasMatrix 填）。
+            m_clipMtx[k] = worldToClip;
+
             // 视锥平面：用与绘制侧完全一致的 worldToClip 提 6 个世界空间平面。
             // 关键：必须用 GL.GetGPUProjectionMatrix(proj,true)*view（即渲染时实际用的矩阵），
             // 不能用裸 proj*view —— 后者在 D3D reversed-Z 下近/远平面算反 ⇒ 过剔除。
@@ -691,11 +718,39 @@ namespace Cluster
 
             // buffer 绑定按 kernel 分开设：SetBuffer(kernelIndex, name, buf) 只对该 kernel 生效。
             // _Counter / _Args / _Visible 被 Reset / CullAll / BuildArgs 共用 ⇒ 三个都要绑。
+            // Hi-Z：只有「开关打开 + 金字塔已建好（上一帧的阴影图）」才做；否则整体关闭。
+            bool hzOk = hiZEnable && m_hizValid && m_hiz0 != null && m_hizAtlasSize > 0;
+            cullShader.SetInt("_HiZEnable", hzOk ? 1 : 0);
+            cullShader.SetInt("_ZReversed", SystemInfo.usesReversedZBuffer ? 1 : 0);
+            cullShader.SetFloat("_HiZBias", 0f);
+            cullShader.SetFloat("_HiZRelBias", HiZRelBias);
+            cullShader.SetFloat("_HiZMinSize", HiZMinScreenSize);
+            cullShader.SetInt("_AtlasW", m_hizAtlasSize);
+            cullShader.SetInt("_AtlasH", m_hizAtlasSize);
+            cullShader.SetMatrixArray("_ClipMtx", m_clipMtx);
+            cullShader.SetMatrixArray("_AtlasMtx", hzOk ? m_atlasMtx : m_atlasMtxZero);
+
             int kReset = cullShader.FindKernel("Reset");
             int kCull = cullShader.FindKernel("CullAll");
             int kIdx = cullShader.FindKernel("BuildIndices");
             int kArgs = cullShader.FindKernel("BuildArgs");
             int kCopy = cullShader.FindKernel("CopyStatic");
+
+            // _HiZ0..3 是 compute 里的【全局声明】⇒ CullAll 必须绑；没建金字塔时塞 1×1 占位
+            // （不绑会报 "Property (_HiZ0) ... is not set"；绑占位时 _HiZEnable=0，kernel 不会去采）。
+            var hz0 = hzOk ? m_hiz0 : DummyHiZ();
+            var hz1 = (hzOk && m_hiz1 != null) ? m_hiz1 : hz0;
+            var hz2 = (hzOk && m_hiz2 != null) ? m_hiz2 : hz0;
+            var hz3 = (hzOk && m_hiz3 != null) ? m_hiz3 : hz0;
+            cmd.SetComputeTextureParam(cullShader, kCull, "_HiZ0", hz0);
+            cmd.SetComputeTextureParam(cullShader, kCull, "_HiZ1", hz1);
+            cmd.SetComputeTextureParam(cullShader, kCull, "_HiZ2", hz2);
+            cmd.SetComputeTextureParam(cullShader, kCull, "_HiZ3", hz3);
+            cmd.SetComputeTextureParam(cullShader, kCull, "_SrcDepth", hz0);
+            cullShader.SetInt("_HiZ0SizeX", hz0.width); cullShader.SetInt("_HiZ0SizeY", hz0.height);
+            cullShader.SetInt("_HiZ1SizeX", hz1.width); cullShader.SetInt("_HiZ1SizeY", hz1.height);
+            cullShader.SetInt("_HiZ2SizeX", hz2.width); cullShader.SetInt("_HiZ2SizeY", hz2.height);
+            cullShader.SetInt("_HiZ3SizeX", hz3.width); cullShader.SetInt("_HiZ3SizeY", hz3.height);
 
             foreach (int k in new[] { kReset, kCull, kIdx, kArgs, kCopy })
             {
@@ -758,6 +813,114 @@ namespace Cluster
             cmd.BeginSample("CCull.BuildIndices");
             cmd.DispatchCompute(cullShader, kIdx, gx, gy, 1);
             cmd.EndSample("CCull.BuildIndices");
+        }
+
+        // ---------------- Hi-Z：灯光空间的遮挡剔除 ----------------
+
+        /// <summary>
+        /// 登记某级联的「世界 → 阴影图集 UV」矩阵（= Shadows.cs 里的 dirShadowMatrices[tileIndex]，
+        /// 由 ConvertToAtlasMatrix 生成，与采样侧 SAMPLE_TEXTURE2D_SHADOW 口径逐位一致）。
+        /// Hi-Z 用它把簇的 8 个角点投到图集上算 texel 矩形。必须在 Cull 之前调用。
+        /// </summary>
+        public void SetCascadeAtlasMatrix(int cascade, Matrix4x4 atlasMtx)
+        {
+            if (cascade < 0 || cascade >= MaxCascades) return;
+            m_atlasMtx[cascade] = atlasMtx;
+        }
+
+        /// <summary>
+        /// 用【本帧】画完的阴影图集深度重建遮挡金字塔，供【下一帧】的 CullAll 使用。
+        /// 必须在所有级联都画完（ExecuteBuffer 之后）、且图集还没被 ReleaseTemporaryRT 之前调用。
+        /// </summary>
+        public void BuildHiZ(CommandBuffer cmd, RenderTargetIdentifier srcDepth, int atlasSize)
+        {
+            if (!built || cullShader == null || !hiZEnable) return;
+            if (atlasSize <= 0) return;
+            EnsureHiZ(atlasSize);
+            if (m_hiz0 == null || m_hiz3 == null) return;
+
+            int k0 = cullShader.FindKernel("BuildOccluder0");
+            int k1 = cullShader.FindKernel("BuildOccluder1");
+            int k2 = cullShader.FindKernel("BuildOccluder2");
+            int k3 = cullShader.FindKernel("BuildOccluder3");
+
+            cullShader.SetInt("_AtlasW", atlasSize);
+            cullShader.SetInt("_AtlasH", atlasSize);
+            cullShader.SetInt("_HiZ0SizeX", m_hiz0.width); cullShader.SetInt("_HiZ0SizeY", m_hiz0.height);
+            cullShader.SetInt("_HiZ1SizeX", m_hiz1.width); cullShader.SetInt("_HiZ1SizeY", m_hiz1.height);
+            cullShader.SetInt("_HiZ2SizeX", m_hiz2.width); cullShader.SetInt("_HiZ2SizeY", m_hiz2.height);
+            cullShader.SetInt("_HiZ3SizeX", m_hiz3.width); cullShader.SetInt("_HiZ3SizeY", m_hiz3.height);
+
+            // 所有全局纹理在【每个】kernel 上都绑一遍（漏绑会报 "Property (...) is not set"）。
+            void Bind(int k)
+            {
+                cmd.SetComputeTextureParam(cullShader, k, "_SrcDepth", srcDepth);
+                cmd.SetComputeTextureParam(cullShader, k, "_HiZ0", m_hiz0);
+                cmd.SetComputeTextureParam(cullShader, k, "_HiZ1", m_hiz1);
+                cmd.SetComputeTextureParam(cullShader, k, "_HiZ2", m_hiz2);
+                cmd.SetComputeTextureParam(cullShader, k, "_HiZ3", m_hiz3);
+            }
+            void Run(int k, RenderTexture dst)
+                => cmd.DispatchCompute(cullShader, k,
+                    Mathf.Max(1, Mathf.CeilToInt(dst.width / 8f)),
+                    Mathf.Max(1, Mathf.CeilToInt(dst.height / 8f)), 1);
+
+            Bind(k0); Run(k0, m_hiz0);
+            Bind(k1); Run(k1, m_hiz1);
+            Bind(k2); Run(k2, m_hiz2);
+            Bind(k3); Run(k3, m_hiz3);
+
+            m_hizValid = true;      // 从下一帧开始生效（本帧的 Cull 已经跑过了）
+        }
+
+        void EnsureHiZ(int atlasSize)
+        {
+            int w0 = Mathf.Max(1, atlasSize / 2), h0 = w0;
+            int w1 = Mathf.Max(1, w0 / 2), h1 = w1;
+            int w2 = Mathf.Max(1, w1 / 2), h2 = w2;
+            int w3 = Mathf.Max(1, w2 / 2), h3 = w3;
+            if (m_hizAtlasSize == atlasSize && m_hiz0 != null && m_hiz3 != null
+                && m_hiz3.width == w3) return;
+
+            ReleaseHiZ();
+            m_hiz0 = NewHiZRT(w0, h0, "ClusterShadowHiZ0");
+            m_hiz1 = NewHiZRT(w1, h1, "ClusterShadowHiZ1");
+            m_hiz2 = NewHiZRT(w2, h2, "ClusterShadowHiZ2");
+            m_hiz3 = NewHiZRT(w3, h3, "ClusterShadowHiZ3");
+            m_hizAtlasSize = atlasSize;
+            m_hizValid = false;
+        }
+
+        static RenderTexture NewHiZRT(int w, int h, string name)
+        {
+            var rt = new RenderTexture(w, h, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear)
+            {
+                enableRandomWrite = true,
+                useMipMap = false,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = name,
+            };
+            rt.Create();
+            return rt;
+        }
+
+        void ReleaseHiZ()
+        {
+            if (m_hiz0 != null) { m_hiz0.Release(); UnityEngine.Object.DestroyImmediate(m_hiz0); m_hiz0 = null; }
+            if (m_hiz1 != null) { m_hiz1.Release(); UnityEngine.Object.DestroyImmediate(m_hiz1); m_hiz1 = null; }
+            if (m_hiz2 != null) { m_hiz2.Release(); UnityEngine.Object.DestroyImmediate(m_hiz2); m_hiz2 = null; }
+            if (m_hiz3 != null) { m_hiz3.Release(); UnityEngine.Object.DestroyImmediate(m_hiz3); m_hiz3 = null; }
+            m_hizAtlasSize = 0;
+            m_hizValid = false;
+        }
+
+        /// <summary>1×1 占位金字塔：只为满足「compute 里全局声明的纹理必须已绑定」。
+        /// 绑占位时 _HiZEnable 一定是 0，kernel 不会去采样。</summary>
+        RenderTexture DummyHiZ()
+        {
+            if (m_hizDummy == null) m_hizDummy = NewHiZRT(1, 1, "ClusterShadowHiZDummy");
+            return m_hizDummy;
         }
 
         /// <summary>
@@ -830,6 +993,8 @@ namespace Cluster
             planesBuf = visibleBuf = counterBuf = argsBuf = null;
             m_cpuBounds = null;
             m_needStaticCopy = false;
+            ReleaseHiZ();
+            if (m_hizDummy != null) { m_hizDummy.Release(); UnityEngine.Object.DestroyImmediate(m_hizDummy); m_hizDummy = null; }
             for (int i = 0; i < MaxCascades; i++) m_padHasKey[i] = false;
             RestoreCutoutMarks();
             built = false;

@@ -25,6 +25,10 @@
 #pragma kernel BuildArgs
 #pragma kernel BuildIndices
 #pragma kernel CopyStatic
+#pragma kernel BuildOccluder0
+#pragma kernel BuildOccluder1
+#pragma kernel BuildOccluder2
+#pragma kernel BuildOccluder3
 
 StructuredBuffer<float4> _ClusterBounds;         // xyz=世界包围球中心 w=半径
 
@@ -54,6 +58,141 @@ int _IdxDimX;                                    // BuildIndices 的 x 维线程
 // 完全跳过 BuildIndices 的重排。多画的那几个不可见簇已被视锥剔过 ⇒ 影子落不进本级联盒内
 // ⇒ 视觉上无害，只是多走点几何；换掉的是整整 49MB/级的索引写入。
 int _FullSkipPercent;
+
+// ===================== Hi-Z 遮挡剔除（灯光空间）=====================
+// 数据流：本帧阴影图集画完 → BuildOccluder0..3 用【本帧阴影图深度】建金字塔 →
+//         【下一帧】的 CullAll 用它做遮挡测试。和 GBuffer 那套一模一样（同一帧建、下一帧用）。
+// 意义：沿光轴被别的投影体挡住的簇，写进阴影图也是白写（会被更近的深度覆盖）⇒ 整簇剔掉不画。
+// 对远级联特别有效：视锥剔除在级联 2/3 几乎剔不掉东西（实测 100% 可见）。
+//
+// ⚠️【UAV 上限 8】CullAll 已用 _SlotOf / _Visible / _Counter 三个，这里再加 _HiZ0..3 四个 = 7。
+//    所以【不能】再加第 5 级金字塔（也不加统计缓冲），否则 D3D11.0 直接跳过 dispatch。
+//    大簇靠「最粗一级允许 8×8 texel」的预算扩覆盖范围，不靠加级。
+Texture2D<float>   _SrcDepth;      // 阴影图集（RenderTextureFormat.Shadowmap，可 Load）
+RWTexture2D<float> _HiZ0;          // 1/2 图集
+RWTexture2D<float> _HiZ1;          // 1/4
+RWTexture2D<float> _HiZ2;          // 1/8
+RWTexture2D<float> _HiZ3;          // 1/16
+int _HiZ0SizeX, _HiZ0SizeY;
+int _HiZ1SizeX, _HiZ1SizeY;
+int _HiZ2SizeX, _HiZ2SizeY;
+int _HiZ3SizeX, _HiZ3SizeY;
+int   _AtlasW, _AtlasH;            // 阴影图集尺寸（BuildOccluder0 的 Load 边界）
+int   _HiZEnable;                  // 0 = 不做遮挡测试（Scene 相机 / 开关关闭 / 金字塔还没建好）
+int   _ZReversed;
+float _HiZBias, _HiZRelBias, _HiZMinSize;
+// world→clip：GL.GetGPUProjectionMatrix(proj,true)*view —— 它的 ndc.z 就是阴影图里【存的那个深度】
+float4x4 _ClipMtx[4];
+// world→图集 UV：ConvertToAtlasMatrix(...) —— 与采样侧 SAMPLE_TEXTURE2D_SHADOW 的口径逐位一致
+// （经验锚点：阴影采样正确 ⇒ 这个矩阵的 xy 乘图集尺寸就是 texel 坐标，不需要再翻 Y）。
+float4x4 _AtlasMtx[4];
+
+#define ZFAR2(a, b)  (_ZReversed ? min(a, b) : max(a, b))
+#define ZNEAR2(a, b) (_ZReversed ? max(a, b) : min(a, b))
+
+int2 ShadowHiZSize(int lvl)
+{
+    if (lvl == 0) return int2(_HiZ0SizeX, _HiZ0SizeY);
+    if (lvl == 1) return int2(_HiZ1SizeX, _HiZ1SizeY);
+    if (lvl == 2) return int2(_HiZ2SizeX, _HiZ2SizeY);
+    return int2(_HiZ3SizeX, _HiZ3SizeY);
+}
+
+float ShadowHiZSample(int lvl, int2 p)
+{
+    if (lvl == 0) return _HiZ0[p];
+    if (lvl == 1) return _HiZ1[p];
+    if (lvl == 2) return _HiZ2[p];
+    return _HiZ3[p];
+}
+
+// 簇包围盒在该级联阴影图上的 texel 矩形 + 最近深度
+bool ClusterShadowRect(float4 bb, int k, out float2 smin, out float2 smax, out float nearestZ)
+{
+    smin = 1e30; smax = -1e30;
+    float nz = (_ZReversed != 0) ? -1e30 : 1e30;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        float3 w = bb.xyz + float3((i & 1) ? bb.w : -bb.w,
+                                   (i & 2) ? bb.w : -bb.w,
+                                   (i & 4) ? bb.w : -bb.w);
+        float4 ap = mul(_AtlasMtx[k], float4(w, 1.0));
+        if (ap.w <= 1e-4) { nearestZ = saturate(nz); return false; }
+        float4 cp = mul(_ClipMtx[k], float4(w, 1.0));
+        nz = ZNEAR2(nz, cp.z / cp.w);          // 8 个角点里最近的那个（阴影图里存的就是这个 z）
+        float2 s = ap.xy * float2(_AtlasW, _AtlasH);
+        smin = min(smin, s);
+        smax = max(smax, s);
+    }
+    smin = clamp(smin, 0.0, float2(_AtlasW - 1, _AtlasH - 1));
+    smax = clamp(smax, 0.0, float2(_AtlasW - 1, _AtlasH - 1));
+    nearestZ = saturate(nz);
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder0(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ0SizeX || (int)id.y >= _HiZ0SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_AtlasW - 1, _AtlasH - 1);
+    float m = _SrcDepth.Load(int3(clamp(base, int2(0, 0), dmax), 0));
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR2(m, _SrcDepth.Load(int3(q, 0)));
+    }
+    _HiZ0[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder1(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ1SizeX || (int)id.y >= _HiZ1SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ0SizeX - 1, _HiZ0SizeY - 1);
+    float m = _HiZ0[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR2(m, _HiZ0[q]);
+    }
+    _HiZ1[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder2(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ2SizeX || (int)id.y >= _HiZ2SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ1SizeX - 1, _HiZ1SizeY - 1);
+    float m = _HiZ1[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR2(m, _HiZ1[q]);
+    }
+    _HiZ2[id.xy] = m;
+}
+
+[numthreads(8, 8, 1)]
+void BuildOccluder3(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _HiZ3SizeX || (int)id.y >= _HiZ3SizeY) return;
+    int2 base = int2(id.xy) * 2;
+    int2 dmax = int2(_HiZ2SizeX - 1, _HiZ2SizeY - 1);
+    float m = _HiZ2[clamp(base, int2(0, 0), dmax)];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 q = clamp(base + int2(x, y), int2(0, 0), dmax);
+        m = ZFAR2(m, _HiZ2[q]);
+    }
+    _HiZ3[id.xy] = m;
+}
 
 // 纯清零：dispatch 1 组即可
 [numthreads(64, 1, 1)]
@@ -96,6 +235,51 @@ void CullAll(uint3 id : SV_DispatchThreadID)
         }
 
         if (!ok) continue;
+
+        // ===== Hi-Z 遮挡剔除（灯光空间）=====
+        // 判据与 GBuffer 那套完全一致：簇在阴影图上的矩形内「最远的深度」都比簇最近点更近
+        // ⇒ 整簇被更近的投影体完全挡住 ⇒ 写进阴影图也会被覆盖 ⇒ 零贡献，直接不画。
+        // ⚠️ 故意【不受 _DebugForceAll 影响】：Debug 模式要能单独看遮挡剔除对不对。
+        if (_HiZEnable != 0 && k < 4)
+        {
+            float2 smin, smax; float nearestZ;
+            if (ClusterShadowRect(bb, k, smin, smax, nearestZ))
+            {
+                float2 span = smax - smin;
+                float maxSpan = max(span.x, span.y);
+                if (maxSpan >= _HiZMinSize && span.x > 0 && span.y > 0)
+                {
+                    float tileFar = 0;
+                    bool tested = false;
+                    // 选级：从最细（1/2 图集）往上找，矩形 texel 数不超过预算；
+                    // 最粗一级（1/16）给 8×8 = 64，让大簇也能测（512 的 tile 在 1/16 上是 32 texel）。
+                    [loop] for (int lvl = 0; lvl < 4; lvl++)
+                    {
+                        float inv = 0.5 * exp2(-(float)lvl);
+                        int budget = (lvl == 3) ? 64 : 16;
+                        int2 sz = ShadowHiZSize(lvl) - 1;
+                        int2 a = clamp((int2)floor(smin * inv), int2(0, 0), sz);
+                        int2 b = clamp((int2)ceil (smax * inv), int2(0, 0), sz);
+                        int2 n = b - a + 1;
+                        if (n.x * n.y <= budget)
+                        {
+                            tileFar = ShadowHiZSample(lvl, a); tested = true;
+                            for (int y = 0; y < n.y; y++)
+                                for (int x = 0; x < n.x; x++)
+                                    tileFar = ZFAR2(tileFar, ShadowHiZSample(lvl, a + int2(x, y)));
+                            break;
+                        }
+                    }
+                    if (tested)
+                    {
+                        float tol = max(_HiZBias, nearestZ * _HiZRelBias);
+                        bool occluded = (_ZReversed != 0) ? (tileFar > nearestZ + tol)
+                                                          : (tileFar < nearestZ - tol);
+                        if (occluded) continue;     // 该级联这簇不可见
+                    }
+                }
+            }
+        }
 
         // 原子追加进该级联的紧凑列表
         uint slot;

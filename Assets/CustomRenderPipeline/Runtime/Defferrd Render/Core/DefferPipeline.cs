@@ -115,6 +115,9 @@ namespace CustomRenderPipline.DefferPipeline
 
             Profiler.BeginSample(SampleName);
             ExecuteBuffer();
+            // 阴影侧 Hi-Z 的开关口径：只在 Game 相机做遮挡剔除（Scene 视图只做视锥剔除）。
+            // 必须在 lighting.Setup（内部会渲染阴影）之前置位。
+            ClusterShadowRenderer.HiZGameCamera = camera != null && camera.cameraType == CameraType.Game;
             //之后加后处理、灯光等数据准备
             //准备灯光数据，在灯光数据中会进行阴影数据准备
             lighting.Setup(
@@ -248,25 +251,56 @@ namespace CustomRenderPipline.DefferPipeline
             // 剔除结果（可见簇列表 + indirect args）本帧被 GBuffer 和 Feedback 共用，
             // 所以必须在这里、在 RenderFeedback 之前 dispatch 完。
             // 触发条件 = 同一个 clusterMode 开关（不允许 GBuffer 和阴影各走一半）。
-            // 只对 Game 摄像机生效：Scene 视图始终走 SRP，天然可作为 A/B 对照。
+            // Game 摄像机恒生效；Scene 视图按资产的 sceneViewReuseMainCulling 决定
+            // 【复用主相机剔除结果】还是【独立视锥剔除】——两种都会画 cluster，方便直接看剔除效果。
             useCluster = false;
             var gbuf = ClusterGBufferRenderer.HasInstance ? ClusterGBufferRenderer.Instance : null;
-            if (gbuf != null) gbuf.active = false;
+            if (gbuf != null)
+            {
+                gbuf.active = false;
+                // 一并复位：否则切回 SRP 模式后这里仍然是上一帧的 true，
+                // DrawGBufferFinal 会继续白建 Hi-Z 金字塔。
+                gbuf.hiZEnable = false;
+            }
 
             var clusterAsset = ClusterControl.TryGetAssembleAsset();
-            if (camera.cameraType == CameraType.Game && clusterAsset != null
+            bool gameCam = camera.cameraType == CameraType.Game;
+            // 只放开 SceneView：Preview / Reflection 探针仍走 SRP，避免影响探针和预览。
+            // Scene 视图【不自己剔除】：直接复用主相机已经算好的可见簇 + indirect args，
+            // 只换 world→clip 矩阵。理由：Scene 视锥远大于游戏相机，独立剔除几乎什么都剔不掉，
+            // 白跑一遍 31856 簇的 dispatch，还看不出任何"被剔掉"的效果；
+            // 复用主相机的可见集才是"看到剔除结果"的正确方式——主相机看不到的簇，Scene 里也不画。
+            bool sceneCam = camera.cameraType == CameraType.SceneView;
+            bool sceneCluster = sceneCam && clusterAsset != null && clusterAsset.sceneViewCluster;
+
+            if ((gameCam || sceneCluster) && clusterAsset != null
                 && clusterAsset.UseRVT && clusterAsset.clusterMode != ClusterMode.SRP)
             {
                 if (gbuf == null) gbuf = ClusterGBufferRenderer.Instance;
                 gbuf.debugForceAll = (clusterAsset.clusterMode == ClusterMode.ClusterDebug) ? 1 : 0;
+                gbuf.debugStats = (clusterAsset.clusterMode == ClusterMode.ClusterDebug);
+                gbuf.hiZEnable = clusterAsset.clusterHiZOcclusion;
                 gbuf.active = true;
-                if (gbuf.Prepare(camera))
+
+                bool ok = sceneCluster ? gbuf.PrepareViewOnly(camera) : gbuf.Prepare(camera);
+                if (ok)
                 {
-                    gbuf.Cull(buffer);
-                    Profiler.BeginSample("Cluster.GBufferCull");
-                    ExecuteBuffer();
-                    Profiler.EndSample();
+                    if (!sceneCluster)
+                    {
+                        gbuf.Cull(buffer, width, height);
+                        Profiler.BeginSample("Cluster.GBufferCull");
+                        ExecuteBuffer();
+                        Profiler.EndSample();
+                        // Hi-Z 统计必须【提交之后】再读回（AsyncGPUReadback 与图形命令有序），
+                        // 提前读会拿到 C# 清零的值 ⇒ 全是 0，看起来像"Hi-Z 根本没跑"。
+                        gbuf.FlushDebugStats();
+                    }
                     useCluster = true;
+                }
+                else if (sceneCluster)
+                {
+                    // 主相机还没剔除过（刚进 Play / 主相机被禁用）⇒ Scene 回退 SRP，别画空白
+                    gbuf.active = false;
                 }
             }
 
@@ -404,6 +438,9 @@ namespace CustomRenderPipline.DefferPipeline
                 Profiler.BeginSample("Cluster.GBufferDraw");
                 ExecuteBuffer();
                 Profiler.EndSample();
+                // Hi-Z 金字塔【不在这里建】：这里的深度附件可能带 MSAA，直接当 SRV 读到的是
+                // 未 resolve 的样本（实测表现为「近的被剔、远的还在、一堆穿孔」）。
+                // 改到 DrawGBufferFinal 里、深度拷贝成 _CameraDepthTexture（MSAA=1）之后建。
             }
 
             // 几何由上面的 context.DrawRenderers(cullingResults) 走 SRP 绘制；
@@ -483,6 +520,22 @@ namespace CustomRenderPipline.DefferPipeline
                     32, FilterMode.Point, RenderTextureFormat.Depth);
                 Draw(DefferProperty.GBufferDepthId, ShaderProperty.CameraDepthTexId,
                     (int)DefferRenderPass._CopyDepth);
+
+                // ===== Hi-Z：用这张【非 MSAA】的深度拷贝建遮挡金字塔，供下一帧的簇剔除用 =====
+                // 复用它而不是自己再 blit 一张，是因为它本来就要为后处理/粒子准备（CopyDepth 开关），
+                // 等于零额外开销。
+                // ⚠️ 只允许 Game 相机建：Scene 相机也会走到这里，但它的深度/视锥完全不同，
+                // 让它建会覆盖主相机那份金字塔 ⇒ 下一帧主相机用错的遮挡体去剔 ⇒ 误剔。
+                if (ClusterGBufferRenderer.HasInstance
+                    && ClusterGBufferRenderer.Instance.hiZEnable
+                    && camera.cameraType == CameraType.Game)
+                {
+                    ClusterGBufferRenderer.Instance.BuildHiZ(
+                        buffer, ShaderProperty.CameraDepthTexId, width, height);
+                    Profiler.BeginSample("Cluster.HiZBuild");
+                    ExecuteBuffer();
+                    Profiler.EndSample();
+                }
             }
 
             //拷贝颜色

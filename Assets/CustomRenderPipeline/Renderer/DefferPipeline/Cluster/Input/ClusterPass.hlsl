@@ -173,9 +173,17 @@ void ClusterGBufferShade (Varyings input,
 	float3 refl = 0;
 	float3 viewDir = normalize(_WorldSpaceCameraPos - positionWS);
 	float3 reflect_dir = reflect(-viewDir, normal);
-	float mip = PerceptualRoughnessToMipmapLevel(roughness);
-
-	refl = ComputeIndirectSpecular(reflect_dir, positionWS, mip);
+	// ❌ 原来这里是 ComputeIndirectSpecular(...) —— 读 unity_SpecCube0。
+	//   unity_SpecCube0 / _HDR / _ProbePosition / _BoxMin / _BoxMax 都是 Unity 在【绑定每个
+	//   Renderer】时设的全局量；簇走 DrawProceduralIndirect 没有 Renderer ⇒ 读到的是上一个
+	//   SRP 物体留下的【陈旧值】。表现：反光强度随相机位置/距离剧变（相机附近刚画的探针亮就暴亮，
+	//   换个地方就"反光消失"），盒投影的中心/包围盒也是错的 ⇒ 反射方向乱飞。
+	// ✅ 改成与 GBufferPass.hlsl（DefferStandard / BRG）逐字一致：从工程自己的天空盒 _MySkybox 采样
+	//   （GPUDravinSystem 每帧 SetGlobalTexture，和 _Sh9 同源），并按粗糙度衰减非金属的反射强度。
+	float reflMip = clamp(roughness * 7.0, 0.0, 8.0);
+	refl = SamplerReflectProbe(reflect_dir, reflMip);
+	float reflIntensity = lerp(saturate(0.05 + (1.0 - roughness) * 0.6), 1.0, metallic);
+	refl *= reflIntensity;
 
 	target._GBufferRT0 = float4(albedo.xyz, metallic);
 	// target._GBufferRT0 = smoothstep(minRadio, maxRadio, mipRadio);

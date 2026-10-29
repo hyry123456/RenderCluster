@@ -91,7 +91,13 @@ namespace Cluster
         int m_clusterCount;
         bool m_built;
         bool m_atlasBound;
+        // 是否已经有相机跑过一次 Cull（可见列表 / args 已经有效）。
+        // Scene 视图「复用主相机可见集」必须先满足它，否则缓冲是空的 ⇒ 什么都画不出来。
+        bool m_culled;
         Matrix4x4 m_w2c;
+        // 【上一帧】的 world→clip。Hi-Z 金字塔是上一帧深度建的，遮挡测试必须配上一帧的矩阵，
+        // 否则相机一动，簇被投影到"这一帧的屏幕"却拿"上一帧的深度"去比 ⇒ 系统性错位 ⇒ 误剔。
+        Matrix4x4 m_prevVP = Matrix4x4.identity;
         readonly Vector4[] m_planes = new Vector4[PlanesPerView];
 
         // ---------------- 分组（detail 贴图对） ----------------
@@ -102,10 +108,54 @@ namespace Cluster
 
         /// <summary>排查用：非 0 时跳过视锥剔除，全部簇都画。</summary>
         public int debugForceAll = 0;
+        /// <summary>只在 ClusterDebug 模式下为 true：开启 Hi-Z 判定统计与额外日志。</summary>
+        public bool debugStats = false;
 
         /// <summary>本帧是否由管线启用（DefferPipeline 每帧设置）。
         /// 关掉资产开关后必须立刻停用，否则 GBuffer 走 SRP、Feedback 还走 Cluster，两边会分叉。</summary>
         public bool active;
+
+        // ===== Hi-Z 遮挡剔除 =====
+        // 用【上一帧】的相机深度金字塔，剔掉被墙挡住整块的簇。
+        // 之所以能"上一帧"：金字塔在本帧 GBuffer 画完后重建，供下一帧使用，
+        // 所以既不需要跨帧保存深度图，也不存在 depth→color 的拷贝格式问题。
+        // 失败模式是安全的：深度读不到 ⇒ 金字塔全是 0（无穷远）⇒ 判据永不成立 ⇒ 不剔除、不改变画面。
+        public bool hiZEnable = false;
+        // 四级 HZB：1/2 → 1/4 → 1/8 → 1/16 屏，每级 2×2 归约取「最远」。
+        // ⚠️【不能加级】CullAll 的 UAV 已占满 8 个（_HiZ0..3 + _HiZStat + _SlotOf + _Visible + _Counter），
+        // D3D11.0 一个 kernel 最多 8 个 UAV。再加一级 ⇒ dispatch 被跳过、剔除整个失效。
+        // 大簇的覆盖范围靠 compute 里的 texel 预算（最粗一级给 8×8）来扩，不靠加级。
+        RenderTexture m_hiz0, m_hiz1, m_hiz2, m_hiz3;
+        bool m_hizValid;
+        // 占位纹理：_HiZ0/_HiZ1 在 compute 里是【全局声明】，所有 kernel 都要求绑定。
+        // Hi-Z 关闭或首帧还没建金字塔时也必须塞一张（否则报
+        // "Property (_HiZ0) at kernel index (1) is not set"）。1×1 的 RFloat 开销可忽略。
+        RenderTexture m_hizDummy;
+        /// <summary>绝对深度余量（深度空间）。0 = 严格按判据。</summary>
+        const float HiZBias = 0f;
+        /// <summary>
+        /// 相对深度余量（乘 nearestZ）。远处深度值趋近 0（reversed-Z），此时绝对 bias 等于没加，
+        /// 全靠这个相对量兜住浮点误差 → 误差方向永远偏「不剔除」，只会漏剔、不会穿孔。
+        /// 1% ≈ 200m 处 1.6m、10m 处 0.03m 的深度余量：够吃浮点与半 texel 的错位，又不至于挡住正常剔除。
+        /// </summary>
+        const float HiZRelBias = 0.01f;
+        /// <summary>
+        /// 簇的屏幕跨度小于它就不做遮挡测试（像素）。
+        /// 金字塔最细一级是 1/2 屏（1 texel = 2×2 像素），4 像素 = 2 texel 起步；
+        /// 更小的簇在块里几乎全是邻居，宁可漏剔（本来也几乎没收益）。
+        /// </summary>
+        const float HiZMinScreenSize = 4f;
+        static readonly int DepthTexId = Shader.PropertyToID("_GBufferDepthTex");
+
+        // 调试统计（只在 ClusterDebug 模式累加）：0=测了且保留 1=被判遮挡剔除 3=跳过(太小/太大) 4=矩形不可靠
+        // 5/6/7 由 C# 填「本帧状态」：5=Hi-Z 实际启用 6=金字塔有效 7=剔选用屏宽
+        ComputeBuffer m_hizStat;
+        bool m_hizStatPending;
+        /// <summary>本帧是否该读一次统计——在 Cull 里置位，由管线在 ExecuteBuffer 之后调 FlushDebugStats。</summary>
+        bool m_hizStatDue;
+        uint[] m_dbgStat = new uint[8];
+        /// <summary>剔选用到的视口尺寸（只给调试日志用）。</summary>
+        int m_dbgPicW;
 
         public bool IsReady => active && m_built && m_clusterCount > 0 && m_groupCount > 0
             && m_atlasBound && m_mat != null;
@@ -498,9 +548,32 @@ namespace Cluster
             return IsReady;
         }
 
+        /// <summary>
+        /// 只更新 world→clip（绘制用的那个矩阵），【不动】剔除平面与可见列表缓冲。
+        /// 用途：Scene 视图直接用主相机已经算好的可见簇 / indirect args 来画 ——
+        /// 可见性跟主相机走，Scene 不跑 Cull、也就没有额外的剔除开销。
+        ///
+        /// 为什么要这样：Scene 相机的视锥远大于游戏相机，独立剔除几乎什么都剔不掉，
+        /// 只会白跑一遍 31856 簇的 dispatch，还看不出任何"被剔掉"的效果。
+        /// 复用主相机的可见集才是"看到剔除结果"的正确方式：主相机看不到的簇，
+        /// Scene 里也不会画出来。
+        ///
+        /// 返回 false ⇒ 主相机还没剔除过（刚进 Play / 主相机被禁用），调用方应回退 SRP。
+        /// </summary>
+        public bool PrepareViewOnly(Camera camera)
+        {
+            if (m_dirty) Rebuild();
+            if (!m_built || camera == null || !m_culled) return false;
+            var gpuProj = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+            m_w2c = gpuProj * camera.worldToCameraMatrix;
+            return IsReady;
+        }
+
         /// <summary>一次 GPU 剔除，产出每组的可见簇列表与 indirect args。
         /// 必须在任何绘制之前、且同一帧只调一次（GBuffer 与 Feedback 共用这份结果）。</summary>
-        public void Cull(CommandBuffer cmd)
+        public void Cull(CommandBuffer cmd) => Cull(cmd, 0, 0);
+
+        public void Cull(CommandBuffer cmd, int picW, int picH)
         {
             if (!m_built || m_cull == null || m_clusterCount == 0) return;
 
@@ -512,12 +585,64 @@ namespace Cluster
             int kIdx = m_cull.FindKernel("BuildIndices");
             int kArgs = m_cull.FindKernel("BuildArgs");
 
+            m_cull.SetInt("_HiZEnable", (hiZEnable && m_hizValid) ? 1 : 0);
+            m_cull.SetFloat("_HiZBias", HiZBias);
+            m_cull.SetFloat("_HiZRelBias", HiZRelBias);
+            m_cull.SetFloat("_HiZMinSize", HiZMinScreenSize);
+            // 深度方向：D3D 恒为 reversed-Z（1=近），但别硬编码——GL/Vulkan 上就是相反的。
+            // 传错的表现是「近的被剔、远的还在，一堆穿孔」。
+            m_cull.SetInt("_ZReversed", SystemInfo.usesReversedZBuffer ? 1 : 0);
+            if (picW > 0 && picH > 0)
+            {
+                m_cull.SetVector("_PicSize", new Vector4(picW, picH, 0f, 0f));
+                // 遮挡测试用【上一帧】的 VP：金字塔是上一帧深度建的，两者必须同源。
+                m_cull.SetMatrix("_ViewProj", m_prevVP);
+            }
+            // 无论开不开都必须绑：_HiZ0..3 / _SrcDepth 是 compute 里的全局声明，
+            // 所有 kernel 都会要求它们已绑定（否则 Submit 时报 "Property (_HiZ0) ... is not set"）。
+            // 没建金字塔时塞 1×1 占位，_HiZEnable=0 保证 kernel 根本不会去采样它们。
+            bool hzOk = hiZEnable && m_hizValid && m_hiz0 != null;
+            var hz0 = hzOk ? m_hiz0 : DummyHiZ();
+            var hz1 = (hzOk && m_hiz1 != null) ? m_hiz1 : hz0;
+            var hz2 = (hzOk && m_hiz2 != null) ? m_hiz2 : hz0;
+            var hz3 = (hzOk && m_hiz3 != null) ? m_hiz3 : hz0;
+            cmd.SetComputeTextureParam(m_cull, kCull, "_HiZ0", hz0);
+            cmd.SetComputeTextureParam(m_cull, kCull, "_HiZ1", hz1);
+            cmd.SetComputeTextureParam(m_cull, kCull, "_HiZ2", hz2);
+            cmd.SetComputeTextureParam(m_cull, kCull, "_HiZ3", hz3);
+            cmd.SetComputeTextureParam(m_cull, kCull, "_SrcDepth", hz0);
+            m_cull.SetInt("_HiZ0SizeX", hz0.width);
+            m_cull.SetInt("_HiZ0SizeY", hz0.height);
+            m_cull.SetInt("_HiZ1SizeX", hz1.width);
+            m_cull.SetInt("_HiZ1SizeY", hz1.height);
+            m_cull.SetInt("_HiZ2SizeX", hz2.width);
+            m_cull.SetInt("_HiZ2SizeY", hz2.height);
+            m_cull.SetInt("_HiZ3SizeX", hz3.width);
+            m_cull.SetInt("_HiZ3SizeY", hz3.height);
+
+            // Hi-Z 统计缓冲：_HiZStat 是 compute 里的全局声明 ⇒ 每个 kernel 都得绑。
+            if (m_hizStat == null)
+                m_hizStat = new ComputeBuffer(8, sizeof(uint), ComputeBufferType.Structured);
+            if (debugStats)
+            {
+                // 0..4 清零（只统计本帧），5..7 填本帧状态，让日志能自证"到底跑没跑 Hi-Z"。
+                m_dbgStat[0] = m_dbgStat[1] = m_dbgStat[2] = m_dbgStat[3] = m_dbgStat[4] = 0;
+                m_dbgStat[5] = (uint)(hzOk ? 1 : 0);
+                m_dbgStat[6] = (uint)(m_hizValid ? 1 : 0);
+                m_dbgStat[7] = (uint)Mathf.Max(0, picW);
+                m_hizStat.SetData(m_dbgStat);
+                m_dbgPicW = picW;
+                m_cull.SetInt("_HiZDebug", 1);
+            }
+            else m_cull.SetInt("_HiZDebug", 0);
+
             foreach (int k in new[] { kReset, kCull, kIdx, kArgs })
             {
                 m_cull.SetInt("_GroupCount", m_groupCount);
                 m_cull.SetInt("_ClusterCount", m_clusterCount);
                 m_cull.SetInt("_TrisPerCluster", TrisPerCluster);
                 m_cull.SetInt("_DebugForceAll", debugForceAll == 0 ? 0 : 1);
+                m_cull.SetBuffer(k, "_HiZStat", m_hizStat);
                 m_cull.SetBuffer(k, "_DrawBase", m_drawBaseBuf);
                 m_cull.SetBuffer(k, "_Counter", m_counterBuf);
                 m_cull.SetBuffer(k, "_Args", m_argsBuf);
@@ -534,6 +659,8 @@ namespace Cluster
 
             cmd.DispatchCompute(m_cull, kReset, Mathf.Max(1, Mathf.CeilToInt(m_groupCount / 64f)), 1, 1);
             cmd.DispatchCompute(m_cull, kCull, groups, 1, 1);
+            // 从这一刻起缓冲里的可见列表 / args 有效，Scene 视图可以复用它直接画。
+            m_culled = true;
             // 一维展开：总簇数 × 384 个角点，每线程一个角点。不可见的簇在 kernel 里
             // 靠 _SlotOf 直接退出 ⇒ 规模只和「场景簇数」有关，与组数无关。
             // ⚠️【试过并回退】每簇一个 384 线程组（组数 ÷6）：occupancy 下降，反而变慢。
@@ -545,6 +672,153 @@ namespace Cluster
             m_cull.SetInt("_IdxDimX", gx * ThreadGroupSize);
             cmd.DispatchCompute(m_cull, kIdx, gx, gy, 1);
             cmd.DispatchCompute(m_cull, kArgs, gGroups, 1, 1);
+
+            // ⚠️ 不要在这里直接发起 AsyncGPUReadback：此刻 CullAll 还没进命令队列
+            // （ExecuteBuffer 在管线里稍后才调），读回拿到的是刚才 SetData 写进去的 0。
+            // 改成打标记，由管线在 ExecuteBuffer 之后调 FlushDebugStats()。
+            if (debugStats && !m_hizStatPending && Time.frameCount % 120 == 0)
+                m_hizStatDue = true;
+        }
+
+        /// <summary>
+        /// 由管线在【ExecuteBuffer 之后】调用：真正发起 Hi-Z 统计的异步读回。
+        /// 只能在这时读——AsyncGPUReadback 与已入队的图形命令是有序的，提前读只会拿到清零值。
+        /// </summary>
+        public void FlushDebugStats()
+        {
+            if (!m_hizStatDue) return;
+            m_hizStatDue = false;
+            RequestHiZStats();
+        }
+
+        /// <summary>
+        /// 调试：异步读回 Hi-Z 判定统计（不 stall GPU）。只在 ClusterDebug 模式下调用。
+        /// 用来判断"到底剔了多少 / 有多少被跳过"——如果剔除比例明显偏高，就是误剔。
+        /// </summary>
+        void RequestHiZStats()
+        {
+            if (m_hizStat == null) return;
+            m_hizStatPending = true;
+            int picW = m_dbgPicW;
+            AsyncGPUReadback.Request(m_hizStat, req =>
+            {
+                m_hizStatPending = false;
+                if (req.hasError) return;
+                var d = req.GetData<uint>();
+                Debug.Log($"[Cluster Hi-Z] 启用={d[5]} 金字塔有效={d[6]} 剔选屏宽={picW} ｜ " +
+                          $"测了 {d[0]} 保留 / 剔 {d[1]} / 跳过 {d[3]}（太小或太大）/ 矩形不可靠 {d[4]}");
+            });
+        }
+
+        /// <summary>
+        /// 用【本帧】的相机深度重建遮挡金字塔，供【下一帧】的 CullAll 使用。
+        ///
+        /// ⚠️ 必须传【非 MSAA】的深度源。`_GBufferDepthTex` 是带 antiAliasing 的 depth RT，
+        /// 直接当 SRV `Load` 读到的是未 resolve 的样本（实测：画面一堆穿孔，近的被剔、远的还在）。
+        /// 所以调用方要传管线里那份「为后处理/粒子准备的深度拷贝」`_CameraDepthTexture`（MSAA=1）。
+        ///
+        /// ⚠️ 也正因为要用那份拷贝，本函数必须在深度拷贝【之后】调用（DrawGBufferFinal 里）。
+        /// </summary>
+        public void BuildHiZ(CommandBuffer cmd, RenderTargetIdentifier srcDepth, int picW, int picH)
+        {
+            if (!m_built || m_cull == null || !hiZEnable) return;
+            if (picW <= 0 || picH <= 0) return;
+            EnsureHiZ(picW, picH);
+            if (m_hiz0 == null || m_hiz3 == null) return;
+
+            int k0 = m_cull.FindKernel("BuildOccluder0");
+            int k1 = m_cull.FindKernel("BuildOccluder1");
+            int k2 = m_cull.FindKernel("BuildOccluder2");
+            int k3 = m_cull.FindKernel("BuildOccluder3");
+
+            m_cull.SetInt("_DepthW", picW);
+            m_cull.SetInt("_DepthH", picH);
+            m_cull.SetInt("_HiZ0SizeX", m_hiz0.width);
+            m_cull.SetInt("_HiZ0SizeY", m_hiz0.height);
+            m_cull.SetInt("_HiZ1SizeX", m_hiz1.width);
+            m_cull.SetInt("_HiZ1SizeY", m_hiz1.height);
+            m_cull.SetInt("_HiZ2SizeX", m_hiz2.width);
+            m_cull.SetInt("_HiZ2SizeY", m_hiz2.height);
+            m_cull.SetInt("_HiZ3SizeX", m_hiz3.width);
+            m_cull.SetInt("_HiZ3SizeY", m_hiz3.height);
+
+            // 所有全局纹理在【每个】kernel 上都绑一遍：Unity 的 kernel 反射在部分平台/驱动下
+            // 会把未使用的全局资源也算进来，漏绑就报 "not set"。多绑一次零成本。
+            void Bind(CommandBuffer c, int k)
+            {
+                c.SetComputeTextureParam(m_cull, k, "_SrcDepth", srcDepth);
+                c.SetComputeTextureParam(m_cull, k, "_HiZ0", m_hiz0);
+                c.SetComputeTextureParam(m_cull, k, "_HiZ1", m_hiz1);
+                c.SetComputeTextureParam(m_cull, k, "_HiZ2", m_hiz2);
+                c.SetComputeTextureParam(m_cull, k, "_HiZ3", m_hiz3);
+                if (m_hizStat != null) m_cull.SetBuffer(k, "_HiZStat", m_hizStat);
+            }
+            void Run(int k, RenderTexture dst)
+                => cmd.DispatchCompute(m_cull, k,
+                    Mathf.Max(1, Mathf.CeilToInt(dst.width / 8f)),
+                    Mathf.Max(1, Mathf.CeilToInt(dst.height / 8f)), 1);
+
+            // 逐级 2×2 归约：1/1 → 1/2 → 1/4 → 1/8 → 1/16
+            Bind(cmd, k0); Run(k0, m_hiz0);
+            Bind(cmd, k1); Run(k1, m_hiz1);
+            Bind(cmd, k2); Run(k2, m_hiz2);
+            Bind(cmd, k3); Run(k3, m_hiz3);
+
+            m_hizValid = true;      // 从下一帧开始生效（本帧的 Cull 已经跑过了）
+            m_prevVP = m_w2c;       // 记下"这金字塔是哪套 VP 建的"，下一帧遮挡测试要用它
+        }
+
+        void EnsureHiZ(int picW, int picH)
+        {
+            // 四级金字塔：1/2 → 1/4 → 1/8 → 1/16 屏（级数被 UAV 上限锁死，见字段注释）。
+            // 最细一级必须是 1/2（甚至 1/1）：块越大越容易把邻居的最远深度算进来。
+            int w0 = Mathf.Max(1, picW / 2), h0 = Mathf.Max(1, picH / 2);
+            int w1 = Mathf.Max(1, w0 / 2), h1 = Mathf.Max(1, h0 / 2);
+            int w2 = Mathf.Max(1, w1 / 2), h2 = Mathf.Max(1, h1 / 2);
+            int w3 = Mathf.Max(1, w2 / 2), h3 = Mathf.Max(1, h2 / 2);
+            if (m_hiz0 != null && m_hiz0.width == w0 && m_hiz0.height == h0
+                && m_hiz3 != null && m_hiz3.width == w3 && m_hiz3.height == h3)
+                return;
+
+            ReleaseHiZ();
+            m_hiz0 = NewHiZRT(w0, h0, "ClusterHiZ0");
+            m_hiz1 = NewHiZRT(w1, h1, "ClusterHiZ1");
+            m_hiz2 = NewHiZRT(w2, h2, "ClusterHiZ2");
+            m_hiz3 = NewHiZRT(w3, h3, "ClusterHiZ3");
+            m_hizValid = false;
+        }
+
+        static RenderTexture NewHiZRT(int w, int h, string name)
+        {
+            var rt = new RenderTexture(w, h, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear)
+            {
+                enableRandomWrite = true,
+                useMipMap = false,
+                filterMode = FilterMode.Point,
+                wrapMode = TextureWrapMode.Clamp,
+                name = name,
+            };
+            rt.Create();
+            return rt;
+        }
+
+        void ReleaseHiZ()
+        {
+            if (m_hiz0 != null) { m_hiz0.Release(); Object.DestroyImmediate(m_hiz0); m_hiz0 = null; }
+            if (m_hiz1 != null) { m_hiz1.Release(); Object.DestroyImmediate(m_hiz1); m_hiz1 = null; }
+            if (m_hiz2 != null) { m_hiz2.Release(); Object.DestroyImmediate(m_hiz2); m_hiz2 = null; }
+            if (m_hiz3 != null) { m_hiz3.Release(); Object.DestroyImmediate(m_hiz3); m_hiz3 = null; }
+            m_hizValid = false;
+        }
+
+        /// <summary>
+        /// 1×1 占位金字塔，只为了满足「compute 里全局声明的纹理必须已绑定」这个要求。
+        /// 内容不会被读：绑占位时 _HiZEnable 一定是 0，kernel 里那句 if 直接跳过。
+        /// </summary>
+        RenderTexture DummyHiZ()
+        {
+            if (m_hizDummy == null) m_hizDummy = NewHiZRT(1, 1, "ClusterHiZDummy");
+            return m_hizDummy;
         }
 
         /// <summary>画 GBuffer（pass 0）。返回 false = 没画，调用方应保留 SRP 绘制。</summary>
@@ -596,6 +870,15 @@ namespace Cluster
         {
             m_entries.Clear();
             ReleaseBuffers();
+            ReleaseHiZ();           // Hi-Z 金字塔是自建 RT，不随 Unity 的临时 RT 管理，必须自己放
+            m_hizStat?.Release();
+            m_hizStat = null;
+            if (m_hizDummy != null)
+            {
+                m_hizDummy.Release();
+                Object.DestroyImmediate(m_hizDummy);
+                m_hizDummy = null;
+            }
             // 图集 RT 也会随 ClusterCore.Cleanup 销毁：下次进 Play 必须重新回填，
             // 否则材质里留着的是已销毁的纹理引用。
             m_atlasBound = false;
@@ -615,6 +898,7 @@ namespace Cluster
             m_planesBuf = m_visibleBuf = m_counterBuf = m_argsBuf = null;
             m_drawIdxBuf = null; m_drawBaseBuf = null; m_slotBuf = null;
             m_built = false;
+            m_culled = false;   // 缓冲全换了，旧的可见列表 / args 作废
         }
     }
 }
