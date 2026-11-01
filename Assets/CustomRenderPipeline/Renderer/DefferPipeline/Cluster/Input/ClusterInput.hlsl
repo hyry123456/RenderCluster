@@ -1,6 +1,10 @@
 #ifndef CLUSTER_INPUT
 #define CLUSTER_INPUT
 
+// RVT 寻址的唯一实现（pageId / tile 定位 / padding / Y 翻转）。
+// Feedback、MeshRenderer/簇采样、地形多图层采样三处共用，改动只需改那一份。
+#include "../../../Cluster/ClusterLibrary/VirtualTexture.hlsl"
+
 
 //双路径属性声明：
 //· DOTS_INSTANCING_ON 变体（BRG 绘制时 Unity 自动启用该关键字）：
@@ -70,38 +74,9 @@ struct RVTColors{
 
 RVTColors GetColor(float2 uv, uint texId, uint mip, float2 detailUV){
 
-	//pageId = mip * _SumTextureCount + texId * (T*T) + tileIndex，与 Feedback 编码完全一致
-	int T = _TilesPerAxis;
-	int Tsq = T * T;
-	//先 Wrap 再切 tile：uv 已经过 _MainTex_ST 变换，tiling>1 时会 >1；
-	//直接 *T 后 clamp 会把所有重复段压到最后一个 tile（整片拉伸、法线方向全错）。
-	//T=1 时与旧写法等价（后续本来就要 frac）。
-	float2 wrappedUV = frac(uv);
-	float2 tileUV = wrappedUV * (float)T;
-	int tileX = clamp((int)floor(tileUV.x), 0, T - 1);
-	int tileY = clamp((int)floor(tileUV.y), 0, T - 1);
-	float2 localUV = frac(tileUV);
-	float2 localDetailUV = frac(detailUV * (float)T);
-	int tileIndex = tileY * T + tileX;
-	int pageId = (int)mip * _SumTextureCount + (int)texId * Tsq + tileIndex;
-	TextureNode node = _TextureNodesBuffer[pageId];
-
-	float4 levelData = _LevelData[node.mipsLevel],
-		levelPadding = _LevelPadding[node.mipsLevel];
-    localUV = frac(localUV); 													//限制uv范围，默认都是Repeat
-    localDetailUV = frac(localDetailUV);
-
-
-	//第一个是offset，然后加到目标位置，再加Padding
-	float2 tileBegin = float2(levelData.x, 0) + levelData.yz * float2(node.width, node.height) + levelPadding.xy;
-	//贴图值起点加上uv值
-	localUV = tileBegin + levelPadding.zw * localUV;
-    localDetailUV = tileBegin + levelPadding.zw * localDetailUV;
-
-#if UNITY_UV_STARTS_AT_TOP
-    localUV.y = 1.0 - localUV.y;
-    localDetailUV.y = 1.0 - localDetailUV.y;
-#endif
+	// 寻址统一走 VirtualTexture.hlsl（与 Feedback / 地形共用同一份 pageId 公式）。
+	// detail 图集已废弃（colors.detail 恒为 0），不再计算 localDetailUV。
+	float2 localUV = VTGetSampleUV(uv, texId, mip);
 	
 	// 【3 张图集】按 TileTable.cs 的布局拼回各语义通道。
 	// 每张图集用自己的采样器（跟随纹理 anisoLevel），不要用全局 sampler_linear_repeat —— 见 UnityInput.hlsl。

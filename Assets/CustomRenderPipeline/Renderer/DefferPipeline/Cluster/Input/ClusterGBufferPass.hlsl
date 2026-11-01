@@ -51,6 +51,22 @@ void ClusterGBufferFragment (Varyings input, out DefferTarget target)
 	ClusterGBufferShade(input, target);
 }
 
+// ---------------- 深度预 pass（只写深度） ----------------
+// 解决「簇按任意序绘制、无前到后排序」导致的过度绘制：先把所有可见簇的深度铺一遍，
+// 主 GBuffer pass 再靠 early-Z 把被挡住的片元直接砍掉（GBuffer 写 4 张 MRT，填充率极贵）。
+// VS 只取位置（1 次缓冲读），片元为空 + ColorMask 0 ⇒ 这一遍几乎只有光栅化成本。
+float4 ClusterDepthVertex (ClusterAttributes input) : SV_POSITION
+{
+	return mul(_ClusterGBufferW2C, float4(ClusterFetchPosition(input.vertexID), 1.0));
+}
+
+// 返回 float4 而非 void：部分平台对「无输出的片元入口」支持不一，ColorMask 0 已保证不写颜色，
+// 返回值直接被丢弃，保留一个 SV_Target 出口最稳。
+float4 ClusterDepthFragment () : SV_Target
+{
+	return 0;
+}
+
 // ---------------- RVT Feedback ----------------
 
 struct ClusterFeedbackVaryings

@@ -74,6 +74,16 @@ namespace Cluster
         // ---------------- 场景登记 ----------------
         readonly Dictionary<Component, Entry> m_entries = new Dictionary<Component, Entry>();
         bool m_dirty = true;
+        // 「孤儿簇掩码」是否已清理过（Play 开始后跑一次即可，不必每帧扫）。
+        bool m_orphanCleaned = false;
+
+        // ===== 深度预 pass =====
+        // 簇 GBuffer 按组/槽位任意序绘制、无前到后排序 ⇒ 严重过度绘制（GBuffer 写 4 张 MRT，填充率极贵）。
+        // 先以「只取位置」的极便宜 VS 把所有可见簇的深度铺一遍（ColorMask 0），主 pass 靠 early-Z
+        // 把被遮挡片元直接砍掉。实测 14 次 draw 花 1.45ms、而 SRP 135 次只花 1.12ms ⇒ 过度绘制是主因。
+        // 默认开；若某场景实测反而更慢（VS 翻倍 > 省下的填充），把这里置 false 即可关闭对比。
+        const bool EnableDepthPrepass = true;
+        int m_depthPass = -1;   // "ClusterDepthOnly" 的 pass 索引（缓存，避免每帧 FindPass）
 
         // ---------------- GPU 资源 ----------------
         Material m_mat;
@@ -202,6 +212,32 @@ namespace Cluster
             if (owner != null && m_entries.Remove(owner)) m_dirty = true;
         }
 
+        /// <summary>清理「孤儿簇掩码」：renderingLayerMask 带了 bit28（本应由 Cluster 画 GBuffer），
+        /// 但该 MeshRenderer 上【没有任何 ClusterObject 组件】⇒ 它根本不是簇物体，bit28 是残留/损坏的。
+        ///
+        /// 原则（用户明确要求）：对象没有挂 Cluster 组件，即使在 Cluster 模式也必须由 SRP 正常渲染。
+        /// SRP 的 GBuffer 绘制用 ~bit28 把带该位的物体排除掉，于是孤儿（有 bit28、无 ClusterObject）
+        /// 会「既被 SRP 排除、又没进簇 GBuffer」⇒ 整块消失、只剩一道浮空阴影。
+        /// 清掉 bit28 后：SRP GBuffer 正常画它（颜色），cluster 阴影正常投它（阴影），完全一致。
+        ///
+        /// 只清「无 ClusterObject」的：有 ClusterObject 的物体其掩码归组件自己管，不要动。
+        /// 只在 Play 开始后跑一次（掩码损坏是序列化/重启用导致的偶发态，不是每帧变化）。</summary>
+        void ClearOrphanClusterMasks()
+        {
+            if (m_orphanCleaned) return;
+            m_orphanCleaned = true;
+            var mrs = Object.FindObjectsByType<MeshRenderer>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            uint clusterBit = 1u << ClusterProverty.ClusterRenderingLayerBit;
+            foreach (var mr in mrs)
+            {
+                if (mr == null) continue;
+                if ((mr.renderingLayerMask & clusterBit) == 0) continue;       // 没带簇位，跳过
+                if (mr.GetComponent<ClusterObject>() != null) continue;          // 有簇组件 ⇒ 掩码归它管
+                mr.renderingLayerMask = mr.renderingLayerMask & ~clusterBit;     // 孤儿 ⇒ 退回 SRP
+            }
+        }
+
         static ClusterMaterialData ToMaterialData(Material m, int mapId)
         {
             return new ClusterMaterialData
@@ -283,6 +319,41 @@ namespace Cluster
                 m_built = false;
                 return;
             }
+
+            // 诊断：登记了却摊平出 0 个簇的网格（典型静默失败：Register 成功 ⇒ 被打上
+            // ClusterRenderingLayer 位从 SRP 排除，但簇 GBuffer 实际没画它 ⇒
+            // 「阴影在、GBuffer 不在」）。点名报出来方便定位到底是哪一个物体。
+            if (m_entries.Count != records.Count)
+            {
+                var okOwners = new HashSet<Component>();
+                foreach (var r in records) okOwners.Add(r.asset == null ? null : null); // 仅占位，下面用 mesh 反查
+                foreach (var kv in m_entries)
+                {
+                    bool drew = false;
+                    var asset = ClusterMeshCache.Get(kv.Value.mesh);
+                    if (asset != null && asset.clusterCount > 0)
+                    {
+                        int subN = Mathf.Min(kv.Value.subs != null ? kv.Value.subs.Length : 0,
+                                             asset.sourceMesh != null ? asset.sourceMesh.subMeshCount : 0);
+                        for (int s = 0; s < subN; s++)
+                        {
+                            var sub = kv.Value.subs[s];
+                            if (sub == null) continue;
+                            int g = GroupOf(sub.detail, sub.detailNormal);
+                            for (int c = 0; c < asset.clusterCount; c++)
+                            {
+                                if (asset.clusterSubmesh[c] != s) continue;
+                                if ((int)asset.clusterMeta[c].z != 0) continue;
+                                drew = true; break;
+                            }
+                            if (drew) break;
+                        }
+                    }
+                    if (!drew)
+                        Debug.LogWarning($"[ClusterGBuffer] 物体 “{(kv.Key != null ? kv.Key.name : "?")}” 已登记但摊平出 0 个可见簇（LOD0/子网格不匹配或 ClusterMeshCache 缺失）→ 它会被排除出 SRP、簇 GBuffer 又没画它 ⇒ 表现就是「阴影在、表面不在」。");
+                }
+            }
+
             m_groupCount = Mathf.Max(1, m_groupCount);
 
             // ---- 2. 顶点：按【每簇】去重后烘成【世界空间】----
@@ -512,6 +583,7 @@ namespace Cluster
                 {
                     m_mat = new Material(sh) { name = "ClusterGBuffer" };
                     m_atlasBound = false;   // 图集由 ClusterObject 回填，回填前不画
+                    m_depthPass = m_mat.FindPass("ClusterDepthOnly");   // 深度预 pass（找不到 = -1，自动跳过）
                 }
             }
             if (m_mat != null)
@@ -532,6 +604,9 @@ namespace Cluster
         public bool Prepare(Camera camera)
         {
             if (m_dirty) Rebuild();
+            // 清理孤儿簇掩码：无 ClusterObject 却带 bit28 的物体退回 SRP（见方法注释）。
+            // 必须在 Rebuild 之后（m_entries 已是最新）调用，但内部只跑一次。
+            ClearOrphanClusterMasks();
             if (!m_built || camera == null) return false;
 
             // 与绘制侧逐位一致的 world→clip：GL.GetGPUProjectionMatrix(proj, true) * view。
@@ -563,6 +638,7 @@ namespace Cluster
         public bool PrepareViewOnly(Camera camera)
         {
             if (m_dirty) Rebuild();
+            ClearOrphanClusterMasks();
             if (!m_built || camera == null || !m_culled) return false;
             var gpuProj = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
             m_w2c = gpuProj * camera.worldToCameraMatrix;
@@ -578,12 +654,11 @@ namespace Cluster
             if (!m_built || m_cull == null || m_clusterCount == 0) return;
 
             int groups = Mathf.CeilToInt(m_clusterCount / (float)ThreadGroupSize);
-            int gGroups = Mathf.Max(1, Mathf.CeilToInt(m_groupCount / 8f));
 
             int kReset = m_cull.FindKernel("Reset");
             int kCull = m_cull.FindKernel("CullAll");
             int kIdx = m_cull.FindKernel("BuildIndices");
-            int kArgs = m_cull.FindKernel("BuildArgs");
+            // BuildArgs 已合并进 BuildIndices（省一次 dispatch + UAV 屏障，约 0.15ms），不再单独 dispatch。
 
             m_cull.SetInt("_HiZEnable", (hiZEnable && m_hizValid) ? 1 : 0);
             m_cull.SetFloat("_HiZBias", HiZBias);
@@ -636,12 +711,15 @@ namespace Cluster
             }
             else m_cull.SetInt("_HiZDebug", 0);
 
-            foreach (int k in new[] { kReset, kCull, kIdx, kArgs })
+            // 常量只设一次：ComputeShader.SetInt(name, v) 是【全局】属性、不区分 kernel，
+            // 原来在 4 个 kernel 的循环里重复设 4 遍纯属浪费 CPU（每帧 12 次多余调用）。
+            m_cull.SetInt("_GroupCount", m_groupCount);
+            m_cull.SetInt("_ClusterCount", m_clusterCount);
+            m_cull.SetInt("_TrisPerCluster", TrisPerCluster);
+            m_cull.SetInt("_DebugForceAll", debugForceAll == 0 ? 0 : 1);
+
+            foreach (int k in new[] { kReset, kCull, kIdx })
             {
-                m_cull.SetInt("_GroupCount", m_groupCount);
-                m_cull.SetInt("_ClusterCount", m_clusterCount);
-                m_cull.SetInt("_TrisPerCluster", TrisPerCluster);
-                m_cull.SetInt("_DebugForceAll", debugForceAll == 0 ? 0 : 1);
                 m_cull.SetBuffer(k, "_HiZStat", m_hizStat);
                 m_cull.SetBuffer(k, "_DrawBase", m_drawBaseBuf);
                 m_cull.SetBuffer(k, "_Counter", m_counterBuf);
@@ -670,8 +748,8 @@ namespace Cluster
             int gx = Mathf.Min(65535, totalGroups);
             int gy = Mathf.Max(1, Mathf.CeilToInt(totalGroups / (float)gx));
             m_cull.SetInt("_IdxDimX", gx * ThreadGroupSize);
+            // BuildArgs 已合并进本 dispatch（见 compute 的 BuildIndices 注释）
             cmd.DispatchCompute(m_cull, kIdx, gx, gy, 1);
-            cmd.DispatchCompute(m_cull, kArgs, gGroups, 1, 1);
 
             // ⚠️ 不要在这里直接发起 AsyncGPUReadback：此刻 CullAll 还没进命令队列
             // （ExecuteBuffer 在管线里稍后才调），读回拿到的是刚才 SetData 写进去的 0。
@@ -839,6 +917,19 @@ namespace Cluster
             // 从不采样 _DetailMap / _DetailNormalMap。这两张【每材质】贴图是 GBuffer(pass 0) 才需要的，
             // 故 Feedback 绝不为它们按组拆分/绑定 —— 否则就是 GBuffer 路径的死工作遗物。
             bool needsDetail = (pass == 0);
+
+            // ===== 深度预 pass（只对 GBuffer）=====
+            // 先把所有可见簇的深度铺好（VS 只取位置、ColorMask 0），主 pass 靠 early-Z 砍过度绘制。
+            // Feedback(pass 1) 是 ZTest Always 的页表写入，不参与深度，跳过。
+            if (pass == 0 && EnableDepthPrepass && m_depthPass >= 0)
+            {
+                for (int g = 0; g < m_groupCount; g++)
+                {
+                    cmd.DrawProceduralIndirect(m_drawIdxBuf, Matrix4x4.identity, m_mat, m_depthPass,
+                        MeshTopology.Triangles, m_argsBuf, sizeof(uint) * 5 * g, m_mpb);
+                }
+            }
+
             for (int g = 0; g < m_groupCount; g++)
             {
                 if (needsDetail)
@@ -869,6 +960,7 @@ namespace Cluster
         public void Release()
         {
             m_entries.Clear();
+            m_orphanCleaned = false;   // 下次 Play 重新扫一遍孤儿簇掩码
             ReleaseBuffers();
             ReleaseHiZ();           // Hi-Z 金字塔是自建 RT，不随 Unity 的临时 RT 管理，必须自己放
             m_hizStat?.Release();

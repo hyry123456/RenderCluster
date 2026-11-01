@@ -5,11 +5,12 @@
 // _DetailMap / _DetailNormalMap 这两张【每材质】贴图 —— 所以一次 draw 只能覆盖
 // 「detail 贴图对相同」的簇，其余按组分开画（本工程实测 ≤17 组）。
 //
-// 整帧 4 个 dispatch：
+// 整帧 3 个 dispatch：
 //   Reset        （1 组，清零每组的计数器）
 //   CullAll      （每簇一线程，摄像机视锥球-平面测试，通过则原子追加进本组列表）
-//   BuildIndices （每 (角点, 可见槽位, 组) 一线程，把可见簇的顶点号铺进索引缓冲）
-//   BuildArgs    （每组一线程，写【索引】间接绘制 args：5 个 uint）
+//   BuildIndices （每 (角点, 可见槽位, 组) 一线程，把可见簇的顶点号铺进索引缓冲，
+//                 并顺带写【索引】间接绘制 args：5 个 uint —— 原 BuildArgs 已合并进来，
+//                 省掉一次只有 1~3 个线程组、却要 ~0.15ms 固定开销的 dispatch）
 //
 // 为什么要建索引（2026-10-27 定案，这是 GBuffer 追平 SRP 的关键）：
 //   非索引绘制 vertexCount = 可见簇数 × 384，一个 128 三角形的簇唯一顶点只有约 66 个
@@ -320,11 +321,28 @@ void CullAll(uint3 id : SV_DispatchThreadID)
 // ⚠️ 别改成「y = 组内簇数上限、z = 组」的方阵：那是上千万线程，实测把省下的 draw 全吃回去。
 // ⚠️【试过并回退】每簇一个 384 线程组：occupancy 下降，ClusterCull 反而变慢。
 // ⚠️ D3D11 单维最多 65535 个线程组 ⇒ 必须二维拆开，所以用 _IdxDimX 把 (x,y) 拼回一维。
+// 注意：本 kernel 已【合并原 BuildArgs】—— 前 _GroupCount 个线程顺带写本组的间接绘制 args。
+// 为什么合并：BuildArgs 只有 ≤17 个线程（3 个线程组的 dispatch），实测却要 0.168ms，
+// 几乎全是 dispatch + UAV 屏障的固定开销（D3D11 两个 Dispatch 之间有写后写依赖会插屏障、卡管线）。
+// 合并后整帧 compute 从 4 个 dispatch 降到 3 个，直接省掉这 0.15ms 级别的浪费。
+// _Counter 已由上一个 dispatch（CullAll）写定，这里读到的是最终值，顺序安全。
 [numthreads(64, 1, 1)]
 void BuildIndices(uint3 id : SV_DispatchThreadID)
 {
     uint idx = id.y * (uint)_IdxDimX + id.x;
     uint perCluster = (uint)(_TrisPerCluster * 3);
+
+    // ===== 原 BuildArgs 的工作（前 _GroupCount 个线程）=====
+    if ((int)idx < _GroupCount)
+    {
+        uint ag = idx;
+        _Args[ag * 5 + 0] = _Counter[ag] * perCluster;   // indexCount
+        _Args[ag * 5 + 1] = 1;                           // instanceCount
+        _Args[ag * 5 + 2] = _DrawBase[ag];               // startIndex
+        _Args[ag * 5 + 3] = 0;                           // baseVertex
+        _Args[ag * 5 + 4] = 0;                           // startInstance
+    }
+
     if ((int)idx >= _ClusterCount * (int)perCluster) return;
 
     uint c      = idx / perCluster;

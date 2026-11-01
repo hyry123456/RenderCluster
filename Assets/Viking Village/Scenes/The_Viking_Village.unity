@@ -6519,7 +6519,7 @@ Light:
   m_BounceIntensity: 1.5
   m_ColorTemperature: 6570
   m_UseColorTemperature: 0
-  m_BoundingSphereOverride: {x: 4.5904e-41, y: 5.445292e+30, z: 4.5904e-41, w: 9.403955e-38}
+  m_BoundingSphereOverride: {x: 1.02e-43, y: 7.1e-44, z: 1.8539e-41, w: 0}
   m_UseBoundingSphereOverride: 0
   m_UseViewFrustumForShadowCasterCull: 1
   m_ShadowRadius: 0
@@ -8047,7 +8047,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 100004, guid: 11b6c022ca54ae4428be5a16a816c940, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 100004, guid: 11b6c022ca54ae4428be5a16a816c940, type: 3}
       propertyPath: m_StaticEditorFlags
@@ -31232,7 +31232,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 100004, guid: 11b6c022ca54ae4428be5a16a816c940, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 100004, guid: 11b6c022ca54ae4428be5a16a816c940, type: 3}
       propertyPath: m_StaticEditorFlags
@@ -49872,7 +49872,7 @@ MonoBehaviour:
   - {x: -0.52757347, y: -0.3652965, z: -0.278059, w: 0.0155371865}
   - {x: -0.032940418, y: -0.019115455, z: -0.015982486, w: 0.000000022439053}
   - {x: -0.23518097, y: -0.1448795, z: -0.11212979, w: 0.008919796}
-  _bakedFromInstanceId: 27258
+  _bakedFromInstanceId: 27270
 --- !u!4 &1165414209
 Transform:
   m_ObjectHideFlags: 0
@@ -86767,7 +86767,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 4294967295
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &2086600764
 Transform:
   m_ObjectHideFlags: 0

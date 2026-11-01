@@ -80,10 +80,10 @@ void ClusterGBufferShade (Varyings input,
 	float majorLen = max(lenX, lenY), minorLen = min(lenX, lenY);
 	float anisoRatio = majorLen / max(minorLen, 1e-6);
 	float2 majorDir = (lenX >= lenY ? dx : dy) / max(majorLen, 1e-6);
-	float2 minorVec = (lenX < lenY) ? dx : dy;
 
-	float mipRadio = clamp(_VTFeedbackParam.x * log2(max(dot(minorVec, minorVec), 1e-12)) +
-		_VTFeedbackParam.w, 0.0, _VTFeedbackParam.z);
+	// mip 公式统一走 VirtualTexture.hlsl 的 VTMipLevel（与 Feedback / 地形同源）。
+	// 若在这里另写一份，一旦常数或轴选择差一点，就变成「请求粗页、采样细页」→ 串色/黑块。
+	float mipRadio = VTMipLevel(input.baseUV);
 
 	float maxRadio = ceil(mipRadio), minRadio = floor(mipRadio);
 	uint maxMip = (uint)maxRadio, 

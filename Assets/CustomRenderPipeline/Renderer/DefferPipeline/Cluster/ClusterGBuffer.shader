@@ -74,5 +74,27 @@ Shader "Cluster/ClusterGBuffer"
             #include "Input/ClusterGBufferPass.hlsl"
             ENDHLSL
         }
+
+        // ---------- pass 2：深度预 pass（只写深度，供主 GBuffer pass 吃 early-Z） ----------
+        // 主 GBuffer pass（pass 0）按簇/组任意序绘制、无前到后排序 ⇒ 严重过度绘制。
+        // 这一遍先把所有可见簇的深度铺好（VS 只取位置，ColorMask 0），主 pass 再靠 early-Z
+        // 把被遮挡的片元直接砍掉。复用同一份 index/args，不额外开销任何缓冲。
+        Pass
+        {
+            Name "ClusterDepthOnly"
+            Tags { "Queue" = "Geometry" "LightMode" = "ClusterDepthOnly" }
+
+            ZWrite On
+            ZTest LEqual
+            ColorMask 0
+
+            HLSLPROGRAM
+            #pragma target 4.5
+            #pragma vertex ClusterDepthVertex
+            #pragma fragment ClusterDepthFragment
+
+            #include "Input/ClusterGBufferPass.hlsl"
+            ENDHLSL
+        }
     }
 }

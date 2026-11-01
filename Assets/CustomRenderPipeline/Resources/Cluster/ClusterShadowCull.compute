@@ -307,17 +307,39 @@ void BuildIndices(uint3 id : SV_DispatchThreadID)
 {
     uint idx = id.y * (uint)_IdxDimX + id.x;
     uint perCluster = (uint)(_TrisPerCluster * 3);
+
+    // ===== 合并原 BuildArgs（前 _CascadeCount 个线程写 indirect args）=====
+    // 省掉一次只有 1 个线程组的 dispatch——它的固定开销（dispatch + UAV 屏障）与工作量无关，
+    // 实测约 0.15ms，比干活的 BuildIndices 还贵。
+    // 正确性：本 kernel 不再读 _Args（下面 base 直接由 _Counter 现算），所以「写 args」与
+    // 「算 base」在同一 dispatch 内没有读写竞争；_Args 只被写、随后由 draw 读。
+    if ((int)idx < _CascadeCount)
+    {
+        uint ak    = idx;
+        uint acnt  = _Counter[ak];
+        uint aone  = (uint)_ClusterCount * perCluster;
+        bool afull = (acnt * 100u >= (uint)_ClusterCount * (uint)_FullSkipPercent);
+        _Args[ak * 5 + 0] = afull ? aone : acnt * perCluster;   // indexCount
+        _Args[ak * 5 + 1] = 1;                                  // instanceCount
+        _Args[ak * 5 + 2] = afull ? 0u : aone * (ak + 1u);       // startIndexLocation
+        _Args[ak * 5 + 3] = 0;                                  // baseVertexLocation
+        _Args[ak * 5 + 4] = 0;                                  // startInstanceLocation
+    }
+
     if ((int)idx >= _ClusterCount * (int)perCluster) return;
 
     uint c      = idx / perCluster;
     uint corner = idx - c * perCluster;
     uint gvid   = (uint)_CornerGvid[idx];
 
+    uint oneCopy = (uint)_ClusterCount * perCluster;
     for (int k = 0; k < _CascadeCount; k++)
     {
-        // 本段起点由 BuildArgs 决定：0 = 走静态全量段（无需重排），否则是压实段的起点。
-        // 所以 BuildArgs 必须排在本 kernel 之前 dispatch。
-        uint base = _Args[k * 5 + 2];
+        // 本段起点：0 = 走静态全量段（无需重排），否则是压实段起点。
+        // 现算（不读 _Args）⇒ 本 kernel 与 BuildArgs 的写没有竞争，可以合并成一个 dispatch。
+        uint cnt  = _Counter[k];
+        bool full = (cnt * 100u >= (uint)_ClusterCount * (uint)_FullSkipPercent);
+        uint base = full ? 0u : oneCopy * (uint)(k + 1u);
         if (base == 0u) continue;
 
         uint slot = _SlotOf[k * _ClusterCount + c];

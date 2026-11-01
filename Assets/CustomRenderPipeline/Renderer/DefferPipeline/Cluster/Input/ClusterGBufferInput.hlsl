@@ -122,4 +122,12 @@ void ClusterFetch(uint vertexID, out uint matIndex,
 	uv   = float2(asfloat(e1.z), asfloat(e1.w));
 }
 
+// 深度预 pass 专用取数：只读位置那半个 uint4（e0.xyz），不解码法线/切线/UV。
+// 深度预 pass 会把所有顶点再跑一遍，VS 成本压到最低 ⇒ 只 1 次缓冲读 + 1 次矩阵乘。
+float3 ClusterFetchPosition(uint vertexID)
+{
+	uint4 e0 = asuint(_Vertices[vertexID * 2u]);
+	return float3(asfloat(e0.x), asfloat(e0.y), asfloat(e0.z));
+}
+
 #endif

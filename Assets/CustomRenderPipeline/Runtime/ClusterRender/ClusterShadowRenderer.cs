@@ -9,9 +9,9 @@ namespace Cluster
     /// 【cluster 管线】阴影渲染器。资产开关切换三种模式：SRP / Cluster / ClusterDebug。
     ///
     /// 当前流程（Cluster / ClusterDebug）：
-    ///   · 每帧 4 个 compute dispatch（Reset / CullAll / BuildIndices / BuildArgs）一次性剔完【所有级联】——
+    ///   · 每帧 3 个 compute dispatch（Reset / CullAll / BuildIndices）一次性剔完【所有级联】——
     ///     CullAll 每线程一个簇、内部循环所有级联做球-平面剔除，写出 _SlotOf（不可见 = 0xFFFFFFFF）；
-    ///     BuildIndices 只给【可见】簇铺索引；BuildArgs 每线程一个级联写 indirect args。
+    ///     BuildIndices 只给【可见】簇铺索引，并顺带写各级联的 indirect args（原 BuildArgs 已合并进来）。
     ///   · 每级联一次【索引】DrawProceduralIndirect（共 4 次 draw），VS 里只剩 _Positions[SV_VertexID]。
     ///   · LOD：当前只画 LOD0。
     ///
@@ -78,6 +78,9 @@ namespace Cluster
         // ---------------- 场景登记 ----------------
         readonly List<Mesh> meshes = new List<Mesh>();
         readonly List<Matrix4x4> worlds = new List<Matrix4x4>();
+        // 每个登记项的【源 MeshRenderer】——只用于每帧检测 active/enabled 变化，
+        // 触发重扫让「关闭的物体阴影也一起消失」（不依赖 ClusterObject 的 enable/disable 事件）。
+        readonly List<MeshRenderer> m_sources = new List<MeshRenderer>();
         readonly Dictionary<Mesh, ClusterMeshAsset> baked = new Dictionary<Mesh, ClusterMeshAsset>();
 
         // ⚠️ 曾经的「全场景包围球」（m_sceneCenter / m_sceneRadius）已删除：
@@ -254,6 +257,9 @@ namespace Cluster
 
         int clusterCount;
         bool built, dirty = true;
+        /// <summary>场景里某物体被禁用/启用后，下一帧 Rebuild 需要按当前 active 状态重新扫描。
+        /// 否则一次性扫描的结果会一直保留已禁用物体的几何 ⇒「GBuffer 已 Unregister、阴影还画着」的浮空阴影。</summary>
+        bool m_rescanNeeded = false;
         /// <summary>本帧 ScanScene 是否跳过了「需 alpha 镂空」的投射物（草/蕨/灌木）。
         /// 有则 Shadows.cs 需用 SRP 路径单独画它们的阴影（Cluster 纯几何 shader 无法镂空）。</summary>
         bool m_hasCutoffCasters = false;
@@ -310,11 +316,12 @@ namespace Cluster
 
         // ---------------- 注册 ----------------
 
-        public void Register(Mesh mesh, Matrix4x4 world)
+        public void Register(Mesh mesh, Matrix4x4 world, MeshRenderer source)
         {
             if (mesh == null) return;
             meshes.Add(mesh);
             worlds.Add(world);
+            m_sources.Add(source);
             dirty = true;
         }
 
@@ -322,7 +329,17 @@ namespace Cluster
         {
             meshes.Clear();
             worlds.Clear();
+            m_sources.Clear();
             m_hasCutoffCasters = false;
+            dirty = true;
+        }
+
+        /// <summary>场景里某个物体被禁用/启用（ClusterObject 生命周期变化）后，通知阴影集合
+        /// 需要按当前 active 状态重新扫描。避免「GBuffer 已去掉该物体、cluster 阴影还留着」的浮空阴影。
+        /// 只在 cluster 阴影实例已存在时才有意义（SRP 模式不会创建实例，自然 no-op）。</summary>
+        public void RequestRescan()
+        {
+            m_rescanNeeded = true;
             dirty = true;
         }
 
@@ -439,9 +456,19 @@ namespace Cluster
                 {
                     m_hasCutoffCasters = true; m_scanSkipCutout++; continue;
                 }
+                // 孤儿簇掩码：物体被标了「只由 Cluster 画 GBuffer」（仅 bit28）却没有 ClusterObject 兜底
+                // ⇒ 既被 SRP GBuffer 排除（bit28）又没进簇 GBuffer（没注册）→ 完全不可见，
+                // 却还在 cluster 阴影集合里投出一块浮空阴影（表现正是「阴影在、表面不在」）。
+                // 直接跳过：它的阴影本就不该存在。正常簇物体有 ClusterObject ⇒ 不跳过；
+                // 普通 SRP 物体掩码含 bit0 ⇒ 不跳过（它由 SRP GBuffer 正常画）。
+                bool onlyClusterBit = (mr.renderingLayerMask & ~(1u << ClusterProverty.ClusterRenderingLayerBit)) == 0;
+                if (onlyClusterBit && co == null)
+                {
+                    m_scanSkipDisabled++; continue;
+                }
                 var mf = mr.GetComponent<MeshFilter>();
                 if (mf == null || mf.sharedMesh == null) { m_scanSkipNoMesh++; continue; }
-                Register(mf.sharedMesh, mr.transform.localToWorldMatrix);
+                Register(mf.sharedMesh, mr.transform.localToWorldMatrix, mr);
             }
             dirty = true;
         }
@@ -461,11 +488,47 @@ namespace Cluster
 
         // ---------------- 摊平成世界空间的一份大数组 ----------------
 
+        /// <summary>每帧（Cluster 模式 Rebuild 必被调用）检测已登记投射物的 active 状态是否变化。
+        /// 任意 MeshRenderer 失活 / 被销毁 / 关投影 ⇒ 标记需要重扫，使「关闭的物体阴影也一起消失」。
+        /// 这覆盖了 ClusterObject.OnDisable 之外的情况（子物体单独禁用、普通 MeshRenderer、
+        /// 地形网格等都不会走 ClusterObject 的 RequestRescan），是「浮空阴影消不掉」的根治手段。
+        /// 只做廉价布尔检查（不分配、不 FindObjectsByType），只在 Cluster 模式随 Rebuild 每帧跑一次。</summary>
+        void DetectCasterChanges()
+        {
+            for (int i = 0; i < m_sources.Count; i++)
+            {
+                var mr = m_sources[i];
+                if (mr == null
+                    || !mr.gameObject.activeInHierarchy
+                    || !mr.enabled
+                    || mr.shadowCastingMode == ShadowCastingMode.Off)
+                {
+                    m_rescanNeeded = true;
+                    dirty = true;
+                    return;
+                }
+            }
+        }
+
         public void Rebuild()
         {
+            // 每帧先检测「已登记投射物 active 状态变化」：任何物体的 MeshRenderer 失活都触发重扫，
+            // 让关闭的物体阴影随之消失（不依赖 ClusterObject 的 enable/disable 事件）。
+            // 必须放在 `if (!dirty) return;` 之前，否则变化永远等不到下一次 Build。
+            DetectCasterChanges();
+
             if (!dirty) return;
-            // 没有外部登记过 ⇒ 直接扫描场景里所有【启用 + 会投影】的 MeshRenderer。
-            if (meshes.Count == 0) ScanScene();
+            // 首次（meshes 空）或场景里某物体被禁用/启用后（m_rescanNeeded）需要重新扫描：
+            // Clear 会清空旧 meshes/worlds（不还原 cutout 位，那一步在后面的 Release 里做），
+            // ScanScene 按当前 activeInHierarchy / enabled 重新登记，于是被禁用的物体自然不再进阴影集合。
+            // 以前只在 meshes.Count==0 时扫一次，运行时禁用某物体后它仍残留在阴影集合里
+            //（GBuffer 侧 ClusterObject.OnDisable 已 Unregister，于是出现"有阴影无物体"的浮空阴影）。
+            if (m_rescanNeeded || meshes.Count == 0)
+            {
+                Clear();
+                ScanScene();
+                m_rescanNeeded = false;
+            }
             EnsureBaked();
             Release();
 
@@ -701,7 +764,7 @@ namespace Cluster
         /// <summary>
         /// 一次 GPU 剔除 + 索引重排，产出每个级联的可见簇槽位(_SlotOf)、索引缓冲(_DrawIdx)、args(_Args)。
         /// 必须在【所有级联都 AddCascade 完】之后、任何 draw 之前调用。
-        /// 整帧只有 4 个 dispatch（Reset / CullAll / BuildIndices / BuildArgs），与级联数无关。
+        /// 整帧只有 3 个 dispatch（Reset / CullAll / BuildIndices），与级联数无关。
         /// </summary>
         public void Cull(CommandBuffer cmd)
         {
@@ -714,10 +777,9 @@ namespace Cluster
             planesBuf.SetData(cpuPlanes);
 
             int groups = Mathf.CeilToInt(clusterCount / (float)ThreadGroupSize);
-            int cGroups = Mathf.Max(1, Mathf.CeilToInt(cascadeCount / 8f));
 
             // buffer 绑定按 kernel 分开设：SetBuffer(kernelIndex, name, buf) 只对该 kernel 生效。
-            // _Counter / _Args / _Visible 被 Reset / CullAll / BuildArgs 共用 ⇒ 三个都要绑。
+            // _Counter / _Args / _Visible 被 Reset / CullAll / BuildIndices 共用 ⇒ 三个都要绑。
             // Hi-Z：只有「开关打开 + 金字塔已建好（上一帧的阴影图）」才做；否则整体关闭。
             bool hzOk = hiZEnable && m_hizValid && m_hiz0 != null && m_hizAtlasSize > 0;
             cullShader.SetInt("_HiZEnable", hzOk ? 1 : 0);
@@ -733,8 +795,8 @@ namespace Cluster
             int kReset = cullShader.FindKernel("Reset");
             int kCull = cullShader.FindKernel("CullAll");
             int kIdx = cullShader.FindKernel("BuildIndices");
-            int kArgs = cullShader.FindKernel("BuildArgs");
             int kCopy = cullShader.FindKernel("CopyStatic");
+            // BuildArgs 已合并进 BuildIndices（省一次 dispatch + UAV 屏障，约 0.15ms），不再单独 dispatch。
 
             // _HiZ0..3 是 compute 里的【全局声明】⇒ CullAll 必须绑；没建金字塔时塞 1×1 占位
             // （不绑会报 "Property (_HiZ0) ... is not set"；绑占位时 _HiZEnable=0，kernel 不会去采）。
@@ -752,14 +814,16 @@ namespace Cluster
             cullShader.SetInt("_HiZ2SizeX", hz2.width); cullShader.SetInt("_HiZ2SizeY", hz2.height);
             cullShader.SetInt("_HiZ3SizeX", hz3.width); cullShader.SetInt("_HiZ3SizeY", hz3.height);
 
-            foreach (int k in new[] { kReset, kCull, kIdx, kArgs, kCopy })
-            {
-                cullShader.SetInt("_CascadeCount", cascadeCount);
-                cullShader.SetInt("_ClusterCount", clusterCount);
-                cullShader.SetInt("_TrisPerCluster", TrisPerCluster);
-                cullShader.SetInt("_DebugForceAll", dbg);
-                cullShader.SetInt("_FullSkipPercent", FullSkipPercent);
+            // 常量只设一次：SetInt(name, v) 是全局属性、不区分 kernel，原来在 4 个 kernel 的循环里
+            // 重复设 4 遍是纯 CPU 浪费（每帧 15 次多余调用）。
+            cullShader.SetInt("_CascadeCount", cascadeCount);
+            cullShader.SetInt("_ClusterCount", clusterCount);
+            cullShader.SetInt("_TrisPerCluster", TrisPerCluster);
+            cullShader.SetInt("_DebugForceAll", dbg);
+            cullShader.SetInt("_FullSkipPercent", FullSkipPercent);
 
+            foreach (int k in new[] { kReset, kCull, kIdx, kCopy })
+            {
                 cullShader.SetBuffer(k, "_Counter", counterBuf);
                 cullShader.SetBuffer(k, "_Args", argsBuf);
                 cullShader.SetBuffer(k, "_Visible", visibleBuf);
@@ -800,11 +864,7 @@ namespace Cluster
             cmd.DispatchCompute(cullShader, kCull, groups, 1, 1);
             cmd.EndSample("CCull.CullAll");
 
-            // ⚠️ BuildArgs 必须在 BuildIndices【之前】：BuildIndices 读 _Args[k*5+2]（本段起点）
-            //    判断该级联走静态段（=0，跳过重排）还是压实段（写索引）。
-            cmd.BeginSample("CCull.BuildArgs");
-            cmd.DispatchCompute(cullShader, kArgs, cGroups, 1, 1);
-            cmd.EndSample("CCull.BuildArgs");
+            // （原 BuildArgs dispatch 已合并进 BuildIndices：它现算 base、顺带写 args。）
 
             // 索引重排：总簇数 × 384 个角点，每线程一个，内部循环所有级联
             // （_CornerGvid 对 4 个级联是同一个值，只读一次）。

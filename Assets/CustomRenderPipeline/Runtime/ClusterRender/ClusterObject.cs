@@ -13,9 +13,14 @@ namespace Cluster
 
 
 
-        /// <summary>cutoff 物体专用 rendering layer 位的还原值（OnDisable 时恢复，避免脏化场景）。</summary>
+        /// <summary>cutoff / Cluster 物体专用 rendering layer 位的还原值（OnDisable 时恢复，避免脏化场景）。</summary>
         private uint m_originalRLM = 0;
         private bool m_rlmStored = false;
+        // 只捕获一次：m_originalRLM 必须是「Cluster 处理之前」的原始掩码，之后（含「禁用→重新启用」）
+        // 绝不能再覆盖。否则会出现这种损坏：禁用时把掩码还原成 bit28（当时 mask 已经是 bit28 了），
+        // 重新启用又把它当成「原值」存下来，最终退出 Play 还原出一个仍带 bit28 的掩码 ⇒
+        // 物体卡在「被 SRP 排除（bit28）、却没有 ClusterObject 接管」的孤儿态（整块消失、只剩阴影）。
+        private bool m_rlmCaptured = false;
 
         // ===== 「静态才进 Cluster」的守卫 =====
         // 簇数据是世界空间烘焙的、世界矩阵只在注册时抓一次。物体一旦真的动起来
@@ -228,6 +233,9 @@ namespace Cluster
                     // 只把 bit28 从 filter 里清掉【排不掉】这些物体（它们还有 bit0 能通过），
                     // 所以这里必须让它们【只】保留 bit28 —— 这样才能从 SRP 的所有 pass 一起消失。
                     SetRenderingLayerBit(1u << ClusterProverty.ClusterRenderingLayerBit, keepOriginal: false);
+                    // 重新启用时把该物体补回 cluster 阴影集合（按当前 active 状态重新扫描）。
+                    if (ClusterShadowRenderer.HasInstance)
+                        ClusterShadowRenderer.Instance.RequestRescan();
                 }
             }
             else if (Application.isPlaying)
@@ -327,7 +335,9 @@ namespace Cluster
         {
             var mr = GetComponent<MeshRenderer>();
             if (mr == null) return;
-            if (!m_rlmStored) { m_originalRLM = mr.renderingLayerMask; m_rlmStored = true; }
+            // 只在第一次设置位时捕获一次「原始掩码」，之后（含禁用→重新启用）不再覆盖。
+            // 见 m_rlmCaptured 字段注释：这是「退出 Play 后 bit28 残留」的根因修复。
+            if (!m_rlmCaptured) { m_originalRLM = mr.renderingLayerMask; m_rlmCaptured = true; m_rlmStored = true; }
             mr.renderingLayerMask = keepOriginal ? (m_originalRLM | bit) : bit;
         }
 
@@ -358,6 +368,11 @@ namespace Cluster
             m_registered = false;
             if (ClusterGBufferRenderer.HasInstance)
                 ClusterGBufferRenderer.Instance.Unregister(this);
+
+            // 阴影集合必须同步移除：cluster 阴影是一次性场景扫描，禁用物体不会自动消失，
+            // 否则会出现「GBuffer 已关、阴影还在」的浮空阴影。实例未创建（SRP 模式）时 no-op。
+            if (ClusterShadowRenderer.HasInstance)
+                ClusterShadowRenderer.Instance.RequestRescan();
 
             // 还原 rendering layer 位（cutoff / Cluster GBuffer 专用），避免脏化场景资产
             if (m_rlmStored)

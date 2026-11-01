@@ -21,6 +21,15 @@ namespace Cluster
 
         public static ShaderTagId feedbackTagId = new ShaderTagId("Feedback");
 
+        /// <summary>
+        /// 地形 RVT 反馈的 pass tag（TerrainLit.shader 里 4 个 pass，每层一个）。
+        /// 只有地形材质带这些 tag ⇒ 这 4 次 DrawRenderers 不会重复画别的物体。
+        /// </summary>
+        static readonly ShaderTagId[] terrainFeedbackTagIds = {
+            new ShaderTagId("TerrainFeedback0"), new ShaderTagId("TerrainFeedback1"),
+            new ShaderTagId("TerrainFeedback2"), new ShaderTagId("TerrainFeedback3"),
+        };
+
         const string _FeedbackName = "FeedbackTex", _FbZoomTexName = "FeedbackZoomTex";
 
         ///// <summary>        /// 需要调入的颜色队列        /// </summary>
@@ -743,6 +752,23 @@ namespace Cluster
                     context.DrawRenderers(
                         cullingResults, ref drawingSettings, ref filteringSettings
                     );
+                }
+
+                // ===== 地形（SRP 路径）的 RVT 反馈 =====
+                // 地形材质带 TerrainFeedback0..3 四个 pass：一个 pass 只能编码一个 pageId
+                // （RGBA8 = 32bit），4 个图层就必须画 4 次。
+                // 必须放在 clusterDrawn 判断【之外】：clusterMode != SRP 时上面只画了簇，
+                // 地形不在簇几何里，否则地形的页永远不会升级 → 整片糊在最粗 mip。
+                if (TerrainRenderSetup.ActiveCount > 0)
+                {
+                    var terrainSorting = new SortingSettings(camera) { criteria = SortingCriteria.CommonOpaque };
+                    var terrainFilter = new FilteringSettings(
+                        RenderQueueRange.opaque, renderingLayerMask: (uint)layerMask);
+                    for (int ti = 0; ti < terrainFeedbackTagIds.Length; ti++)
+                    {
+                        var tds = new DrawingSettings(terrainFeedbackTagIds[ti], terrainSorting);
+                        context.DrawRenderers(cullingResults, ref tds, ref terrainFilter);
+                    }
                 }
 
                 //缩放纹理，并准备读入CPU
