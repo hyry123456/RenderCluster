@@ -45,6 +45,20 @@
 - **SRP 与 Cluster 都画两遍几何（GBuffer + Feedback）**，所以把 Feedback 并进 MRT
   不会缩小两条路径的差距，只在绝对性能上有收益。
 
+## 灯光（Tiled Deferred，2026-11-01 定案）
+- 结构：16×16 像素 tile + 深度 min/max，逐灯做「视图空间深度区间 + tile 锥 AABB」测试，
+  每 tile 最多输出 `MAX_LIGHT_COUNT_PER_TILE = 32` 盏。**该常量三处一致**（Light.hlsl / compute / C#）。
+- `_MAX_OTHER_LIGHT_COUNT = 1024`（Lighting.cs）**只是「能参与剔除的灯数上限」，不是线程数上限**：
+  compute 用跨步循环 `for (i = groupIndex; i < count; i += 256)`，灯少时只跑一圈。
+  超限时按 `luminance(finalColor) × range²` 降序保留，丢最弱的（不是按遍历顺序截断）。
+- **面光源（MRP 代表点近似）**：`OtherLight` 多 2 个 float4（`lightAreaRight` / `lightAreaUp`，轴已乘半宽/半高）。
+  **判定约定 `lightAreaRight.w > 0` ⇔ 面光源**；`Lighting.cs` / `Light.hlsl` / `ClusterLight.compute` 三处逐字一致。
+  - ⚠️ 点光/聚光**必须显式清零**这两个字段：`NativeArray` 是 `UninitializedMemory`，残留值会被误判成面光。
+  - 面光源**不投影**（area shadow 太贵，`lightShadowData` 给零）、高光仍是点光形状（真矩形高光要 LTC+LUT）。
+  - `GetOtherLightByPosition` / `GetOtherLight_SSS` **没有**面光分支（退化成中心点光），做体积光时要补。
+- 明确不做：每 tile「最强 N 排序」（32 够，溢出几乎不发生，bitonic 排序纯浪费）、
+  3D 簇（tile × 深度切片，灯少时收益为零）。体积光属「以后可能加」，届时才需要 3D 切片。
+
 ## 铁律 / 雷区
 - 正交级联的 **x/y 剔除是精确的**（光方向 = 投影方向 ⇒ 盒外投不到盒内）；
   但**沿光轴的深度范围 Unity 只按 cullingSphere 拟合（≈2R），不看场景** ⇒ 自建簇必须自己撑开，

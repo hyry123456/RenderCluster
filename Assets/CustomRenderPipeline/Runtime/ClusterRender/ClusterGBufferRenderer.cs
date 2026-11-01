@@ -234,6 +234,13 @@ namespace Cluster
                 if (mr == null) continue;
                 if ((mr.renderingLayerMask & clusterBit) == 0) continue;       // 没带簇位，跳过
                 if (mr.GetComponent<ClusterObject>() != null) continue;          // 有簇组件 ⇒ 掩码归它管
+                // ⚠️ 只有「整份掩码就只剩簇位」的才是真孤儿：SRP 的 GBuffer 用 ~bit28 过滤，
+                //    这种物体在 SRP 下会被整个排掉 ⇒ 完全不渲染（就是 terrain_near_01 那次）。
+                //    而掩码里还有别的位（比如 Unity 默认的 0xFFFFFFFF "Everything"）的物体，
+                //    SRP 下照样能通过过滤，根本不需要修 —— 不判断就动它，
+                //    会在编辑器里把整个场景的渲染层掩码悄悄改写一遍（默认值是 0xFFFFFFFF，
+                //    改成 0xEFFFFFFF），白白把场景标脏、产生几千行无意义的 diff。
+                if ((mr.renderingLayerMask & ~clusterBit) != 0) continue;
                 mr.renderingLayerMask = mr.renderingLayerMask & ~clusterBit;     // 孤儿 ⇒ 退回 SRP
             }
         }

@@ -20,7 +20,10 @@ float3 GetGBufferLight(Surface surface, float2 screenUV){
 	float2 coord = _CameraBufferSize.xy * screenUV; 
 	uint2 tileId = floor(coord / _DeferredTileParams.xy);
 	uint tileIndex = tileId.y * _DeferredTileParams.z + tileId.x;
-	int lightCount = _TileLightsArgsBuffer[tileIndex];
+	// 防御性 clamp：compute 已经写过一次，但一旦哪天它忘了，这里会读到相邻 tile 的索引。
+	// ⚠️ 必须显式转 int：buffer 元素是 uint，直接 min(uint, 32) 在 HLSL 里是
+	//    "ambiguous function call"，会让整个 shader 编译失败。
+	int lightCount = min((int)_TileLightsArgsBuffer[tileIndex], MAX_LIGHT_COUNT_PER_TILE);
 
 	uint tileLightOffset = tileIndex * MAX_LIGHT_COUNT_PER_TILE;
 

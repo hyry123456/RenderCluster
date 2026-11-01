@@ -150,7 +150,11 @@ namespace CustomRenderPipline.DefferPipeline
             //在资产导入期间调用会直接抛 UnityException
             if (camera.cameraType == CameraType.Game && ClusterControl.Instance.ClusterAssembleAsset.MipsDebug)
             {
-                buffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                // 同 Cleanup 处：无参重载 = Load，会触发 Unity 内部 "load 相机目标" 的
+                // Hidden/Internal-Loading blit ⇒ keyword 空间断言。这里紧接着就要 Clear，
+                // 根本不需要 load 旧内容。
+                buffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget,
+                    RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store);
                 buffer.ClearRenderTarget(true, true, Color.black);
                 buffer.EnableShaderKeyword("_FEED_BACK_DEBUG");
 
@@ -581,10 +585,22 @@ namespace CustomRenderPipline.DefferPipeline
         private void DrawGBufferFinal(int targetTexId)
         {
             //Draw(0, targetTexId, (int)DefferRenderPass._GBufferDraw);
-            //注意：不能使用 (BuiltinRenderTextureType)0（None）作为 Blit 源，
-            //None 是无法解析的“空”标识，会导致 "temporary render texture not found (Blit source)"，
-            //且顶点着色器需要 _SourceTexture_TexelSize 判断 UV 翻转，必须绑定一个有效源纹理
-            buffer.Blit(BuiltinRenderTextureType.CameraTarget, targetTexId, material, (int)DefferRenderPass._GBufferDraw);
+            // src 必须是一个【真实、可采样、且不是本帧任何在用的 RT】的纹理。
+            // 【2026-11-01 修复】这个断言（"State comes from an incompatible keyword space"，
+            //   Expected=DefferCamera / Actual=Hidden/Internal-Loading）来自下面这次 Blit：
+            //   CommandBuffer 里的 Blit 由 ImageFilters::Blit 实现，当源纹理「不可直接采样」时
+            //   （CameraTarget 是正在写的相机目标；null 的语义是「把当前 RT 拷过去」），
+            //   Unity 会先插一次 Hidden/Internal-Loading 的内部拷贝；
+            //   该 shader 的 local keyword space 只有 4 个 stereo keyword，与 DefferCamera 的 15 个
+            //   不兼容 ⇒ LocalKeywordState::Union 断言。
+            // 所以既不能用 CameraTarget，也不能用 null，也不能用 GBuffer（那是当前 MRT 的附件）。
+            // 用一张 1×1 的临时 RT 当占位源：可采样、不与任何 RT 冲突、开销可忽略。
+            // 本 pass 的片元只从 GBuffer 取数据，源纹理仅为提供 texelSize（且
+            // _SourceTexture_TexelSize 在 C# 侧从未设置，恒为 0），换任何有效 RT 都不影响画面。
+            int dummySrcId = Shader.PropertyToID("_GBufferDrawSrcDummy");
+            buffer.GetTemporaryRT(dummySrcId, 1, 1, 0, FilterMode.Point, RenderTextureFormat.Default);
+            buffer.Blit(dummySrcId, targetTexId, material, (int)DefferRenderPass._GBufferDraw);
+            buffer.ReleaseTemporaryRT(dummySrcId);
             ExecuteBuffer();
         }
 
@@ -653,7 +669,16 @@ namespace CustomRenderPipline.DefferPipeline
         /// <summary>	/// 清除使用过的数据，因为纹理图大多数都是在内存中的，因此需要我们手动释放	/// </summary>
         void Cleanup()
         {
-            buffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+            // 【2026-11-01】必须显式写 DontCare，不能用无参重载。
+            // 无参重载 = RenderBufferLoadAction.Load，而「load 相机目标的已有内容」在
+            // Unity 内部是一次 ImageFilters::Blit（Hidden/Internal-Loading，4 个 stereo keyword）；
+            // 此时 CommandBuffer 上还挂着 DefferCamera 的 15 个 global keyword，
+            // LocalKeywordState::Union 两个不兼容的 keyword 空间 ⇒
+            // "State comes from an incompatible keyword space" 断言。
+            // 这里这一句只是为了「把 RT 从临时纹理上摘下来」好让后面的 ReleaseTemporaryRT 生效，
+            // 不需要保留任何旧内容（最终图像已由 DrawFinal 写入并 Store）⇒ DontCare 完全等价。
+            buffer.SetRenderTarget(BuiltinRenderTextureType.CameraTarget,
+                RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store);
             buffer.ReleaseTemporaryRT(ShaderProperty.ColorAttachmentId);
             buffer.ReleaseTemporaryRT(DefferProperty.GBufferDepthId);
 
