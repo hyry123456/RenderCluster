@@ -26,7 +26,7 @@ MonoBehaviour:
   rvtDebugTex: {fileID: 0}
   debugMode: 0
   rvtTrilinearBlend: 0
-  UseRVT: 1
+  UseRVT: 0
   clusterMode: 0
   clusterShadowMaxDepthPad: 2
   sceneViewCluster: 0

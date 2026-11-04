@@ -208,35 +208,96 @@ namespace Cluster
             requestFlags = new ComputeBuffer(need, sizeof(uint), ComputeBufferType.Structured);
         }
 
+        /// <summary>反馈 RT 的一个「尺寸槽」。
+        /// Scene / Game / 预览相机各自有不同的渲染尺寸，若只留一对 RT，就会逐帧
+        /// "尺寸不匹配 ⇒ 释放 + 重建"，等于每帧分配两张 RenderTexture。
+        /// 按尺寸缓存后同尺寸直接复用。</summary>
+        private struct FeedbackSet
+        {
+            public int fbW, fbH;
+            public RenderTexture fb;
+            public RenderTexture zoom;
+        }
+        private readonly List<FeedbackSet> feedbackSets = new List<FeedbackSet>();
+        private const int MaxFeedbackSets = 4;
+
         private void CreateFeedbackTexs(int width, int heigh)
         {
-            int fbWidth = width / fbScale, fbHeigh = heigh / fbScale;
-            if (feedbackTex == null)
+            int fbWidth = Mathf.Max(1, width / fbScale);
+            int fbHeigh = Mathf.Max(1, heigh / fbScale);
+            int zoomWid = Mathf.Max(1, width / fbZoomScale);
+            int zoomHei = Mathf.Max(1, heigh / fbZoomScale);
+
+            // ---- 命中已有尺寸槽（LRU：命中即移到末尾）----
+            for (int i = 0; i < feedbackSets.Count; i++)
             {
-                //必须要设置为线性空间，不然颜色值会被调整，导致数组对应错误
-                feedbackTex = RenderTexture.GetTemporary(fbWidth, fbHeigh, 32,
-                    RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+                FeedbackSet s = feedbackSets[i];
+                // 被 Unity 销毁过（域重载/资源卸载）时 Unity 的 null 判定有效，直接跳过重建
+                if (s.fb == null || s.zoom == null) continue;
+                if (s.fbW != fbWidth || s.fbH != fbHeigh) continue;
 
-                int zoomWid = width / fbZoomScale, zoomHei = heigh / fbZoomScale;
-
-                downScaleFeedback = RenderTexture.GetTemporary(zoomWid, zoomHei, 32,
-                    RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
-                feedbackTex.name = _FeedbackName;
-                downScaleFeedback.name = _FbZoomTexName;
+                if (i != feedbackSets.Count - 1)
+                {
+                    feedbackSets.RemoveAt(i);
+                    feedbackSets.Add(s);
+                }
+                feedbackTex = s.fb;
+                downScaleFeedback = s.zoom;
+                return;
             }
-            if (feedbackTex.width != fbWidth || feedbackTex.height != fbHeigh)
+
+            // ---- 没命中：淘汰最久未用的，再新建 ----
+            while (feedbackSets.Count >= MaxFeedbackSets)
             {
-                RenderTexture.ReleaseTemporary(feedbackTex);
-                RenderTexture.ReleaseTemporary(downScaleFeedback);
-
-
-                feedbackTex = new RenderTexture(fbWidth, fbHeigh, 32, RenderTextureFormat.ARGB32);
-                int zoomWid = width / fbZoomScale, zoomHei = heigh / fbZoomScale;
-
-                downScaleFeedback = new RenderTexture(zoomWid, zoomHei, 0, RenderTextureFormat.ARGB32);
-                feedbackTex.name = _FeedbackName;
-                downScaleFeedback.name = _FbZoomTexName;
+                FeedbackSet old = feedbackSets[0];
+                feedbackSets.RemoveAt(0);
+                ReleaseRT(ref old.fb);
+                ReleaseRT(ref old.zoom);
             }
+
+            // ⚠️ 必须用 new RenderTexture，不能用 RenderTexture.GetTemporary：
+            //   · 这两个 RT 要【跨帧】长期持有，而 GetTemporary 的契约是「同一帧内 Release」；
+            //   · 更要命的是尺寸切换时用 ReleaseTemporary 去释放由 new 创建的 RT，会报
+            //     "Attempting to release a non-temporary RenderTexture as a temporary texture"，
+            //     而且旧 RT 根本不会被释放 ⇒ Scene/Game 尺寸不同时【每帧漏两张显存】。
+            //     （以前第一帧用 GetTemporary 建、切尺寸后改用 new 建，两种口径混在一起。）
+            //   · 必须 Linear：反馈里写的是页号/贴图编号的原始整数位，走 sRGB 读写会改颜色值
+            //     ⇒ 数组下标错位（原注释已经强调过这一点）。
+            FeedbackSet set = new FeedbackSet { fbW = fbWidth, fbH = fbHeigh };
+            set.fb = new RenderTexture(fbWidth, fbHeigh, 32,
+                RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear) { name = _FeedbackName };
+            set.zoom = new RenderTexture(zoomWid, zoomHei, 32,
+                RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear) { name = _FbZoomTexName };
+            set.fb.Create();
+            set.zoom.Create();
+
+            feedbackSets.Add(set);
+            feedbackTex = set.fb;
+            downScaleFeedback = set.zoom;
+        }
+
+        /// <summary>释放所有尺寸槽（Cleanup 调用，必须置 null 防二次 Dispose）。</summary>
+        private void ReleaseFeedbackTexs()
+        {
+            for (int i = 0; i < feedbackSets.Count; i++)
+            {
+                FeedbackSet s = feedbackSets[i];
+                ReleaseRT(ref s.fb);
+                ReleaseRT(ref s.zoom);
+            }
+            feedbackSets.Clear();
+            feedbackTex = null;
+            downScaleFeedback = null;
+        }
+
+        private static void ReleaseRT(ref RenderTexture rt)
+        {
+            if (rt == null) return;
+            rt.Release();
+            // 注意：本文件同时 using System 与 UnityEngine，Object 有歧义，必须写全名
+            if (Application.isPlaying) UnityEngine.Object.Destroy(rt);
+            else UnityEngine.Object.DestroyImmediate(rt);
+            rt = null;
         }
 
         /// <summary>    /// 发起回读请求    /// </summary>
@@ -820,6 +881,10 @@ namespace Cluster
                 debugAsset.debugFeedback = null;
                 debugAsset.debugFeedbackZoom = null;
             }
+
+            // 反馈 RT 以前【从来没被释放过】：GetTemporary 建的那份是临时池泄漏，
+            // new 建的那份随尺寸切换每次漏一张。现在统一由 ReleaseFeedbackTexs 收口。
+            ReleaseFeedbackTexs();
 
             // 释放后立刻置 null：Cleanup 可能被调用多次（退出 Play + 域重载 + 管线 Dispose），
             // 不置 null 会二次 Dispose 已释放/已销毁的对象
