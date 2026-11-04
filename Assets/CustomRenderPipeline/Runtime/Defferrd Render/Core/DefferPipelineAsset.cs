@@ -112,6 +112,9 @@ namespace CustomRenderPipline.DefferPipeline
             },
         };
 
+        // 后处理的开关与抗锯齿已经挪到独立的 PostProcessSettings 资产（见上面的字段），
+        // 这里不再持有后处理相关的一切 —— DefferSetting 只留"渲染管线本身的算法开关"。
+
         public bool accuracyNormal = false;
 
         [Tooltip("PBR:x:ȣyֲڶȣz")]
@@ -126,6 +129,12 @@ namespace CustomRenderPipline.DefferPipeline
     [CreateAssetMenu(menuName = "Rendering/RenderAsset/Deffer Render Pipeline")]
     public class DefferPipelineAsset : RenderAsset
     {
+        [Tooltip("后处理的管线级配置（Game/Scene 开关、抗锯齿）。\n" +
+                 "独立资源 ⇒ 方便继续加字段，也不用每次改它都脏化管线资产。\n" +
+                 "留空 = 不做后处理（HDR 高光会被硬切，仅用于对比）。\n" +
+                 "美术参数（Bloom/暗角/tonemap…）不在这里，在 Volume 里。")]
+        public PostProcessSettings postProcessSettings;
+
         public Shader cameraShader;
 
         [SerializeField]
@@ -163,7 +172,7 @@ namespace CustomRenderPipline.DefferPipeline
             renderSetting.RenderLayer = renderLayer;
             if (CreateDefferPipeline())
                 defferPipeline.Render(context, camera,
-                    renderSetting, shadowSetting, defferSetting);
+                    renderSetting, shadowSetting, defferSetting, postProcessSettings);
 
 
         }

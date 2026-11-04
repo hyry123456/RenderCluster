@@ -54,6 +54,13 @@ namespace CustomRenderPipline.DefferPipeline
         AmbientOcclusion ambientOcclusion = new AmbientOcclusion();
         ClusterCore clusterCore = new ClusterCore();
 
+        /// <summary>后处理链（Bloom + Uber + FXAA）。参数来自 Volume，见 PostVolumeSettings.cs。</summary>
+        readonly PostProcessStack postProcess = new PostProcessStack();
+
+        /// <summary>本帧的后处理配置（独立资产，由 DefferPipelineAsset 传进来）。
+        /// 为 null ⇒ 本帧完全不做后处理。</summary>
+        PostProcessSettings postProcessSettings;
+
         /// <summary>本帧 GBuffer 是否交给 Cluster 绘制（Game 摄像机 + 资产开关 + 数据就绪）。</summary>
         /// <summary>本帧 GBuffer 是否由 Cluster 绘制（= clusterMode 非 SRP 且剔除已就绪）。</summary>
         bool useCluster;
@@ -82,12 +89,13 @@ namespace CustomRenderPipline.DefferPipeline
 
         public void Render(ScriptableRenderContext context, Camera camera,
             RenderSetting renderSetting, ShadowSetting shadowSetting,
-            DefferSetting defferSetting)
+            DefferSetting defferSetting, PostProcessSettings postSettings = null)
         {
             this.camera = camera;
             this.context = context;
             this.renderSetting = renderSetting;
             this.defferSetting = defferSetting;
+            this.postProcessSettings = postSettings;
             GraphicsSettings.useScriptableRenderPipelineBatching = renderSetting.useSRPBatching;
 
 
@@ -213,6 +221,8 @@ namespace CustomRenderPipline.DefferPipeline
                 ClusterShadowRenderer.Instance.Release();
             lighting?.Dispose();
             spaceReflect?.Dispose();
+            // 后处理的 3 个自建材质（HideAndDontSave，不释放会随域重载累积）
+            postProcess?.Dispose();
         }
 
         /// <summary>	/// 执行摄像机数据进行阴影剔除，将不需要的部分进行剔除	/// </summary>
@@ -633,6 +643,22 @@ namespace CustomRenderPipline.DefferPipeline
                     pass = (int)DefferRenderPass._CopyColor; break;
             }
 
+            // ===== 后处理 =====
+            // 只在「正常颜色」输出时做：Debug 视图是诊断用的，套上 tonemap/暗角只会让人看不懂。
+            // 相机类型决定用哪个开关：Game 用 useInGame，Scene 等其他相机用 useInScene。
+            if (pass == (int)DefferRenderPass._CopyColor && PostProcessAllowed())
+            {
+                // 注意用 width/height（含 renderScale），不是 camera.pixelWidth ——
+                // 内部分辨率和输出分辨率可以不同，后处理必须发生在内部分辨率上，
+                // 最后由 SetViewport(pixelRect) 放大到屏幕。
+                if (postProcess.Render(buffer, camera, ShaderProperty.ColorAttachmentId, target,
+                        width, height, postProcessSettings))
+                {
+                    ExecuteBuffer();
+                    return;
+                }
+            }
+
             if(camera.cameraType != CameraType.Game)
             {
                 // 同上方 CopyColor 处的说明：无材质 Blit 会因 keyword 空间不兼容而断言失败，
@@ -652,6 +678,14 @@ namespace CustomRenderPipline.DefferPipeline
             }
 
 #else
+            if (PostProcessAllowed() &&
+                postProcess.Render(buffer, camera, ShaderProperty.ColorAttachmentId, target,
+                    width, height, postProcessSettings))
+            {
+                ExecuteBuffer();
+                return;
+            }
+
             buffer.SetRenderTarget(target, RenderBufferLoadAction.DontCare,
                 RenderBufferStoreAction.Store);
             buffer.SetViewport(camera.pixelRect);
@@ -663,6 +697,21 @@ namespace CustomRenderPipline.DefferPipeline
 #endif
 
             ExecuteBuffer();
+        }
+
+        /// <summary>本帧这个摄像机要不要走后处理（Game / Scene 分开控制）。
+        /// 反射探针 / 预览相机一律不做 —— 那两种相机跑后处理纯属浪费，观感也无意义。
+        /// 配置来自独立资产（PostProcessSettings），没挂资产就整体不做。</summary>
+        bool PostProcessAllowed()
+        {
+            var settings = postProcessSettings;
+            if (settings == null) return false;
+            switch (camera.cameraType)
+            {
+                case CameraType.Game: return settings.useInGame;
+                case CameraType.SceneView: return settings.useInScene;
+                default: return false;
+            }
         }
 
 
